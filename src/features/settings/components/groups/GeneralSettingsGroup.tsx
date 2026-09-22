@@ -26,6 +26,8 @@ interface GeneralSettingsGroupProps {
     setHideDockIcon: (val: boolean) => void;
     edgeDocking: boolean;
     setEdgeDocking: (val: boolean) => void;
+    followMouse: boolean;
+    setFollowMouse: (val: boolean) => void;
     soundEnabled: boolean;
     setSoundEnabled: (val: boolean) => void;
     pasteSoundEnabled: boolean;
@@ -60,6 +62,8 @@ const GeneralSettingsGroup = ({
     setHideDockIcon,
     edgeDocking,
     setEdgeDocking,
+    followMouse,
+    setFollowMouse,
     soundEnabled,
     setSoundEnabled,
     pasteSoundEnabled,
@@ -167,6 +171,27 @@ const GeneralSettingsGroup = ({
                     </label>
                 </div>
 
+
+                <div className="setting-item">
+                    <LabelWithHint
+                        label={t('follow_mouse')}
+                        hint={t('follow_mouse_hint')}
+                        hintKey="follow_mouse"
+                    />
+                    <label className="switch">
+                        <input
+                            className="cb"
+                            type="checkbox"
+                            checked={followMouse}
+                            onChange={(e) => {
+                                const val = e.target.checked;
+                                setFollowMouse(val);
+                                invoke("set_follow_mouse", { enabled: val }).catch(console.error);
+                            }}
+                        />
+                        <div className="toggle"><div className="left" /><div className="right" /></div>
+                    </label>
+                </div>
 
                 <div className="setting-item">
                     <div className="item-label-group">

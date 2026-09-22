@@ -246,7 +246,10 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
     const copyToClipboard = async (id: number, content: string, type: string) => {
         try {
-            await invoke('copy_to_clipboard', { content, contentType: type, paste: true, id, deleteAfterUse: false });
+            // R7: a paste from the tag manager counts as a paste and must land as the
+            // newest entry on the clipboard home page, so pin the move-to-top intent
+            // explicitly instead of relying on the ambient app setting.
+            await invoke('copy_to_clipboard', { content, contentType: type, paste: true, id, deleteAfterUse: false, moveToTop: true });
         } catch (err) { console.error(err); }
     };
 

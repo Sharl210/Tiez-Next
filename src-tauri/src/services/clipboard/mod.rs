@@ -17,6 +17,9 @@ use utils::*;
 const DEFAULT_CLIPBOARD_SETTLE_DELAY_MS: u64 = 100;
 const SNIPPING_TOOL_SETTLE_DELAY_MS: u64 = 1200;
 const RICH_TEXT_RETRY_DELAYS_MS: [u64; 7] = [0, 40, 80, 140, 220, 360, 560];
+/// How many extra rounds one notification may run to catch a copy that landed
+/// while the previous payload was still being read and stored.
+const MAX_SEQUENCE_CATCH_UP_ROUNDS: u8 = 4;
 const PRESERVED_NAMED_FORMAT_MAX_COUNT: usize = 12;
 const PRESERVED_NAMED_FORMAT_MAX_BYTES: usize = 1_500_000;
 const PRESERVED_NAMED_FORMAT_TOTAL_BYTES: usize = 4_000_000;
@@ -534,107 +537,230 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
         }
 
         // 2. Sequence check (De-bounce Windows firing multiple events for one copy)
-        let current_seq =
-            crate::infrastructure::windows_api::win_clipboard::get_clipboard_sequence_number();
-        if current_seq == monitor_state.last_seq {
-            return;
-        }
-        monitor_state.last_seq = current_seq;
-        let source_snapshot =
-            crate::infrastructure::windows_api::window_tracker::get_clipboard_source_app_info();
-
-        // Give source apps time to finish writing clipboard payloads before we start
-        // probing formats. Snipping Tool needs a longer quiet period or its save
-        // pipeline may race with clipboard-manager reads.
-        let settle_delay_ms = if is_snipping_tool_source(&source_snapshot) {
-            SNIPPING_TOOL_SETTLE_DELAY_MS
-        } else {
-            DEFAULT_CLIPBOARD_SETTLE_DELAY_MS
-        };
-        std::thread::sleep(std::time::Duration::from_millis(settle_delay_ms));
-
-        // Initialize clipboard for this thread
-        let mut clipboard = match Clipboard::new() {
-            Ok(cb) => cb,
-            Err(_) => return,
-        };
-
-        let mut cached_text: Option<Option<String>> = None;
-        let mut cached_image: Option<
-            Option<crate::infrastructure::windows_api::win_clipboard::ImageData>,
-        > = None;
-
-        // 3. Content-based deduplication with time window (for Chrome address bar, etc.)
-        // Some apps trigger multiple clipboard updates with different sequence numbers
-        // but identical content within a short time window
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Calculate hash of current clipboard content
-        let current_content_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-            // Hash text content if available
-            if let Some(text) = read_clipboard_text_once(&mut clipboard, &mut cached_text) {
-                normalize_clipboard_plain_text(&text).hash(&mut hasher);
+        //
+        // A single logical copy makes Windows fire several WM_CLIPBOARDUPDATE
+        // messages (source apps publish the individual formats one after
+        // another), so the sequence number is read once here and the whole
+        // handling below is skipped when it has not moved.
+        //
+        // The subtlety is *where* the sequence number is stored. The handling
+        // below is slow by design: it sleeps 100-1200 ms to let the source app
+        // finish writing, retries rich text probing for up to ~1.4 s and may
+        // encode a CF_DIB bitmap to PNG for another 500-2000 ms. Because the
+        // clipboard is a single slot, a copy the user performs *during* that
+        // window overwrites the payload before it is ever read, so storing the
+        // sequence number up-front used to lose that copy permanently: the
+        // late-arriving message carried the very sequence number that had
+        // already been swallowed, so it returned early.
+        //
+        // Therefore the number is only folded into `last_seq` *after* an
+        // iteration finishes, and if it moved in the meantime the iteration is
+        // repeated so the payload that landed in between is still captured.
+        // Repeated events for the same copy keep being de-bounced: while an
+        // iteration is running `last_seq` still holds the pre-iteration number,
+        // and any message whose sequence equals it is dropped right away.
+        let mut processed_seq = monitor_state.last_seq;
+        // Bounded so a never-idle clipboard can neither loop forever nor delay
+        // the listener indefinitely; whatever arrives after the last round is
+        // picked up by the next Windows notification.
+        for _catch_up_round in 0..=MAX_SEQUENCE_CATCH_UP_ROUNDS {
+            let current_seq =
+                crate::infrastructure::windows_api::win_clipboard::get_clipboard_sequence_number();
+            if current_seq == processed_seq {
+                return;
             }
+            // Still recorded immediately so repeated messages belonging to one
+            // copy stay de-bounced; the catch-up decision above deliberately
+            // uses `processed_seq` instead of this field.
+            monitor_state.last_seq = current_seq;
+            let source_snapshot =
+                crate::infrastructure::windows_api::window_tracker::get_clipboard_source_app_info();
 
-            // Also consider image hash if present
-            if let Some(image) = read_clipboard_image_once(&mut cached_image) {
-                image.bytes.hash(&mut hasher);
-            }
+            // Give source apps time to finish writing clipboard payloads before we start
+            // probing formats. Snipping Tool needs a longer quiet period or its save
+            // pipeline may race with clipboard-manager reads.
+            let settle_delay_ms = if is_snipping_tool_source(&source_snapshot) {
+                SNIPPING_TOOL_SETTLE_DELAY_MS
+            } else {
+                DEFAULT_CLIPBOARD_SETTLE_DELAY_MS
+            };
+            std::thread::sleep(std::time::Duration::from_millis(settle_delay_ms));
 
-            hasher.finish()
-        };
+            // Initialize clipboard for this thread
+            let mut clipboard = match Clipboard::new() {
+                Ok(cb) => cb,
+                // Nothing could be read: fold this sequence in so the next message
+                // starts a fresh iteration instead of returning early on a stale
+                // number, and let the loop decide whether another copy is pending.
+                Err(_) => {
+                    processed_seq = current_seq;
+                    continue;
+                }
+            };
 
-        // If content is identical to last processed content within 2000ms window, skip.
-        // Rich text sources (Office/WPS) may fire multiple clipboard events over >500ms
-        // because they write formats sequentially and probe_rich_text_payload retries.
-        if current_content_hash == monitor_state.last_content_hash
-            && current_content_hash != 0
-            && now.saturating_sub(monitor_state.last_process_time) < 2000
-        {
-            return;
-        }
+            let mut cached_text: Option<Option<String>> = None;
+            let mut cached_image: Option<
+                Option<crate::infrastructure::windows_api::win_clipboard::ImageData>,
+            > = None;
 
-        monitor_state.last_content_hash = current_content_hash;
-        monitor_state.last_process_time = now;
+            // 3. Content-based deduplication with time window (for Chrome address bar, etc.)
+            // Some apps trigger multiple clipboard updates with different sequence numbers
+            // but identical content within a short time window
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
 
-        let mut handled = false;
+            // Calculate hash of current clipboard content
+            let current_content_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
-        // --- Core processing logic (same as before) ---
+                // Hash text content if available
+                if let Some(text) = read_clipboard_text_once(&mut clipboard, &mut cached_text) {
+                    normalize_clipboard_plain_text(&text).hash(&mut hasher);
+                }
 
-        // 1. Check Files
-        unsafe {
-            if let Some(files) =
-                crate::infrastructure::windows_api::win_clipboard::get_clipboard_files()
+                // Also consider image hash if present
+                if let Some(image) = read_clipboard_image_once(&mut cached_image) {
+                    image.bytes.hash(&mut hasher);
+                }
+
+                hasher.finish()
+            };
+
+            // If content is identical to last processed content within 2000ms window, skip.
+            // Rich text sources (Office/WPS) may fire multiple clipboard events over >500ms
+            // because they write formats sequentially and probe_rich_text_payload retries.
+            if current_content_hash == monitor_state.last_content_hash
+                && current_content_hash != 0
+                && now.saturating_sub(monitor_state.last_process_time) < 2000
             {
-                let content = files.join("\n");
-                if !content.is_empty() {
-                    let is_new = content != monitor_state.last_text;
-                    let mut should_process = is_new;
-                    if !is_new {
-                        if let Some(db_state) = app.try_state::<DbState>() {
-                            if let Ok(conn) = db_state.conn.lock() {
-                                if let Ok(None) = db_state
-                                    .repo
-                                    .find_by_content_with_conn(&conn, &content, None)
-                                {
-                                    should_process = true;
+                // This payload was already recorded, so this iteration has nothing
+                // left to store: fold the sequence in and let the loop check whether
+                // a copy performed while the payload was being handled is pending.
+                processed_seq = current_seq;
+                continue;
+            }
+
+            monitor_state.last_content_hash = current_content_hash;
+            monitor_state.last_process_time = now;
+
+            let mut handled = false;
+
+            // --- Core processing logic (same as before) ---
+
+            // 1. Check Files
+            unsafe {
+                if let Some(files) =
+                    crate::infrastructure::windows_api::win_clipboard::get_clipboard_files()
+                {
+                    let content = files.join("\n");
+                    if !content.is_empty() {
+                        let is_new = content != monitor_state.last_text;
+                        let mut should_process = is_new;
+                        if !is_new {
+                            if let Some(db_state) = app.try_state::<DbState>() {
+                                if let Ok(conn) = db_state.conn.lock() {
+                                    if let Ok(None) = db_state
+                                        .repo
+                                        .find_by_content_with_conn(&conn, &content, None)
+                                    {
+                                        should_process = true;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if should_process {
-                        let normalized = content.trim().replace("\r\n", "\n");
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        use std::hash::{Hash, Hasher};
-                        normalized.hash(&mut hasher);
-                        let current_hash = hasher.finish();
+                        if should_process {
+                            let normalized = content.trim().replace("\r\n", "\n");
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            use std::hash::{Hash, Hasher};
+                            normalized.hash(&mut hasher);
+                            let current_hash = hasher.finish();
+
+                            let last_app_hash = crate::LAST_APP_SET_HASH.load(Ordering::SeqCst);
+                            let last_app_hash_alt = crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst);
+                            let last_app_time = crate::LAST_APP_SET_TIMESTAMP.load(Ordering::SeqCst);
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            if (last_app_hash != 0
+                                && (last_app_hash == current_hash || last_app_hash_alt == current_hash))
+                                && (now_secs - last_app_time) < 10
+                            {
+                                crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+                                crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+                            } else {
+                                crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+                                crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+                                monitor_state.last_text = content.clone();
+
+                                let settings = app.state::<SettingsState>();
+                                if should_capture_file_entries(
+                                    settings.capture_files.load(Ordering::Relaxed),
+                                ) {
+                                    process_new_entry(
+                                        &app,
+                                        ClipboardData::Files(files),
+                                        None,
+                                        Some(source_snapshot.clone()),
+                                    );
+                                }
+                            }
+                        }
+                        handled = true;
+                    }
+                }
+            }
+
+            if !handled {
+                let settings = app.state::<SettingsState>();
+                let rich_text_enabled = settings.capture_rich_text.load(Ordering::Relaxed);
+                let initial_text = read_clipboard_text_once(&mut clipboard, &mut cached_text)
+                    .filter(|text| !text.trim().is_empty());
+
+                // Fast-path: if the clipboard has a GIF format, skip the expensive
+                // rich text probing entirely and let the image handler (section 3)
+                // process it directly.  Previously GIFs went through rich text
+                // probing → clipboard_image_fallback_data_url → only to be discarded
+                // by `prefer_image`, wasting 0.5–2 s.
+                let clipboard_has_gif = unsafe {
+                    ["GIF", "Animated GIF", "gif", "image/gif"]
+                        .iter()
+                        .any(|name| {
+                            crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(
+                                name,
+                            )
+                            .is_some()
+                        })
+                };
+
+                // When there's no text and the source isn't a dedicated rich text
+                // application, this is almost certainly a pure image copy (e.g.
+                // right-click → Copy image in a browser).  Rich text probing would
+                // just be discarded by `prefer_image = true` later, so skip it
+                // entirely to avoid 100–1400 ms of wasted retries.
+                let pure_image_copy =
+                    initial_text.is_none() && !is_likely_rich_text_source(&source_snapshot);
+
+                let should_probe_rich_text = rich_text_enabled
+                    && !clipboard_has_gif
+                    && !pure_image_copy
+                    && (initial_text.is_some()
+                        || is_likely_rich_text_source(&source_snapshot)
+                        || has_rich_text_candidate_format());
+
+                if should_probe_rich_text {
+                    if let Some((text, html)) =
+                        probe_rich_text_payload(&source_snapshot, initial_text.clone())
+                    {
+                        let normalized_text = normalize_clipboard_plain_text(&text);
+                        let current_hash = calc_text_hash(&normalized_text);
+                        let current_html_hash =
+                            calc_text_hash(&crate::services::clipboard::repair_html_fragment(&html));
 
                         let last_app_hash = crate::LAST_APP_SET_HASH.load(Ordering::SeqCst);
                         let last_app_hash_alt = crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst);
@@ -644,309 +770,241 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
                             .unwrap_or_default()
                             .as_secs();
 
-                        if (last_app_hash != 0
-                            && (last_app_hash == current_hash || last_app_hash_alt == current_hash))
+                        if last_app_hash != 0
+                            && ((current_hash == last_app_hash || current_hash == last_app_hash_alt)
+                                || (current_html_hash == last_app_hash
+                                    || current_html_hash == last_app_hash_alt))
                             && (now_secs - last_app_time) < 10
                         {
                             crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
                             crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+                            monitor_state.last_text = normalized_text;
+                            handled = true;
                         } else {
-                            crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
-                            crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
-                            monitor_state.last_text = content.clone();
+                            let html_animated_gif_fallback =
+                                extract_animated_image_data_url_from_html(&html);
+                            let mut html_to_store = html;
 
-                            let settings = app.state::<SettingsState>();
-                            if should_capture_file_entries(
-                                settings.capture_files.load(Ordering::Relaxed),
-                            ) {
+                            // When the HTML already has <img> tags with local/renderable
+                            // sources, skip the very expensive clipboard bitmap capture
+                            // (clipboard_image_fallback_data_url reads CF_DIB, does PNG
+                            // encoding + base64, typically 500–2000 ms).  HtmlContent
+                            // renders those images directly via Tauri asset paths.
+                            let html_has_renderable_images =
+                                html_to_store.to_ascii_lowercase().contains("<img ");
+
+                            if let Some(data_url) = html_animated_gif_fallback.clone().or_else(|| {
+                                if html_has_renderable_images {
+                                    None
+                                } else {
+                                    clipboard_image_fallback_data_url()
+                                }
+                            }) {
+                                html_to_store = attach_rich_image_fallback(&html_to_store, &data_url);
+                            }
+
+                            let preserved_named_formats =
+                                capture_preserved_named_formats_from_clipboard(Some(&source_snapshot));
+                            if !preserved_named_formats.is_empty() {
+                                html_to_store =
+                                    attach_rich_named_formats(&html_to_store, &preserved_named_formats);
+                            }
+
+                            let has_gif = unsafe {
+                                let mut found = false;
+                                for name in ["GIF", "Animated GIF", "gif", "image/gif"] {
+                                    if crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(name).is_some() {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                found
+                            };
+
+                            // If the derived text is empty (or this is a pure image copy from browser),
+                            // we prefer the image handler unless this is a dedicated rich text source.
+                            // For GIFs, we are especially aggressive because capturing as rich text
+                            // results in a static preview snapshot, killing the animation.
+                            let prefer_image = (text.trim().is_empty() || has_gif)
+                                && !is_likely_rich_text_source(&source_snapshot)
+                                && html_animated_gif_fallback.is_none()
+                                && (read_clipboard_image_once(&mut cached_image).is_some() || has_gif);
+
+                            if !prefer_image {
+                                monitor_state.last_text = normalized_text.clone();
                                 process_new_entry(
                                     &app,
-                                    ClipboardData::Files(files),
+                                    ClipboardData::RichText {
+                                        text: normalized_text,
+                                        html: html_to_store,
+                                    },
                                     None,
                                     Some(source_snapshot.clone()),
                                 );
+                                handled = true;
+
+                                // Update content hash after rich text processing so that
+                                // a subsequent clipboard event with the same raw clipboard
+                                // content is correctly deduped within the time window.
+                                // We reuse `current_content_hash` (computed from the raw
+                                // clipboard text + image at the top of the handler) to
+                                // ensure it matches the next event's initial hash.
+                                monitor_state.last_content_hash = current_content_hash;
+                                monitor_state.last_process_time = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64;
                             }
                         }
                     }
-                    handled = true;
                 }
             }
-        }
 
-        if !handled {
-            let settings = app.state::<SettingsState>();
-            let rich_text_enabled = settings.capture_rich_text.load(Ordering::Relaxed);
-            let initial_text = read_clipboard_text_once(&mut clipboard, &mut cached_text)
-                .filter(|text| !text.trim().is_empty());
+            // 3. Check Image
+            if !handled {
+                unsafe {
+                    let mut gif_data_opt = None;
+                    for name in [
+                        "GIF",
+                        "Animated GIF",
+                        "gif",
+                        "image/gif",
+                        "Graphics Interchange Format",
+                        "image/x-gif",
+                    ] {
+                        if let Some(data) =
+                            crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(
+                                name,
+                            )
+                        {
+                            gif_data_opt = Some(data);
+                            break;
+                        }
+                    }
 
-            // Fast-path: if the clipboard has a GIF format, skip the expensive
-            // rich text probing entirely and let the image handler (section 3)
-            // process it directly.  Previously GIFs went through rich text
-            // probing → clipboard_image_fallback_data_url → only to be discarded
-            // by `prefer_image`, wasting 0.5–2 s.
-            let clipboard_has_gif = unsafe {
-                ["GIF", "Animated GIF", "gif", "image/gif"]
-                    .iter()
-                    .any(|name| {
-                        crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(
-                            name,
-                        )
-                        .is_some()
-                    })
-            };
-
-            // When there's no text and the source isn't a dedicated rich text
-            // application, this is almost certainly a pure image copy (e.g.
-            // right-click → Copy image in a browser).  Rich text probing would
-            // just be discarded by `prefer_image = true` later, so skip it
-            // entirely to avoid 100–1400 ms of wasted retries.
-            let pure_image_copy =
-                initial_text.is_none() && !is_likely_rich_text_source(&source_snapshot);
-
-            let should_probe_rich_text = rich_text_enabled
-                && !clipboard_has_gif
-                && !pure_image_copy
-                && (initial_text.is_some()
-                    || is_likely_rich_text_source(&source_snapshot)
-                    || has_rich_text_candidate_format());
-
-            if should_probe_rich_text {
-                if let Some((text, html)) =
-                    probe_rich_text_payload(&source_snapshot, initial_text.clone())
-                {
-                    let normalized_text = normalize_clipboard_plain_text(&text);
-                    let current_hash = calc_text_hash(&normalized_text);
-                    let current_html_hash =
-                        calc_text_hash(&crate::services::clipboard::repair_html_fragment(&html));
-
-                    let last_app_hash = crate::LAST_APP_SET_HASH.load(Ordering::SeqCst);
-                    let last_app_hash_alt = crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst);
-                    let last_app_time = crate::LAST_APP_SET_TIMESTAMP.load(Ordering::SeqCst);
-                    let now_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    if last_app_hash != 0
-                        && ((current_hash == last_app_hash || current_hash == last_app_hash_alt)
-                            || (current_html_hash == last_app_hash
-                                || current_html_hash == last_app_hash_alt))
-                        && (now_secs - last_app_time) < 10
-                    {
-                        crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
-                        crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
-                        monitor_state.last_text = normalized_text;
-                        handled = true;
+                    let text_animated_gif_fallback = if gif_data_opt.is_none() {
+                        read_clipboard_text_fresh()
+                            .and_then(|text| extract_animated_image_data_url_from_text(&text))
                     } else {
-                        let html_animated_gif_fallback =
-                            extract_animated_image_data_url_from_html(&html);
-                        let mut html_to_store = html;
-
-                        // When the HTML already has <img> tags with local/renderable
-                        // sources, skip the very expensive clipboard bitmap capture
-                        // (clipboard_image_fallback_data_url reads CF_DIB, does PNG
-                        // encoding + base64, typically 500–2000 ms).  HtmlContent
-                        // renders those images directly via Tauri asset paths.
-                        let html_has_renderable_images =
-                            html_to_store.to_ascii_lowercase().contains("<img ");
-
-                        if let Some(data_url) = html_animated_gif_fallback.clone().or_else(|| {
-                            if html_has_renderable_images {
-                                None
-                            } else {
-                                clipboard_image_fallback_data_url()
-                            }
-                        }) {
-                            html_to_store = attach_rich_image_fallback(&html_to_store, &data_url);
-                        }
-
-                        let preserved_named_formats =
-                            capture_preserved_named_formats_from_clipboard(Some(&source_snapshot));
-                        if !preserved_named_formats.is_empty() {
-                            html_to_store =
-                                attach_rich_named_formats(&html_to_store, &preserved_named_formats);
-                        }
-
-                        let has_gif = unsafe {
-                            let mut found = false;
-                            for name in ["GIF", "Animated GIF", "gif", "image/gif"] {
-                                if crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(name).is_some() {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            found
-                        };
-
-                        // If the derived text is empty (or this is a pure image copy from browser),
-                        // we prefer the image handler unless this is a dedicated rich text source.
-                        // For GIFs, we are especially aggressive because capturing as rich text
-                        // results in a static preview snapshot, killing the animation.
-                        let prefer_image = (text.trim().is_empty() || has_gif)
-                            && !is_likely_rich_text_source(&source_snapshot)
-                            && html_animated_gif_fallback.is_none()
-                            && (read_clipboard_image_once(&mut cached_image).is_some() || has_gif);
-
-                        if !prefer_image {
-                            monitor_state.last_text = normalized_text.clone();
-                            process_new_entry(
-                                &app,
-                                ClipboardData::RichText {
-                                    text: normalized_text,
-                                    html: html_to_store,
-                                },
-                                None,
-                                Some(source_snapshot.clone()),
-                            );
-                            handled = true;
-
-                            // Update content hash after rich text processing so that
-                            // a subsequent clipboard event with the same raw clipboard
-                            // content is correctly deduped within the time window.
-                            // We reuse `current_content_hash` (computed from the raw
-                            // clipboard text + image at the top of the handler) to
-                            // ensure it matches the next event's initial hash.
-                            monitor_state.last_content_hash = current_content_hash;
-                            monitor_state.last_process_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis()
-                                as u64;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Check Image
-        if !handled {
-            unsafe {
-                let mut gif_data_opt = None;
-                for name in [
-                    "GIF",
-                    "Animated GIF",
-                    "gif",
-                    "image/gif",
-                    "Graphics Interchange Format",
-                    "image/x-gif",
-                ] {
-                    if let Some(data) =
-                        crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(
-                            name,
-                        )
-                    {
-                        gif_data_opt = Some(data);
-                        break;
-                    }
-                }
-
-                let text_animated_gif_fallback = if gif_data_opt.is_none() {
-                    read_clipboard_text_fresh()
-                        .and_then(|text| extract_animated_image_data_url_from_text(&text))
-                } else {
-                    None
-                };
-
-                if let Some(gif_data) = gif_data_opt {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::{Hash, Hasher};
-                    gif_data.hash(&mut hasher);
-                    let hash = hasher.finish();
-                    let visual_hash =
-                        calc_image_hash_from_bytes(&gif_data).unwrap_or(hash as i64) as u64;
-                    handled = true;
-
-                    if hash != monitor_state.last_image_hash {
-                        if should_ignore_recent_image_echo(hash, visual_hash) {
-                            clear_recent_image_echo_state(hash, visual_hash);
-                        } else {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(gif_data);
-                            process_new_entry(
-                                &app,
-                                ClipboardData::Image {
-                                    data_url: format!("data:image/gif;base64,{}", b64),
-                                },
-                                None,
-                                Some(source_snapshot.clone()),
-                            );
-                            monitor_state.last_text = String::new();
-                        }
-                        monitor_state.last_image_hash = hash;
-                    }
-                } else if let Some(data_url) = text_animated_gif_fallback {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::{Hash, Hasher};
-                    data_url.hash(&mut hasher);
-                    let hash = hasher.finish();
-                    let visual_hash = calc_image_hash(&data_url).unwrap_or(hash as i64) as u64;
-                    handled = true;
-
-                    if hash != monitor_state.last_image_hash {
-                        if should_ignore_recent_image_echo(hash, visual_hash) {
-                            clear_recent_image_echo_state(hash, visual_hash);
-                        } else {
-                            process_new_entry(
-                                &app,
-                                ClipboardData::Image { data_url },
-                                None,
-                                Some(source_snapshot.clone()),
-                            );
-                            monitor_state.last_text = String::new();
-                        }
-                        monitor_state.last_image_hash = hash;
-                    }
-                }
-
-                if !handled {
-                    // Fast path: try native PNG/JPEG clipboard formats first.
-                    // Browsers often provide these alongside CF_DIB, and using
-                    // them directly avoids the expensive bitmap → PNG encode.
-                    let fast_data_url: Option<(String, u64, u64)> = {
-                        use std::hash::{Hash, Hasher};
-                        let mut result = None;
-                        for name in ["PNG", "image/png", "JFIF", "JPEG", "image/jpeg"] {
-                            if let Some(raw) =
-                                crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(name)
-                            {
-                                if raw.len() > 8 && raw[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                    raw.hash(&mut hasher);
-                                    let hash = hasher.finish();
-                                    let visual_hash =
-                                        calc_image_hash_from_bytes(&raw).unwrap_or(hash as i64) as u64;
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
-                                    result = Some((
-                                        format!("data:image/png;base64,{}", b64),
-                                        hash,
-                                        visual_hash,
-                                    ));
-                                    break;
-                                }
-                                if raw.len() > 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
-                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                    raw.hash(&mut hasher);
-                                    let hash = hasher.finish();
-                                    let visual_hash =
-                                        calc_image_hash_from_bytes(&raw).unwrap_or(hash as i64) as u64;
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
-                                    result = Some((
-                                        format!("data:image/jpeg;base64,{}", b64),
-                                        hash,
-                                        visual_hash,
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        result
+                        None
                     };
 
-                    if let Some((data_url, hash, visual_hash)) = fast_data_url {
+                    if let Some(gif_data) = gif_data_opt {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        use std::hash::{Hash, Hasher};
+                        gif_data.hash(&mut hasher);
+                        let hash = hasher.finish();
+                        let visual_hash =
+                            calc_image_hash_from_bytes(&gif_data).unwrap_or(hash as i64) as u64;
+                        handled = true;
+
                         if hash != monitor_state.last_image_hash {
                             if should_ignore_recent_image_echo(hash, visual_hash) {
                                 clear_recent_image_echo_state(hash, visual_hash);
+                            } else {
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(gif_data);
+                                process_new_entry(
+                                    &app,
+                                    ClipboardData::Image {
+                                        data_url: format!("data:image/gif;base64,{}", b64),
+                                    },
+                                    None,
+                                    Some(source_snapshot.clone()),
+                                );
+                                monitor_state.last_text = String::new();
+                            }
+                            monitor_state.last_image_hash = hash;
+                        }
+                    } else if let Some(data_url) = text_animated_gif_fallback {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        use std::hash::{Hash, Hasher};
+                        data_url.hash(&mut hasher);
+                        let hash = hasher.finish();
+                        let visual_hash = calc_image_hash(&data_url).unwrap_or(hash as i64) as u64;
+                        handled = true;
+
+                        if hash != monitor_state.last_image_hash {
+                            if should_ignore_recent_image_echo(hash, visual_hash) {
+                                clear_recent_image_echo_state(hash, visual_hash);
+                            } else {
+                                process_new_entry(
+                                    &app,
+                                    ClipboardData::Image { data_url },
+                                    None,
+                                    Some(source_snapshot.clone()),
+                                );
+                                monitor_state.last_text = String::new();
+                            }
+                            monitor_state.last_image_hash = hash;
+                        }
+                    }
+
+                    if !handled {
+                        // Fast path: try native PNG/JPEG clipboard formats first.
+                        // Browsers often provide these alongside CF_DIB, and using
+                        // them directly avoids the expensive bitmap → PNG encode.
+                        let fast_data_url: Option<(String, u64, u64)> = {
+                            use std::hash::{Hash, Hasher};
+                            let mut result = None;
+                            for name in ["PNG", "image/png", "JFIF", "JPEG", "image/jpeg"] {
+                                if let Some(raw) =
+                                    crate::infrastructure::windows_api::win_clipboard::get_clipboard_raw_format(name)
+                                {
+                                    if raw.len() > 8 && raw[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        raw.hash(&mut hasher);
+                                        let hash = hasher.finish();
+                                        let visual_hash =
+                                            calc_image_hash_from_bytes(&raw).unwrap_or(hash as i64) as u64;
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+                                        result = Some((
+                                            format!("data:image/png;base64,{}", b64),
+                                            hash,
+                                            visual_hash,
+                                        ));
+                                        break;
+                                    }
+                                    if raw.len() > 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        raw.hash(&mut hasher);
+                                        let hash = hasher.finish();
+                                        let visual_hash =
+                                            calc_image_hash_from_bytes(&raw).unwrap_or(hash as i64) as u64;
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+                                        result = Some((
+                                            format!("data:image/jpeg;base64,{}", b64),
+                                            hash,
+                                            visual_hash,
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            result
+                        };
+
+                        if let Some((data_url, hash, visual_hash)) = fast_data_url {
+                            if hash != monitor_state.last_image_hash {
+                                if should_ignore_recent_image_echo(hash, visual_hash) {
+                                    clear_recent_image_echo_state(hash, visual_hash);
+                                    handled = true;
+                                } else {
+                                    process_new_entry(
+                                        &app,
+                                        ClipboardData::Image { data_url },
+                                        None,
+                                        Some(source_snapshot.clone()),
+                                    );
+                                    handled = true;
+                                }
+                                monitor_state.last_image_hash = hash;
+                            } else if image_already_in_db(&app, &data_url) {
+                                // Same hash as last time AND it really is stored — nothing to do.
                                 handled = true;
                             } else {
+                                // Same hash but absent from the database: the earlier event was
+                                // never recorded, so record it now instead of dropping it.
                                 process_new_entry(
                                     &app,
                                     ClipboardData::Image { data_url },
@@ -955,127 +1013,127 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
                                 );
                                 handled = true;
                             }
-                            monitor_state.last_image_hash = hash;
-                        } else if image_already_in_db(&app, &data_url) {
-                            // Same hash as last time AND it really is stored — nothing to do.
-                            handled = true;
-                        } else {
-                            // Same hash but absent from the database: the earlier event was
-                            // never recorded, so record it now instead of dropping it.
-                            process_new_entry(
-                                &app,
-                                ClipboardData::Image { data_url },
-                                None,
-                                Some(source_snapshot.clone()),
-                            );
-                            handled = true;
                         }
-                    }
 
-                    // Slow fallback: read CF_DIB bitmap and encode to PNG
-                    if !handled {
-                        if let Some(image) = read_clipboard_image_once(&mut cached_image) {
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            image.bytes.hash(&mut hasher);
-                            let hash = hasher.finish();
-                            let visual_hash = calc_image_hash_from_rgba(
-                                image.width as u32,
-                                image.height as u32,
-                                &image.bytes,
-                            )
-                            .unwrap_or(hash as i64)
-                                as u64;
+                        // Slow fallback: read CF_DIB bitmap and encode to PNG
+                        if !handled {
+                            if let Some(image) = read_clipboard_image_once(&mut cached_image) {
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                image.bytes.hash(&mut hasher);
+                                let hash = hasher.finish();
+                                let visual_hash = calc_image_hash_from_rgba(
+                                    image.width as u32,
+                                    image.height as u32,
+                                    &image.bytes,
+                                )
+                                .unwrap_or(hash as i64)
+                                    as u64;
 
-                            if hash != monitor_state.last_image_hash {
-                                if should_ignore_recent_image_echo(hash, visual_hash) {
-                                    clear_recent_image_echo_state(hash, visual_hash);
-                                    handled = true;
-                                } else {
-                                    if let Some(img_buf) = image::RgbaImage::from_raw(
-                                        image.width as u32,
-                                        image.height as u32,
-                                        image.bytes,
-                                    ) {
-                                        let mut bytes: Vec<u8> = Vec::new();
-                                        let mut cursor = std::io::Cursor::new(&mut bytes);
-                                        if img_buf
-                                            .write_to(&mut cursor, image::ImageFormat::Png)
-                                            .is_ok()
-                                        {
-                                            let b64 = base64::engine::general_purpose::STANDARD
-                                                .encode(bytes);
-                                            process_new_entry(
-                                                &app,
-                                                ClipboardData::Image {
-                                                    data_url: format!(
-                                                        "data:image/png;base64,{}",
-                                                        b64
-                                                    ),
-                                                },
-                                                None,
-                                                Some(source_snapshot.clone()),
-                                            );
-                                            handled = true;
+                                if hash != monitor_state.last_image_hash {
+                                    if should_ignore_recent_image_echo(hash, visual_hash) {
+                                        clear_recent_image_echo_state(hash, visual_hash);
+                                        handled = true;
+                                    } else {
+                                        if let Some(img_buf) = image::RgbaImage::from_raw(
+                                            image.width as u32,
+                                            image.height as u32,
+                                            image.bytes,
+                                        ) {
+                                            let mut bytes: Vec<u8> = Vec::new();
+                                            let mut cursor = std::io::Cursor::new(&mut bytes);
+                                            if img_buf
+                                                .write_to(&mut cursor, image::ImageFormat::Png)
+                                                .is_ok()
+                                            {
+                                                let b64 = base64::engine::general_purpose::STANDARD
+                                                    .encode(bytes);
+                                                process_new_entry(
+                                                    &app,
+                                                    ClipboardData::Image {
+                                                        data_url: format!(
+                                                            "data:image/png;base64,{}",
+                                                            b64
+                                                        ),
+                                                    },
+                                                    None,
+                                                    Some(source_snapshot.clone()),
+                                                );
+                                                handled = true;
+                                            }
                                         }
                                     }
+                                    monitor_state.last_image_hash = hash;
                                 }
-                                monitor_state.last_image_hash = hash;
                             }
                         }
                     }
                 }
             }
-        }
 
-        // 4. Check Text
-        if !handled {
-            if let Some(text) = read_clipboard_text_once(&mut clipboard, &mut cached_text) {
-                let normalized_text = normalize_clipboard_plain_text(&text);
-                if !normalized_text.trim().is_empty() {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::{Hash, Hasher};
-                    normalized_text.hash(&mut hasher);
-                    let current_hash = hasher.finish();
+            // 4. Check Text
+            if !handled {
+                if let Some(text) = read_clipboard_text_once(&mut clipboard, &mut cached_text) {
+                    let normalized_text = normalize_clipboard_plain_text(&text);
+                    if !normalized_text.trim().is_empty() {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        use std::hash::{Hash, Hasher};
+                        normalized_text.hash(&mut hasher);
+                        let current_hash = hasher.finish();
 
-                    let last_app_hash = crate::LAST_APP_SET_HASH.load(Ordering::SeqCst);
-                    let last_app_time = crate::LAST_APP_SET_TIMESTAMP.load(Ordering::SeqCst);
-                    let now_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                        let last_app_hash = crate::LAST_APP_SET_HASH.load(Ordering::SeqCst);
+                        let last_app_time = crate::LAST_APP_SET_TIMESTAMP.load(Ordering::SeqCst);
+                        let now_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
 
-                    if (last_app_hash != 0
-                        && (current_hash == last_app_hash
-                            || current_hash == crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst)))
-                        && (now_secs - last_app_time) < 10
-                    {
-                        crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
-                        crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+                        if (last_app_hash != 0
+                            && (current_hash == last_app_hash
+                                || current_hash == crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst)))
+                            && (now_secs - last_app_time) < 10
+                        {
+                            crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+                            crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+                            monitor_state.last_text = normalized_text.clone();
+                            processed_seq = current_seq;
+                            continue;
+                        }
+
+                        if last_app_hash != 0 {
+                            crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+                        }
                         monitor_state.last_text = normalized_text.clone();
-                        return;
-                    }
 
-                    if last_app_hash != 0 {
-                        crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+                        // Update content hash so subsequent events with the same
+                        // text content are deduped within the time window.
+                        monitor_state.last_content_hash = current_content_hash;
+                        monitor_state.last_process_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        process_new_entry(
+                            &app,
+                            ClipboardData::Text(normalized_text),
+                            None,
+                            Some(source_snapshot.clone()),
+                        );
                     }
-                    monitor_state.last_text = normalized_text.clone();
-
-                    // Update content hash so subsequent events with the same
-                    // text content are deduped within the time window.
-                    monitor_state.last_content_hash = current_content_hash;
-                    monitor_state.last_process_time = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    process_new_entry(
-                        &app,
-                        ClipboardData::Text(normalized_text),
-                        None,
-                        Some(source_snapshot.clone()),
-                    );
                 }
             }
+
+        // The round is over, so the sequence number is adopted only now: it
+        // is the number the round was actually started from. Reading it a
+        // second time answers whether a copy landed while this payload was
+        // being handled. If it did, that payload is still in the clipboard
+        // and is picked up by the next round; otherwise the listener goes
+        // back to waiting for Windows.
+        processed_seq = current_seq;
+        if crate::infrastructure::windows_api::win_clipboard::get_clipboard_sequence_number()
+            == processed_seq
+        {
+            return;
+        }
         }
     }));
 }
@@ -1086,7 +1144,7 @@ pub use utils::{
     build_entry_preview, derive_rich_text_content, extract_animated_image_data_url_from_html,
     extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
     parse_cf_html, repair_html_fragment, split_rich_html_and_image_fallback,
-    split_rich_html_and_named_formats, truncate_html_for_preview,
+    split_rich_html_and_named_formats, truncate_entry_for_ui, truncate_html_for_preview,
 };
 
 pub fn process_new_entry(

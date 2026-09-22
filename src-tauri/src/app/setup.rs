@@ -38,6 +38,26 @@ static WINDOW_SIZE_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 static LAST_WINDOW_SIZE_EVENT_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_WINDOW_SIZE: OnceLock<Mutex<(u32, u32)>> = OnceLock::new();
 
+/// 边缘停靠判定阈值（物理像素）：窗口边距屏幕边界在此值以内即视为「贴在边缘」。
+///
+/// 该值必须小于 `window_manager.rs` 中 `AUTO_PLACEMENT_EDGE_MARGIN`（程序自动摆位留白），
+/// 否则程序摆位会被误判成用户拖拽到边缘（R1 现象 b/c 的根因）。
+const EDGE_DOCK_THRESHOLD: i32 = 5;
+
+/// 判定「用户主动拖拽窗口」时允许的位置抖动（物理像素）。
+/// 按住左键期间窗口位移超过该值才认为窗口是被拖动的，而不是被程序或点击顺手改动。
+const DRAG_POSITION_TOLERANCE: i32 = 8;
+
+/// 用户拖拽结束后，仍允许视为「拖到边缘」的时间窗（毫秒）。
+///
+/// 用户把窗口拖到边缘后通常还要把鼠标挪开、等窗口自行停靠，这中间有几百毫秒到几秒，
+/// 因此不能只在松手的那一帧判定，而是给一个短时间窗。
+const USER_DRAG_PIN_WINDOW_MS: u64 = 4000;
+
+static DRAG_ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static DRAG_MOVED_BY_USER: AtomicBool = AtomicBool::new(false);
+static LAST_USER_DRAG_END_MS: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug)]
 struct WindowRect {
     x: i32,
@@ -359,9 +379,9 @@ fn load_settings(repo: &impl SettingsRepository) -> StartupSettings {
             .unwrap_or(false),
         follow_mouse: repo
             .get("app.follow_mouse")
-            .unwrap_or(Some("true".to_string()))
+            .unwrap_or(Some("false".to_string()))
             .map(|v| v == "true")
-            .unwrap_or(true),
+            .unwrap_or(false),
         window_pinned: repo
             .get("app.window_pinned")
             .unwrap_or(Some("false".to_string()))
@@ -515,6 +535,9 @@ fn setup_main_window(app: &App, s: &StartupSettings) {
             IS_HIDDEN.store(false, Ordering::Relaxed);
             CURRENT_DOCK.store(0, Ordering::Relaxed);
         }
+
+        // 记录启动时窗口所在的显示器，作为后续「唤起屏」判定的基线
+        crate::app::window_manager::refresh_recall_monitor(&window);
     }
 
     schedule_window_position_repair(app.handle().clone(), s.edge_docking);
@@ -713,6 +736,117 @@ fn start_services(app: &App, s: &StartupSettings, app_handle: AppHandle) {
     }
 }
 
+/// 读取窗口可用的显示器列表（物理像素矩形）。
+#[cfg(target_os = "windows")]
+fn monitor_rects_of<W: MonitorQuery>(window: &W) -> Vec<MonitorRect> {
+    window.monitor_rects()
+}
+
+/// 拖拽探测器：判断「窗口是被用户主动拖到边缘的」，而不是被程序摆位摆过去的。
+///
+/// 依据是 Windows 的实时按键状态与窗口位置变化：
+/// - 按住左键（VK_LBUTTON）期间以按下瞬间的窗口位置为锚点；
+/// - 锚点位移一旦超过 `DRAG_POSITION_TOLERANCE`，即认定窗口是被用户拖动的；
+/// - 左键松开时结算：确实拖动过则标记「用户拖拽结束」并记录时刻；
+/// - 随后 `USER_DRAG_PIN_WINDOW_MS` 内视为拖拽收尾阶段。
+///
+/// 程序用 `set_position` 摆窗时不伴随左键按下，因此永远无法进入该状态。
+///
+/// 注意：本函数必须在每轮轮询中**无条件调用**。若只在「窗口已处于边缘」的分支里调用，
+/// 用户从屏幕中间把窗口拖到边缘的整个过程都不会被采样，到头来攒不够位移量而漏判。
+#[cfg(target_os = "windows")]
+fn update_user_drag_state(window_rect: &RECT) -> bool {
+    let lbutton_down = unsafe { (GetAsyncKeyState(0x01) as u16 & 0x8000) != 0 };
+    let mut anchor = match DRAG_ANCHOR.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+
+    if lbutton_down {
+        match *anchor {
+            None => {
+                // 左键按下的第一帧：以当前位置为基准。若这一帧起始位置已被程序摆到边缘，
+                // 位移累计从零开始，之后没有真实拖动就攒不出位移量。
+                *anchor = Some((window_rect.left, window_rect.top));
+            }
+            Some((ax, ay)) => {
+                if drag_offset_exceeds_tolerance((ax, ay), (window_rect.left, window_rect.top), DRAG_POSITION_TOLERANCE)
+                {
+                    // 相对锚点持续累计：一次按住期间只要出现过超过容差的总位移即判定为拖动
+                    DRAG_MOVED_BY_USER.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    } else if anchor.is_some() {
+        // 左键刚松开：只有真的移动过才算用户拖拽
+        *anchor = None;
+        if DRAG_MOVED_BY_USER.swap(false, Ordering::Relaxed) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            LAST_USER_DRAG_END_MS.store(now, Ordering::Relaxed);
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 一次「按住左键」的位移是否已经越过容差，即窗口是否真的被用户拖过。
+///
+/// 从锚点到当前累计位移按曼哈顿距离判断，窗口只动 X 或只动 Y 都能识别。
+pub fn drag_offset_exceeds_tolerance(
+    anchor: (i32, i32),
+    current: (i32, i32),
+    tolerance: i32,
+) -> bool {
+    (current.0 - anchor.0).abs() > tolerance || (current.1 - anchor.1).abs() > tolerance
+}
+
+/// 距离上次「用户主动拖拽窗口」结束是否仍在收尾时间窗内。
+#[cfg(target_os = "windows")]
+fn within_user_drag_window(now: u64) -> bool {
+    let last = LAST_USER_DRAG_END_MS.load(Ordering::Relaxed);
+    last != 0 && now.saturating_sub(last) <= USER_DRAG_PIN_WINDOW_MS
+}
+
+/// 自动置顶的唯一开关点：只有「用户主动拖拽窗口到边缘」才允许自动置顶。
+///
+/// R1 现象 b 的根因是原实现只要判定贴边就置顶，而 `window_manager.rs` 的程序摆位
+/// 恰好会落在与停靠阈值重合的 5px 内（主副屏交界正是主屏的一条边），于是自动摆位被
+/// 误判成贴边并置顶。修复后：
+/// - 程序摆位（无左键拖拽）永不触发置顶；
+/// - 用户拖拽到边缘后的收尾时间窗内可触发一次置顶；
+/// - 用户手动点图钉的置顶/取消置顶完全不受影响（走 `set_window_pinned` 命令）。
+#[cfg(target_os = "windows")]
+fn maybe_auto_pin_on_user_dock(app_handle: &AppHandle, window: &tauri::WebviewWindow, now: u64) {
+    if !within_user_drag_window(now) {
+        return;
+    }
+    if WINDOW_PINNED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    WINDOW_PINNED.store(true, Ordering::Relaxed);
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focusable(false);
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let ex_style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+            );
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+                ex_style | WS_EX_NOACTIVATE.0 as isize,
+            );
+        }
+    }
+    let _ = app_handle.emit("window-pinned-changed", true);
+}
+
 #[cfg(target_os = "windows")]
 fn start_edge_docking_monitor(app_handle: AppHandle) {
     std::thread::spawn(move || {
@@ -723,6 +857,22 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 Some(s) => s,
                 None => continue,
             };
+
+            // Drag sampling runs before every `continue` below, on purpose.
+            // Those guards skip docking *decisions*, but a user drag can begin and end
+            // inside their windows (the 500ms post-show grace especially), and the
+            // anchor/moved state would then never advance — so a real drag to the edge
+            // would silently fail to auto-pin. The function's effect is its global
+            // state; the return value is informative only.
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let mut drag_rect = RECT::default();
+                if let Ok(hwnd) = window.hwnd() {
+                    unsafe {
+                        let _ = GetWindowRect(HWND(hwnd.0), &mut drag_rect);
+                    }
+                    let _is_user_drag_ended = update_user_drag_state(&drag_rect);
+                }
+            }
 
             if !settings.edge_docking.load(Ordering::Relaxed) {
                 if IS_HIDDEN.load(Ordering::Relaxed) {
@@ -798,7 +948,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 let screen_bottom = screen_pos.y + screen_size.height as i32;
 
                 // When hidden, check if mouse is near the edge sliver
-                let threshold = 5;
+                let threshold = EDGE_DOCK_THRESHOLD;
                 let is_mouse_near_edge = if is_hidden_by_edge {
                     let current_dock = CURRENT_DOCK.load(Ordering::Relaxed);
                     match current_dock {
@@ -912,29 +1062,10 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                     }
 
                     if !IS_HIDDEN.load(Ordering::Relaxed) {
-                        // Auto-enable pin only when docking occurs (runtime only, no DB write)
-                        if !WINDOW_PINNED.load(Ordering::Relaxed) {
-                            WINDOW_PINNED.store(true, Ordering::Relaxed);
-                            let _ = window.set_always_on_top(true);
-                            let _ = window.set_focusable(false);
-                            #[cfg(windows)]
-                            if let Ok(hwnd) = window.hwnd() {
-                                unsafe {
-                                    let ex_style =
-                                        windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                                            HWND(hwnd.0),
-                                            GWL_EXSTYLE,
-                                        );
-                                    let _ =
-                                        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                                            HWND(hwnd.0),
-                                            GWL_EXSTYLE,
-                                            ex_style | WS_EX_NOACTIVATE.0 as isize,
-                                        );
-                                }
-                            }
-                            let _ = app_handle.emit("window-pinned-changed", true);
-                        }
+                        // R1 现象 b 修复：自动置顶只在「用户主动拖拽窗口到边缘」后触发
+                        // （见 `maybe_auto_pin_on_user_dock`）。窗口被程序自动摆位、
+                        // 或仅因贴近主副屏交界而满足贴边判定时，WINDOW_PINNED 保持不变。
+                        maybe_auto_pin_on_user_dock(&app_handle, &window, now);
 
                         let window_height = rect.bottom - rect.top;
                         let window_width = rect.right - rect.left;
@@ -1380,6 +1511,13 @@ fn handle_blur(window: &tauri::Window) {
             };
         if !down && matches!(w.is_focused(), Ok(false)) {
             if !IGNORE_BLUR.load(Ordering::Relaxed) && !WINDOW_PINNED.load(Ordering::Relaxed) {
+                // R1 现象 c 修复：鼠标已经在另一块屏幕上时，失焦不隐藏窗口。
+                // 双屏用户点另一块屏继续干活会让本窗口失焦，但那是正常操作而非「离开」，
+                // 隐藏它等于打断；同屏失焦仍保持既有隐藏行为。
+                if cursor_is_on_other_monitor(&w) {
+                    return;
+                }
+
                 let _ = w.hide();
                 NAVIGATION_ENABLED.store(false, Ordering::SeqCst);
                 release_win_keys();
@@ -1387,4 +1525,75 @@ fn handle_blur(window: &tauri::Window) {
             }
         }
     });
+}
+
+/// 光标当前是否位于「窗口所在显示器」之外的另一块显示器上。
+///
+/// 取不到显示器信息时返回 false，即退回既有隐藏语义，不做跨屏豁免。
+#[cfg(target_os = "windows")]
+fn cursor_is_on_other_monitor<W: MonitorQuery>(window: &W) -> bool {
+    let monitors = monitor_rects_of(window);
+    if monitors.is_empty() {
+        return false;
+    }
+
+    let window_monitor = window.current_monitor_rect();
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+
+    is_point_on_other_monitor(window_monitor, &monitors, point.x, point.y)
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::{drag_offset_exceeds_tolerance, DRAG_POSITION_TOLERANCE};
+
+    #[test]
+    fn drag_detection_ignores_programmatic_placement_jitter() {
+        // 程序用 set_position 摆窗不会伴随左键按下；即便位置变化在容差以内，
+        // 也不能被判成「用户拖拽」，否则自动置顶会被程序摆位触发（R1 现象 b）。
+        assert!(!drag_offset_exceeds_tolerance(
+            (100, 100),
+            (100 + DRAG_POSITION_TOLERANCE, 100),
+            DRAG_POSITION_TOLERANCE
+        ));
+        assert!(!drag_offset_exceeds_tolerance(
+            (100, 100),
+            (100 - DRAG_POSITION_TOLERANCE, 100 - DRAG_POSITION_TOLERANCE),
+            DRAG_POSITION_TOLERANCE
+        ));
+    }
+
+    #[test]
+    fn drag_detection_accepts_real_user_drag() {
+        // 用户拖动窗口：横移、竖移、斜移都要被识别
+        assert!(drag_offset_exceeds_tolerance(
+            (100, 100),
+            (100 + DRAG_POSITION_TOLERANCE + 1, 100),
+            DRAG_POSITION_TOLERANCE
+        ));
+        assert!(drag_offset_exceeds_tolerance(
+            (100, 100),
+            (100, 100 - DRAG_POSITION_TOLERANCE - 1),
+            DRAG_POSITION_TOLERANCE
+        ));
+        // 从屏幕中间拖到边缘的完整位移，必须远超容差
+        assert!(drag_offset_exceeds_tolerance(
+            (800, 500),
+            (0, 500),
+            DRAG_POSITION_TOLERANCE
+        ));
+    }
+
+    #[test]
+    fn dock_threshold_stays_below_auto_placement_margin() {
+        // 5px 停靠阈值与 40px 自动摆位留白必须不相等，否则「程序摆到边缘」= 「用户拖到边缘」
+        assert_ne!(
+            super::EDGE_DOCK_THRESHOLD,
+            crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN
+        );
+        assert!(super::EDGE_DOCK_THRESHOLD < crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN);
+    }
 }

@@ -443,7 +443,20 @@ pub unsafe extern "system" fn mouse_proc(n_code: i32, w_param: WPARAM, l_param: 
                                     || point.y < rect.top - margin
                                     || point.y > rect.bottom + margin;
 
-                                if is_outside {
+                                // 多显示器（R1 现象 c）：点击落在另一块屏幕上时不得隐藏窗口。
+                                // 双屏环境下另一块屏必然位于窗口矩形之外，只看矩形会把「在另一块屏
+                                // 上继续操作」误判成「点击别处」而关掉窗口。这里按显示器判定：命中
+                                // 另一块屏就直接跳过隐藏分支；同屏点击窗口外仍保持既有隐藏语义。
+                                let monitors = window.monitor_rects();
+                                let window_monitor = window.current_monitor_rect();
+                                let is_on_other_monitor = is_point_on_other_monitor(
+                                    window_monitor,
+                                    &monitors,
+                                    point.x,
+                                    point.y,
+                                );
+
+                                if is_outside && !is_on_other_monitor {
                                     // Status check before hiding
                                     if !WindowExt::is_window_visible(main_hwnd) {
                                         return CallNextHookEx(None, n_code, w_param, l_param);

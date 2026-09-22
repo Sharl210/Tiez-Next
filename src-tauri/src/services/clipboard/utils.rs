@@ -460,6 +460,10 @@ fn normalize_plain_text_layout(text: &str) -> String {
 }
 
 fn decode_basic_html_entities(text: &str) -> String {
+    // Kept as the original sequential replacement. It sits on the shared
+    // HTML→text path, and its double-decoding behaviour (e.g. `&amp;lt;` → `<`)
+    // is relied upon by existing preview output, so it is deliberately not
+    // "improved" here.
     text.replace("&nbsp;", " ")
         .replace("&#160;", " ")
         .replace("&amp;", "&")
@@ -893,10 +897,167 @@ pub fn infer_rich_html_from_plain_text(
     None
 }
 
+/// Upper bound for treating a single token as a copied link. Anything longer is
+/// page content rather than a URL, so the HTML text keeps winning there.
+const BARE_URL_TEXT_MAX_CHARS: usize = 8192;
+
+/// Is this text one bare URL and nothing else?
+fn looks_like_bare_url_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > BARE_URL_TEXT_MAX_CHARS {
+        return false;
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some(host) = url_host_of(trimmed) else {
+        return false;
+    };
+
+    // Reject tokens that merely look host-shaped so that version numbers and
+    // filenames ("3.14", "1.2.3", "readme.md") are not taken for links. Without a
+    // scheme, a real link ends in an alphabetic top-level label; and a bare
+    // "a.b"-style token with no path is far more likely a filename fragment.
+    let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    if !has_scheme && host != "localhost" {
+        let tld = host.rsplit('.').next().unwrap_or_default();
+        if tld.is_empty() || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        if !trimmed.contains('/') && !trimmed.starts_with("www.") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Registered host of a URL-shaped token (scheme optional), lowercased and with
+/// userinfo, port and IPv6 brackets removed. `None` means the token is not
+/// URL-shaped at all.
+fn url_host_of(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Drop a "user:password@" prefix, then a ":port" / "[v6]:port" suffix.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    }
+    .to_ascii_lowercase();
+
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+
+    let well_formed = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !well_formed || (!host.contains('.') && host != "localhost") {
+        return None;
+    }
+
+    Some(host)
+}
+
+/// Host comparison key for deciding whether two links point at the same site.
+///
+/// Comparing hosts literally is too strict: the same page is commonly reachable as
+/// `example.com`, `www.example.com` and `docs.example.com`, and a copied link whose
+/// anchor uses a sibling subdomain is still the same site. So subdomains are
+/// collapsed to their registrable domain. A two-label suffix is treated as the
+/// domain boundary, which is right for the common `example.com` case and errs
+/// toward matching for longer public suffixes (never toward rejecting a real link).
+fn comparable_url_host(host: &str) -> String {
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() <= 2 {
+        return host.to_string();
+    }
+    labels[labels.len() - 2..].join(".")
+}
+
+/// First `href` value of an anchor in this HTML, entity-decoded and trimmed.
+fn first_anchor_href(html: &str) -> Option<String> {
+    static ANCHOR_HREF_RE: OnceLock<Regex> = OnceLock::new();
+
+    let captures = ANCHOR_HREF_RE
+        .get_or_init(|| {
+            Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#).unwrap()
+        })
+        .captures(html)?;
+    let raw = captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))?
+        .as_str();
+    let decoded = decode_basic_html_entities(raw).trim().to_string();
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+/// Does this payload describe a link whose plain text is the URL while the HTML
+/// carries a text label for it?
+///
+/// Browsers write the anchor label into `CF_UNICODETEXT` and put the real
+/// target only into `CF_HTML` (`<a href="…">label</a>`). The HTML text wins by
+/// default, which turns "copy link" into "copy the page title": the URL never
+/// reaches the database, and pasting — plain text included — yields the title
+/// only. When the plain text really is the URL of the same site the anchor
+/// points at, the URL is the more faithful content and is kept instead. A
+/// different host means the HTML text is the genuine content (an in-article
+/// hyperlink inside copied text), so the default preference stays untouched.
+fn describes_href_backed_link(plain_text: &str, html: &str) -> bool {
+    if !looks_like_bare_url_text(plain_text) {
+        return false;
+    }
+    let Some(href) = first_anchor_href(html) else {
+        return false;
+    };
+    let (Some(plain_host), Some(href_host)) = (url_host_of(plain_text), url_host_of(&href)) else {
+        return false;
+    };
+    if comparable_url_host(&plain_host) != comparable_url_host(&href_host) {
+        return false;
+    }
+
+    // The label must actually differ from the URL; otherwise the default path
+    // already produces the same value.
+    let html_text = extract_plain_text_from_htmlish(html);
+    collapse_preview_whitespace(&html_text) != collapse_preview_whitespace(plain_text)
+}
+
 pub fn derive_rich_text_content(content: &str, html_content: Option<&str>) -> String {
     let sanitized_plain = sanitize_rich_text_plain_text(content);
     if looks_like_obsidian_callout_markdown(&sanitized_plain) {
         return sanitized_plain;
+    }
+
+    // Keep the URL of an href-backed link instead of the anchor label offered by
+    // the HTML. This is also what the paste paths see: they call this helper
+    // again with the stored row, so a plain-text paste yields the URL as well.
+    if let Some(html) = html_content {
+        if describes_href_backed_link(&sanitized_plain, html) {
+            return sanitized_plain;
+        }
     }
 
     let html_text = html_content
@@ -1220,9 +1381,10 @@ mod tests {
     use super::{
         app_cleanup_policy_matches, apply_cleanup_rules, attach_rich_image_fallback,
         attach_rich_named_formats, build_entry_preview, collapse_preview_whitespace,
-        derive_rich_text_content, extract_animated_image_data_url_from_html,
+        decode_basic_html_entities, derive_rich_text_content,
+        extract_animated_image_data_url_from_html,
         extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
-        infer_rich_html_from_plain_text, normalize_clipboard_plain_text,
+        infer_rich_html_from_plain_text, looks_like_bare_url_text, normalize_clipboard_plain_text,
         parse_app_cleanup_policies, parse_cf_html, parse_cleanup_rules,
         split_rich_html_and_image_fallback, split_rich_html_and_named_formats,
         truncate_html_for_preview, AppCleanupPolicy, HTML_TRUNCATION_SUFFIX,
@@ -1305,6 +1467,111 @@ mod tests {
         let content = derive_rich_text_content(text, Some(html));
 
         assert_eq!(content, "顶顶顶顶");
+    }
+
+    #[test]
+    fn rich_text_content_keeps_copied_link_url_instead_of_anchor_label() {
+        // Browser "copy link": plain text is the URL, HTML only carries the label.
+        let text = "https://example.com/article";
+        let html = "<a href=\"https://example.com/article\">Example Site | Home</a>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn rich_text_content_keeps_copied_link_url_without_scheme_or_www_prefix() {
+        // Same entry re-derived on the paste path, where the stored plain text
+        // may already have lost its scheme while the href kept it.
+        let text = "www.example.com/article";
+        let html = "<a href=\"http://example.com/article\">Example Site | Home</a>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn rich_text_content_still_prefers_html_text_for_in_article_links() {
+        // The copied text (not the clipboard plain text) is the content here, so
+        // the HTML text has to keep winning over any anchor href.
+        let text = "Read the full story";
+        let html = "<p>Read the <a href=\"https://example.com/article\">full story</a></p>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, "Read the full story");
+    }
+
+    #[test]
+    fn rich_text_content_keeps_html_text_when_anchor_points_to_another_host() {
+        // The plain text is a URL but the anchor links elsewhere, so this is page
+        // content with a hyperlink rather than a copied link.
+        let text = "https://example.com/article";
+        let html = "<p><a href=\"https://other.example.org/other\">https://example.com/article</a></p>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, "https://example.com/article");
+        assert!(content.contains("example.com"));
+    }
+
+    #[test]
+    fn rich_text_content_keeps_html_text_when_plain_text_is_not_a_url() {
+        let text = "Example Site | Home";
+        let html = "<a href=\"https://example.com/article\">Example Site | Home</a>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, "Example Site | Home");
+    }
+
+    #[test]
+    fn rich_text_content_keeps_url_when_anchor_uses_a_sibling_subdomain() {
+        // The same site is routinely reachable as example.com, www.example.com and
+        // docs.example.com. A copied link whose anchor uses a sibling subdomain must
+        // still be recognised as the same site, otherwise the URL is replaced by the
+        // page title — the exact symptom being fixed.
+        let text = "https://example.com/guide";
+        let html = "<a href=\"https://docs.example.com/guide\">Example Guide</a>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert_eq!(content, "https://example.com/guide");
+    }
+
+    #[test]
+    fn bare_url_detection_rejects_version_strings_and_filenames() {
+        // These are host-shaped but are not links; treating them as links would let a
+        // stray anchor in the HTML replace genuine text content.
+        for token in ["3.14", "1.2.3", "readme.md", "main.rs", "a.b", "192.168.1.1"] {
+            assert!(!looks_like_bare_url_text(token), "不应视为链接: {token}");
+        }
+    }
+
+    #[test]
+    fn bare_url_detection_accepts_real_links() {
+        for token in [
+            "https://example.com/a",
+            "http://example.com",
+            "www.example.com/page",
+            "example.com/page",
+            "localhost:8080/x",
+        ] {
+            assert!(looks_like_bare_url_text(token), "应视为链接: {token}");
+        }
+    }
+
+    #[test]
+    fn html_entity_decoding_keeps_sequential_replacement_semantics() {
+        // This function sits on the shared HTML→text path and its double-decoding
+        // behaviour is relied on by existing preview output. Locking it here so a
+        // future "cleanup" cannot silently change visible text.
+        assert_eq!(decode_basic_html_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_basic_html_entities("x&nbsp;y"), "x y");
+        assert_eq!(decode_basic_html_entities("&#34;q&#34;"), "\"q\"");
+        assert_eq!(decode_basic_html_entities("&amp;lt;tag&amp;gt;"), "<tag>");
     }
 
     #[test]

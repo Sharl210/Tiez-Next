@@ -278,6 +278,12 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.arrow_key_selection', 'false')",
         [],
     );
+    // 窗口跟随鼠标：默认关闭。多显示器下「跟随鼠标」会让窗口随焦点在屏幕之间跳变，
+    // 与「窗口保留在唤起屏」的期望相反，故默认值由 true 改为 false；用户仍可在设置中开启。
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.follow_mouse', 'false')",
+        [],
+    );
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.window_pinned', 'false')",
         [],

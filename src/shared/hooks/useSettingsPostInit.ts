@@ -316,6 +316,8 @@ export const useSettingsPostInit = ({
       }
     }
     setSilentStart(settings["app.silent_start"] !== "false");
+    // 窗口跟随鼠标默认关闭（后端 StartupSettings / database seed 同为 false）。
+    // 多显示器下跟随鼠标会让窗口随焦点跨屏跳变，与「窗口保留在唤起屏」的期望相反。
     setFollowMouse(settings["app.follow_mouse"] === "true");
     setShowAppBorder(settings["app.show_app_border"] === "true");
     setRegistryWinVEnabled(settings["app.registry_win_v_enabled"] === "true");

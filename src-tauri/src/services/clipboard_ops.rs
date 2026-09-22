@@ -1351,6 +1351,19 @@ fn handle_post_paste_actions(
                 let _ = state.repo.touch_entry(id, Utc::now().timestamp_millis());
             }
         }
+
+        // Tell the clipboard list that this entry was just pasted, so it shows up
+        // as the newest item. The paste path used to update `use_count`/`timestamp`
+        // silently, which the main window could not observe because it only listens
+        // to `clipboard-changed` / `clipboard-updated` / `clipboard-removed`.
+        // Re-reading the row after the touch yields the refreshed timestamp, and the
+        // payload shape matches the capture pipeline's event (one ClipboardEntry).
+        if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
+            let _ = app_handle.emit(
+                "clipboard-updated",
+                crate::services::clipboard::truncate_entry_for_ui(entry),
+            );
+        }
     }
 
     Ok(())

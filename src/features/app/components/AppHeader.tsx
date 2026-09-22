@@ -189,7 +189,7 @@ const AppHeader = ({
                 <input
                   ref={searchInputRef}
                   type="text"
-                  className={`search-input ${showTagFilter && allTags.length > 0 ? 'dropdown-open' : ''}`}
+                  className={`search-input ${showTagFilter && search.trim().length === 0 && allTags.length > 0 ? 'dropdown-open' : ''}`}
                   placeholder={t('search_placeholder')}
                   value={search}
                   onCompositionStart={() => setIsComposing(true)}
@@ -218,7 +218,7 @@ const AppHeader = ({
                   }}
                   style={{ color: colorMode === 'dark' ? '#ffffff' : undefined }}
                 />
-                {showTagFilter && searchIsFocused && allTags.length > 0 && (
+                {showTagFilter && searchIsFocused && search.trim().length === 0 && allTags.length > 0 && (
                   <div className="tags-dropdown">
                     <div className="tags-label">{t('tags') || "Tags"}</div>
                     <div className="tags-list">
