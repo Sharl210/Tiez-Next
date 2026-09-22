@@ -1,17 +1,20 @@
 {
-  "name": "tiez-app",
+  "name": "tiez-next",
   "private": true,
   "version": "0.3.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "vitest run",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features devtools",
     "tauri:build": "tauri build",
+    "tauri:build:win": "tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc",
     "tauri:build:mac-arm": "tauri build --target aarch64-apple-darwin",
     "tauri:build:mac-intel": "PATH=\"$HOME/.cargo/bin:$PATH\" RUSTUP_HOME=\"$HOME/.rustup\" CARGO_HOME=\"$HOME/.cargo\" RUSTUP_TOOLCHAIN=stable-aarch64-apple-darwin tauri build --target x86_64-apple-darwin",
+    "release:win": "set -a && . ./.env && set +a && tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc",
     "release": "set -a && . ./.env && set +a && tauri build",
     "release:arm": "set -a && . ./.env && set +a && tauri build --target aarch64-apple-darwin",
     "release:intel": "set -a && . ./.env && set +a && tauri build --target x86_64-apple-darwin",
@@ -55,7 +58,8 @@
     "node-fetch": "^2.6.7",
     "playwright": "^1.40.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^3.2.4"
   },
   "overrides": {
     "react": "$react",

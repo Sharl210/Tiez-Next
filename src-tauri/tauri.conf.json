@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TieZ",
+  "productName": "Tiez-Next",
   "version": "0.3.4",
-  "identifier": "com.tiez",
+  "identifier": "com.tieznext",
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0MDY1QzlGQkU0ODcwMjMKUldRamNFaStuMXdHcEtFWlNINnVJcVgxa2tRb0wrRlBjdzRmZ3Z1WGJxZ1V3R0w5ZmNUemtvRjMK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0QTY4MUY4M0M5NjEyNzEKUldSeEVwWTgrSUdtUkVFRmphUlVZSGdFRlpjQW16LzVrKzFIYUszTzhzMUxta2FsbWQydWlId0kK",
       "endpoints": [
-        "https://tiez.name666.top/api/v1/latest-version?platform={{target}}"
+        "https://github.com/Sharl210/Tiez-Next/releases/latest/download/latest.json"
       ]
     }
   },
@@ -20,7 +20,7 @@
   "app": {
     "windows": [
       {
-        "title": "TieZ",
+        "title": "Tiez-Next",
         "label": "main",
         "width": 352,
         "height": 380,
@@ -32,7 +32,7 @@
         "backgroundColor": "#00000000",
         "alwaysOnTop": false,
         "decorations": false,
-        "devtools": true,
+        "devtools": false,
         "skipTaskbar": true,
         "visible": true,
         "dragDropEnabled": false,
@@ -125,10 +125,10 @@
               "identifier": "opener:allow-open-url",
               "allow": [
                 {
-                  "url": "https://tiez.name666.top/**"
+                  "url": "https://github.com/Sharl210/Tiez-Next/**"
                 },
                 {
-                  "url": "https://github.com/jimuzhe/tie-z/**"
+                  "url": "https://github.com/jimuzhe/tiez-clipboard/**"
                 }
               ]
             },
@@ -147,12 +147,27 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/app.icns"
+      "icons/icon.icns",
+      "icons/icon.ico"
     ],
     "targets": [
-      "dmg",
-      "app"
+      "nsis"
     ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "compression": "lzma",
+        "installerHooks": "nsis/uninstall.nsh",
+        "languages": [
+          "English",
+          "SimpChinese",
+          "TradChinese"
+        ],
+        "displayLanguageSelector": true,
+        "startMenuFolder": "Tiez-Next"
+      }
+    },
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.13"

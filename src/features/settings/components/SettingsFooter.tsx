@@ -286,7 +286,7 @@ const SettingsFooter = ({
                     justifyContent: 'center',
                     gap: '8px'
                 }}>
-                    <span>TieZ {appVersion ? `v${appVersion}` : "v0.2.0"}</span>
+                    <span>Tiez-Next {appVersion ? `v${appVersion}` : "v0.2.0"}</span>
                     <button
                         onClick={async () => {
                             if (updateStatus) return;

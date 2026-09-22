@@ -6,13 +6,13 @@
 ---
 
 <div align="center">
-  <img src="docs/images/logo.png" alt="TieZ Hero Logo" width="300" />
+  <img src="docs/images/logo.png" alt="Tiez-Next Hero Logo" width="300" />
 
   ### **STAY FAST. STAY SYNCED.**
 
   | STARS | VERSION | LICENSE | PLATFORM |
   | :--- | :--- | :--- | :--- |
-  | [![Stars](https://img.shields.io/github/stars/jimuzhe/tiez-clipboard?label=STARS&style=for-the-badge&color=4CAF50)](https://github.com/jimuzhe/tiez-clipboard/stargazers) | [![Version](https://img.shields.io/github/v/release/jimuzhe/tiez-clipboard?label=VERSION&style=for-the-badge&color=2196F3)](https://github.com/jimuzhe/tiez-clipboard/releases) | [![License](https://img.shields.io/badge/LICENSE-GPL--3.0-FF9800?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0) | [![Platform](https://img.shields.io/badge/PLATFORM-WIN%20%2F%20MAC-f44336?style=for-the-badge)](https://github.com/jimuzhe/tiez-clipboard/releases) |
+  | [![Stars](https://img.shields.io/github/stars/Sharl210/Tiez-Next?label=STARS&style=for-the-badge&color=4CAF50)](https://github.com/Sharl210/Tiez-Next/stargazers) | [![Version](https://img.shields.io/github/v/release/Sharl210/Tiez-Next?label=VERSION&style=for-the-badge&color=2196F3)](https://github.com/Sharl210/Tiez-Next/releases) | [![License](https://img.shields.io/badge/LICENSE-GPL--3.0-FF9800?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0) | [![Platform](https://img.shields.io/badge/PLATFORM-WIN%20%2F%20MAC-f44336?style=for-the-badge)](https://github.com/Sharl210/Tiez-Next/releases) |
 
   [English](./README.md) | [简体中文](./README.zh-CN.md)
 </div>
@@ -81,15 +81,15 @@
 | **macOS** | Sierra 10.15+ <br>(Apple Silicon / Intel) | `.dmg` |
 | **Linux** | 即将支持 | 敬请期待 |
 
-[**前往 Releases 下载最新版本 →**](https://github.com/jimuzhe/tiez-clipboard/releases)
+[**前往 Releases 下载最新版本 →**](https://github.com/Sharl210/Tiez-Next/releases)
 
 ---
 
 ## Star History
 
 <div align="center">
-  <a href="https://star-history.com/#jimuzhe/tiez-clipboard&Date">
-    <img src="https://api.star-history.com/svg?repos=jimuzhe/tiez-clipboard&type=Date" alt="Star History Chart" width="800" />
+  <a href="https://star-history.com/#Sharl210/Tiez-Next&Date">
+    <img src="https://api.star-history.com/svg?repos=Sharl210/Tiez-Next&type=Date" alt="Star History Chart" width="800" />
   </a>
 </div>
 

@@ -5882,7 +5882,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiez-app"
+name = "tiez-next"
 version = "0.3.4"
 dependencies = [
  "arboard",
