@@ -126,6 +126,143 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 迁移中心：供 UI 展示旧目录占用，并在用户明确要求时备份后清理。
+// ---------------------------------------------------------------------------
+
+/// 一个历史数据目录的现状快照，供"迁移中心"展示。
+#[derive(Debug, Clone)]
+pub struct LegacyDirInfo {
+    /// 目录绝对路径。
+    pub path: PathBuf,
+    /// 该目录对应的历史标识符（目录名）。
+    pub identifier: String,
+    /// 占用的总字节数。
+    pub bytes: u64,
+    /// 文件总数。
+    pub files: u64,
+    /// 是否包含主数据库（含则说明是真实数据目录，而非残留空壳）。
+    pub has_database: bool,
+    /// 是否与当前数据目录重合（重合时不得视为可清理的旧目录）。
+    pub is_current: bool,
+}
+
+/// 列出当前存在的历史数据目录及其占用情况。
+///
+/// 只做只读统计，不做任何修改。`current_dir` 用于标记"与当前数据目录重合"的条目，
+/// 避免 UI 把正在使用的目录误列为可清理对象。
+pub fn list_legacy_dirs(current_dir: &Path) -> Vec<LegacyDirInfo> {
+    let mut out = Vec::new();
+
+    for legacy in legacy_dirs_for(current_dir) {
+        if !legacy.is_dir() {
+            continue;
+        }
+        let identifier = legacy
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let (files, bytes) = match scan_tree(&legacy) {
+            Ok(entries) => (
+                entries.iter().filter(|(k, _)| !k.ends_with('/')).count() as u64,
+                entries.iter().map(|(_, s)| *s).sum(),
+            ),
+            Err(_) => (0, 0),
+        };
+
+        out.push(LegacyDirInfo {
+            has_database: legacy.join(DB_FILE).exists(),
+            path: legacy,
+            identifier,
+            bytes,
+            files,
+            is_current: false, // legacy_dirs_for 只产出历史标识符，天然不等于当前目录
+        });
+    }
+
+    out
+}
+
+/// 备份并删除一个历史数据目录。
+///
+/// 安全设计（与迁移同一套思路：宁可没做成，不可丢数据）：
+/// 1. **先完整备份**到同级带时间戳的目录，备份校验通过后才删除原目录；
+/// 2. 备份失败则**不删除**源目录，直接返回错误；
+/// 3. 删除目标**必须在白名单标识符之内**——防止误传路径删掉用户的其他数据；
+/// 4. 拒绝删除当前正在使用的数据目录。
+///
+/// 返回备份目录路径，便于 UI 告知用户"备份在哪"。
+pub fn backup_and_remove_legacy_dir(
+    current_dir: &Path,
+    target: &Path,
+) -> Result<PathBuf, String> {
+    // ---- 安全校验：只允许删除白名单内的历史标识符目录 ----
+    let allowed: Vec<PathBuf> = legacy_dirs_for(current_dir);
+    if !allowed.iter().any(|p| p == target) {
+        return Err(format!(
+            "拒绝操作：{} 不在允许清理的历史数据目录白名单内",
+            target.display()
+        ));
+    }
+    if target == current_dir {
+        return Err("拒绝操作：不能删除当前正在使用的数据目录".to_string());
+    }
+    if !target.is_dir() {
+        return Err(format!("目录不存在或不是目录：{}", target.display()));
+    }
+
+    // 空目录直接删，无需备份（没有数据可保）。
+    let entries = scan_tree(target).map_err(|e| format!("读取目录失败：{}", e))?;
+    if entries.is_empty() {
+        fs::remove_dir_all(target).map_err(|e| format!("删除空目录失败：{}", e))?;
+        return Ok(PathBuf::new());
+    }
+
+    // ---- 第一步：备份到同级带时间戳的目录 ----
+    let backup = backup_path_for(target);
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    copy_tree(target, &backup).map_err(|e| format!("创建备份失败（未删除任何数据）：{}", e))?;
+
+    // ---- 第二步：校验备份完整，不完整则不删源 ----
+    let backup_entries = scan_tree(&backup).map_err(|e| format!("校验备份失败：{}", e))?;
+    if backup_entries != entries {
+        let _ = fs::remove_dir_all(&backup);
+        return Err(format!(
+            "备份内容与源不一致（源 {} 项 / 备份 {} 项），已放弃删除，源数据未改动",
+            entries.len(),
+            backup_entries.len()
+        ));
+    }
+
+    // ---- 第三步：备份完好，才删除源目录 ----
+    fs::remove_dir_all(target).map_err(|e| {
+        format!(
+            "备份已保存在 {}，但删除源目录失败：{}",
+            backup.display(),
+            e
+        )
+    })?;
+
+    Ok(backup)
+}
+
+/// 备份目录路径：同名 + `.backup-<时间戳>`，与源目录同级。
+fn backup_path_for(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "appdata".to_string());
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    parent.join(format!("{}.backup-{}", name, stamp))
+}
+
 /// 内部三态：无此候选 / 跳过 / 成功 / 失败。
 enum Outcome {
     /// 该候选不存在或无需处理，继续试下一个。
@@ -621,6 +758,113 @@ mod tests {
         );
         // 源完好
         assert!(legacy.join("attachments/a.png").exists());
+    }
+
+    // ---- 迁移中心：列表统计与备份删除 ----
+
+    #[test]
+    fn lists_legacy_dirs_with_size_and_db_flag() {
+        let root = tmp("list");
+        let current = root.join("com.tieznext");
+        seed_legacy(&root.join("com.tiez.app"));
+
+        let list = list_legacy_dirs(&current);
+
+        assert_eq!(list.len(), 1);
+        let info = &list[0];
+        assert_eq!(info.identifier, "com.tiez.app");
+        assert!(info.has_database);
+        // seed_legacy 造 7 个文件：db, db-wal, db-shm, tiez.log, datapath.txt,
+        // attachments/a.png, emoji_favorites/e.json（目录不计入 files）
+        assert_eq!(info.files, 7);
+        assert!(info.bytes > 0);
+    }
+
+    #[test]
+    fn list_excludes_nonexistent_and_marks_current_dir() {
+        let root = tmp("list2");
+        let current = root.join("com.tieznext");
+        fs::create_dir_all(&current).unwrap();
+
+        // 两个历史目录都不存在
+        assert!(list_legacy_dirs(&current).is_empty());
+        // 当前目录本身不会被列为可清理项
+        let list = list_legacy_dirs(&current);
+        assert!(!list.iter().any(|i| i.path == current));
+    }
+
+    #[test]
+    fn backup_then_remove_keeps_a_full_copy() {
+        let root = tmp("del");
+        let current = root.join("com.tieznext");
+        let legacy = root.join("com.tiez.app");
+        seed_legacy(&legacy);
+        let before = scan_tree(&legacy).unwrap();
+
+        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+
+        // 源目录已删除
+        assert!(!legacy.exists(), "源目录应已被删除");
+        // 备份存在且内容完整
+        assert!(backup.exists(), "备份必须存在");
+        assert_eq!(scan_tree(&backup).unwrap(), before, "备份内容必须与源一致");
+    }
+
+    #[test]
+    fn refuses_to_delete_paths_outside_whitelist() {
+        let root = tmp("deny");
+        let current = root.join("com.tieznext");
+        // 这不是历史标识符目录，绝不允许删
+        let victim = root.join("user-important-docs");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("thesis.docx"), b"irreplaceable").unwrap();
+
+        let err = backup_and_remove_legacy_dir(&current, &victim).unwrap_err();
+
+        assert!(err.contains("白名单"), "应因白名单拒绝，实际: {}", err);
+        assert!(victim.join("thesis.docx").exists(), "用户数据必须完好");
+    }
+
+    #[test]
+    fn refuses_to_delete_current_data_dir() {
+        let root = tmp("denycur");
+        // 构造一个"当前目录恰好是历史标识符"的场景（防御性）
+        let current = root.join("com.tiez.app");
+        seed_legacy(&current);
+
+        let err = backup_and_remove_legacy_dir(&current, &current).unwrap_err();
+
+        assert!(err.contains("当前"), "应拒绝删除当前目录，实际: {}", err);
+        assert!(current.join(DB_FILE).exists(), "数据必须完好");
+    }
+
+    #[test]
+    fn removes_empty_legacy_dir_without_backup() {
+        let root = tmp("empty");
+        let current = root.join("com.tieznext");
+        let legacy = root.join("com.tiez.app");
+        fs::create_dir_all(&legacy).unwrap(); // 空目录
+
+        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+
+        assert!(!legacy.exists());
+        assert!(backup.as_os_str().is_empty(), "空目录无需备份");
+    }
+
+    #[test]
+    fn delete_failure_leaves_backup_and_reports_path() {
+        let root = tmp("delmiss");
+        let current = root.join("com.tieznext");
+        let legacy = root.join("com.tiez.app");
+        seed_legacy(&legacy);
+
+        // 正常删除应成功并留下备份
+        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+        assert!(backup.exists());
+        // 再次删除同一目录应报"不存在"，且不误删备份
+        let err = backup_and_remove_legacy_dir(&current, &legacy).unwrap_err();
+        assert!(err.contains("不存在"), "实际: {}", err);
+        assert!(backup.exists(), "备份不得被后续调用删除");
     }
 
     #[test]

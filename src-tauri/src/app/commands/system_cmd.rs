@@ -34,6 +34,48 @@ pub fn open_data_folder(state: State<'_, AppDataDir>) -> AppResult<()> {
     Ok(())
 }
 
+/// 供"迁移中心"展示的一条历史数据目录信息（前端友好格式）。
+#[derive(serde::Serialize)]
+pub struct LegacyDirView {
+    pub path: String,
+    pub identifier: String,
+    pub bytes: u64,
+    pub files: u64,
+    pub has_database: bool,
+}
+
+/// 迁移中心：列出旧标识符遗留的数据目录及其占用。
+///
+/// 只读操作，不修改任何数据。用户据此决定是否清理。
+#[tauri::command]
+pub fn list_legacy_data_dirs(state: State<'_, AppDataDir>) -> AppResult<Vec<LegacyDirView>> {
+    let current = state.0.lock().unwrap().clone();
+    Ok(crate::migration_identifier::list_legacy_dirs(&current)
+        .into_iter()
+        .map(|i| LegacyDirView {
+            path: i.path.to_string_lossy().to_string(),
+            identifier: i.identifier,
+            bytes: i.bytes,
+            files: i.files,
+            has_database: i.has_database,
+        })
+        .collect())
+}
+
+/// 迁移中心：备份后删除一个遗留数据目录。
+///
+/// 安全边界：仅允许删除白名单内的历史标识符目录；先完整备份并校验，通过后才删除源目录；
+/// 备份失败则不删除任何数据。返回备份目录路径供界面告知用户。
+#[tauri::command]
+pub fn remove_legacy_data_dir(state: State<'_, AppDataDir>, path: String) -> AppResult<String> {
+    let current = state.0.lock().unwrap().clone();
+    let target = std::path::PathBuf::from(&path);
+
+    crate::migration_identifier::backup_and_remove_legacy_dir(&current, &target)
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(AppError::Validation)
+}
+
 #[tauri::command]
 pub fn open_file_with_default_app(file_path: String) -> AppResult<()> {
     use std::process::Command;
