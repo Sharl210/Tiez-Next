@@ -21,6 +21,10 @@ pub struct ClipboardEntry {
     pub is_external: bool, // New field to track if content is a file path
     #[serde(default)]
     pub pinned_order: i64, // For manual sorting of pinned items
+    /// Free-form user remark attached to this entry.
+    /// Defaulted so payloads produced by builds that predate this field still deserialize.
+    #[serde(default)]
+    pub note: String,
     #[serde(default = "default_true")]
     pub file_preview_exists: bool, // Transient field: does the file exist on disk?
 }

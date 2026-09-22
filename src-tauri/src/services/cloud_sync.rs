@@ -172,6 +172,10 @@ struct CloudSyncItem {
     pub use_count: i32,
     #[serde(default)]
     pub pinned_order: i64,
+    /// User remark. Defaulted so that sync payloads from older builds
+    /// (which do not carry this field) still deserialize.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1170,6 +1174,7 @@ fn collect_local_syncable_items(
                 tags: e.tags,
                 use_count: e.use_count,
                 pinned_order: e.pinned_order,
+                note: e.note.clone(),
             })?;
             let mut item = normalized;
             item.content_hash = compute_sync_content_hash(&item.content_type, &item.content);
@@ -1229,6 +1234,7 @@ fn collect_local_tombstones(
                 tags: Vec::new(),
                 use_count: 0,
                 pinned_order: 0,
+                note: String::new(),
             })
         })
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1506,6 +1512,7 @@ fn apply_remote_changes(
                 || item.content_type == "file"
                 || item.content_type == "video",
             pinned_order: item.pinned_order,
+            note: item.note.clone(),
             file_preview_exists: true,
         };
 
@@ -3398,6 +3405,7 @@ fn check_and_create_emoji_sync_op(app: &AppHandle) -> AppResult<Option<CloudSync
         preview: "⭐ Emoji Sync".to_string(),
         is_pinned: false,
         pinned_order: 0,
+        note: String::new(),
         tags: vec![],
         use_count: 0,
     }))
@@ -3523,6 +3531,7 @@ mod tests {
             tags: vec![],
             use_count: 0,
             pinned_order: 0,
+            note: String::new(),
         };
 
         let normalized = normalize_item_for_sync(item).expect("normalized item");

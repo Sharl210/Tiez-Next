@@ -246,6 +246,7 @@ pub async fn handle_text(
                 use_count: 0,
                 is_external: false,
                 pinned_order: 0,
+                note: String::new(),
                 file_preview_exists: true,
             };
             db_state.repo.save(&entry, None).map_err(|e| {
@@ -277,6 +278,7 @@ pub async fn handle_text(
                 use_count: 0,
                 is_external: false,
                 pinned_order: 0,
+                note: String::new(),
                 file_preview_exists: true,
             };
 

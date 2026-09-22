@@ -160,6 +160,7 @@ pub async fn add_manual_item(
         use_count: 0,
         is_external: false,
         pinned_order: 0,
+        note: String::new(),
         file_preview_exists: true,
     };
 

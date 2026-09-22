@@ -452,6 +452,7 @@ pub async fn register_received_file(
             use_count: 0,
             is_external: false,
             pinned_order: 0,
+            note: String::new(),
             file_preview_exists: true,
         };
         if settings.persistent.load(Ordering::Relaxed) {

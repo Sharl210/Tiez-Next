@@ -207,6 +207,19 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
     }
 
+    // Migration 11: User note/remark attached to an entry.
+    // Has a default so upgrading an existing database is lossless, and so a build that
+    // only knows about older columns still sees a valid table shape.
+    if current_version < 11 {
+        if !has_column(conn, "clipboard_history", "note")? {
+            conn.execute(
+                "ALTER TABLE clipboard_history ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
+    }
+
     Ok(())
 }
 
