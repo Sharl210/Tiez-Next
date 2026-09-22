@@ -9,6 +9,7 @@ pub mod global_state;
 pub mod infrastructure;
 pub mod logger;
 pub mod migration;
+pub mod migration_identifier;
 pub mod services;
 
 use crate::app::setup;

@@ -624,6 +624,32 @@ fn rewrite_custom_background_in_db(
     old_base: &std::path::Path,
     new_base: &std::path::Path,
 ) -> AppResult<()> {
+    rewrite_custom_background_in_db_impl(db_path, old_base, new_base, true)
+}
+
+/// 供标识符迁移使用的**只读源**版本：只改写数据库里的路径字符串，
+/// **绝不移动或删除源目录中的文件**。
+///
+/// 迁移的安全契约要求源目录全程只读（见 `crate::migration_identifier`）。用户主动
+/// 切换数据目录时移动源文件是合理的（那时是显式操作），但启动期自动迁移不应改动
+/// 旧目录——否则"迁移失败也不损失原数据"的保证就不成立了。
+pub fn rewrite_data_paths_in_db(
+    db_path: &std::path::Path,
+    old_base: &std::path::Path,
+    new_base: &std::path::Path,
+) -> AppResult<()> {
+    rewrite_attachment_paths_in_db(db_path, old_base, new_base)?;
+    rewrite_emoji_favorites_in_db(db_path, old_base, new_base)?;
+    rewrite_custom_background_in_db_impl(db_path, old_base, new_base, false)?;
+    Ok(())
+}
+
+fn rewrite_custom_background_in_db_impl(
+    db_path: &std::path::Path,
+    old_base: &std::path::Path,
+    new_base: &std::path::Path,
+    move_source_file: bool,
+) -> AppResult<()> {
     let conn = Connection::open(db_path).map_err(AppError::from)?;
     let value: Option<String> = conn
         .query_row(
@@ -652,7 +678,9 @@ fn rewrite_custom_background_in_db(
     };
     let new_path = new_base.join(relative);
 
-    if old_path != new_path && old_path.exists() {
+    // 只在"用户主动切换数据目录"的场景下移动源文件；自动迁移时跳过，
+    // 文件已由迁移逻辑复制到新目录，这里仅改写引用。
+    if move_source_file && old_path != new_path && old_path.exists() {
         if let Some(parent) = new_path.parent() {
             std::fs::create_dir_all(parent).map_err(AppError::from)?;
         }
