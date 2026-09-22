@@ -1,10 +1,12 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 const EMPTY_TAG_SUGGESTIONS: string[] = [];
 import type { Dispatch, SetStateAction, MouseEvent, ReactNode } from "react";
 import type { DragControls } from "framer-motion";
 import ClipboardItem from "../../features/clipboard/components/ClipboardItem";
 import type { QuickPasteHint } from "../../features/clipboard/types";
+import { isBodyEditable } from "../../features/clipboard/types";
 import type { ClipboardEntry } from "../types";
 import type { Locale } from "../types";
 
@@ -93,6 +95,39 @@ export const useClipboardItemRenderer = ({
   handleUpdateTags,
   handleAIAction
 }: UseClipboardItemRendererOptions): { renderItemContent: RenderItemContent } => {
+  /**
+   * R10: body-editing state lives here rather than in App.tsx.
+   *
+   * Two reasons: the owner of this task must not touch App.tsx (a concurrent change
+   * owns that file), and the renderer is the only consumer of the state — the dialog
+   * is rendered by ClipboardItem itself. The list refresh needs no wiring at all:
+   * `update_item_content` emits `clipboard-changed`, which App already listens for
+   * (`useClipboardEvents` → `onChanged` → `fetchHistory(true)`).
+   */
+  const [editingBodyId, setEditingBodyId] = useState<number | null>(null);
+  const [bodyEditSaving, setBodyEditSaving] = useState(false);
+  const [bodyEditError, setBodyEditError] = useState<string | null>(null);
+
+  const closeBodyEditor = useCallback(() => {
+    setEditingBodyId(null);
+    setBodyEditSaving(false);
+    setBodyEditError(null);
+  }, []);
+
+  const saveBodyEdit = useCallback(async (id: number, newContent: string) => {
+    setBodyEditSaving(true);
+    setBodyEditError(null);
+    try {
+      await invoke("update_item_content", { id, newContent });
+      setEditingBodyId(null);
+    } catch (err) {
+      // TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳
+      setBodyEditError(`保存失败：${err?.toString() || err}`);
+    } finally {
+      setBodyEditSaving(false);
+    }
+  }, []);
+
   const renderItemContent = useCallback(
     (item: ClipboardEntry, index: number, dragControls?: DragControls, disableLayout?: boolean) => {
       const isSensitiveHidden =
@@ -114,6 +149,22 @@ export const useClipboardItemRenderer = ({
           isRevealed={revealedIds.has(item.id)}
           isEditingTags={isEditingTags}
           tagInput={isEditingTags ? tagInput : ""}
+          // R10: only text-like bodies get an editor. `image` / `file` / `video` store
+          // a path or a data URL; rewriting it would desync `content_hash` (the backend
+          // now refuses that too), and their note is edited from tag management.
+          onEdit={isBodyEditable(item.content_type) ? (e) => {
+            e.stopPropagation();
+            setBodyEditError(null);
+            setEditingBodyId(item.id);
+          } : undefined}
+          isEditingBody={editingBodyId === item.id}
+          bodyInitialDraft={editingBodyId === item.id ? item.content : undefined}
+          bodyEditSaving={bodyEditSaving}
+          bodyEditError={editingBodyId === item.id ? bodyEditError : null}
+          onBodyEditSave={isBodyEditable(item.content_type)
+            ? (newContent) => { void saveBodyEdit(item.id, newContent); }
+            : undefined}
+          onBodyEditCancel={closeBodyEditor}
           tagSuggestions={isEditingTags ? allTags : EMPTY_TAG_SUGGESTIONS}
           tagColors={tagColors}
           theme={theme}
@@ -229,7 +280,12 @@ export const useClipboardItemRenderer = ({
       setEditingTagsId,
       setTagInput,
       handleUpdateTags,
-      handleAIAction
+      handleAIAction,
+      editingBodyId,
+      bodyEditSaving,
+      bodyEditError,
+      closeBodyEditor,
+      saveBodyEdit
     ]
   );
 

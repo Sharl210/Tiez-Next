@@ -291,9 +291,20 @@ pub fn delete_tag_from_all(
     app_data: State<'_, AppDataDir>,
     tag_name: String,
 ) -> AppResult<()> {
+    // R3: unlinking the tag from in-session entries, not dropping those entries.
+    //
+    // This used to be `session_items.retain(|item| !item.tags.contains(&tag_name))`,
+    // which discarded every not-yet-persisted entry that happened to carry the tag —
+    // the same "delete a group, lose your data" defect the repository path had, only
+    // harder to notice because session entries are the most recently copied ones.
+    // Matching is case-insensitive to mirror the repository's `COLLATE NOCASE`.
     {
         let mut session_items = session.inner().0.lock().unwrap();
-        session_items.retain(|item| !item.tags.contains(&tag_name));
+        for item in session_items.iter_mut() {
+            if item.tags.iter().any(|t| t.eq_ignore_ascii_case(&tag_name)) {
+                item.tags.retain(|t| !t.eq_ignore_ascii_case(&tag_name));
+            }
+        }
     }
 
     let data_dir = app_data.0.lock().unwrap();

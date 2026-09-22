@@ -1,4 +1,5 @@
 import { useRef, useEffect, useLayoutEffect, useState, useMemo, memo } from "react";
+import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { currentMonitor, getCurrentWindow, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/window";
@@ -27,10 +28,13 @@ import {
     Files,
     ImageOff,
     FileQuestion,
-    GripVertical
+    GripVertical,
+    Pencil,
+    StickyNote
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
+import { bodyEditDowngradesFormat, getEntryNote } from "../types";
 import {
     formatSensitivePreview,
     getConciseTime,
@@ -45,6 +49,18 @@ import { getSourceAppIcon, peekSourceAppIcon } from "../../../shared/lib/sourceA
 import { registerCompactPreviewControls } from "../lib/compactPreviewControls";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
+/**
+ * R6: how much of an entry note is shown inline before it is cut off. The full text
+ * stays reachable through the `title` tooltip, so a long note cannot break the row
+ * layout while still being readable.
+ */
+const NOTE_INLINE_MAX_CHARS = 120;
+const truncateNoteForInline = (note: string): string => {
+    const trimmed = note.trim();
+    const chars = Array.from(trimmed);
+    if (chars.length <= NOTE_INLINE_MAX_CHARS) return trimmed;
+    return chars.slice(0, NOTE_INLINE_MAX_CHARS).join("") + "…";
+};
 const RICH_IMAGE_FALLBACK_PREFIX = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX = "-->";
 const TABULAR_RICH_HTML_RE = /<(table|tr|td|th|thead|tbody|tfoot|colgroup|col)\b/i;
@@ -702,6 +718,13 @@ const ClipboardItem = ({
     onTagDelete,
     onAIAction,
     onInputSubmit,
+    onEdit,
+    isEditingBody = false,
+    bodyInitialDraft,
+    bodyEditSaving = false,
+    bodyEditError,
+    onBodyEditSave,
+    onBodyEditCancel,
     aiEnabled,
     aiOptionsOpen,
     onAIOptionsToggle,
@@ -722,6 +745,15 @@ const ClipboardItem = ({
     const tagInputRef = useRef<HTMLInputElement>(null);
     const [localTagInput, setLocalTagInput] = useState(tagInput);
     const [localAiOptionsOpen, setLocalAiOptionsOpen] = useState(!!aiOptionsOpen);
+    /**
+     * R10: draft of the body editor. Seeded from `bodyInitialDraft` each time the
+     * dialog opens, so cancelling and reopening never resurrects a discarded draft.
+     */
+    const [bodyDraft, setBodyDraft] = useState<string>(() => bodyInitialDraft ?? "");
+    const bodyEditorOpen = isEditingBody && !!onBodyEditSave;
+    const noteText = getEntryNote(item);
+    const noteIsEmpty = noteText.trim().length === 0;
+    const bodyEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
     const [snapshotFailed, setSnapshotFailed] = useState(false);
     const [richImageFallbackFailed, setRichImageFallbackFailed] = useState(false);
     const [sourceAppIcon, setSourceAppIcon] = useState<string | null>(() => peekSourceAppIcon(item.source_app_path) ?? null);
@@ -1214,6 +1246,20 @@ const ClipboardItem = ({
         }
     }, [isEditingTags]);
 
+    /**
+     * R10: seed the draft when the body editor opens. `item.content` is the source of
+     * truth; the note is deliberately not part of this draft (the note editor belongs
+     * to the tag-management side and writes through a different command).
+     */
+    useEffect(() => {
+        if (!bodyEditorOpen) return;
+        setBodyDraft(bodyInitialDraft ?? item.content ?? "");
+        // The dialog is portalled to <body>, so it would otherwise sit under the
+        // blurred/backdropped list. Close the hover preview for the same reason.
+        void hideCompactPreview();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [bodyEditorOpen, bodyInitialDraft]);
+
     useEffect(() => {
         if (!compactPreviewEnabled) {
             void hideCompactPreview();
@@ -1490,6 +1536,201 @@ const ClipboardItem = ({
         </div>
     );
 
+    /**
+     * R6: show the entry note on the clipboard main page when it is not empty.
+     *
+     * The inline text is cut at `NOTE_INLINE_MAX_CHARS` and the untruncated note is
+     * carried in `title`, so a 2000-character note stays readable without ever
+     * stretching the row.
+     *
+     * Compact mode keeps this in normal flow rather than as an overlay. An absolutely
+     * positioned chip was tried first (mirroring the tag strip) and measured to sit on
+     * top of the second line of content, hiding it — worse than the height it saves.
+     * In flow it costs ~13px, which stays below the ~40px a two-line compact row already
+     * occupies: compact rows were never fixed-height, so density holds and nothing is
+     * covered.
+     *
+     * The remaining collision is the compact tag strip, which is anchored to the
+     * bottom-right of the row. The note therefore reserves that side for itself in
+     * compact mode (`paddingRight`, `textAlign`) so the two never overlap.
+     */
+    const renderNote = () => {
+        const isCompactNote = !!compactMode;
+        // The compact tag strip is absolutely positioned over the row's bottom-right
+        // corner, so the note must not run under it. `maxWidth` on the text element is
+        // what actually bounds it — a flex container's `paddingRight` is not honoured
+        // as a reserve once the child is allowed to grow.
+        const compactNoteReservesTags = isCompactNote && visibleTagCount > 0;
+        return (
+            <div
+                className="entry-note-row"
+                title={noteText}
+                style={{
+                    display: 'flex',
+                    alignItems: isCompactNote ? 'center' : 'flex-start',
+                    gap: isCompactNote ? '3px' : '4px',
+                    marginTop: isCompactNote ? '0' : '2px',
+                    minWidth: 0,
+                    fontSize: '10px',
+                    lineHeight: isCompactNote ? 1.3 : 1.4,
+                    color: 'var(--text-secondary)',
+                    opacity: 0.9
+                }}
+            >
+                <StickyNote
+                    size={10}
+                    style={{ flexShrink: 0, marginTop: isCompactNote ? 0 : '2px' }}
+                />
+                <span
+                    className="entry-note-text"
+                    style={{
+                        minWidth: 0,
+                        maxWidth: compactNoteReservesTags ? '48%' : '100%',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap'
+                    }}
+                >
+                    {truncateNoteForInline(noteText)}
+                </span>
+            </div>
+        );
+    };
+
+    /**
+     * R10: close the body editor on Escape, from anywhere.
+     *
+     * This has to live on `window` rather than on the dialog element. The dialog is
+     * portalled and its content can lose focus (clicking the heading, or any
+     * non-focusable area, leaves `activeElement` on <body>), and a handler bound to the
+     * overlay then never sees the key at all. The capture phase is deliberate: it runs
+     * before the app's global navigation hook, which would otherwise read Escape as
+     * "hide the window" and leave the dialog orphaned on a hidden window.
+     */
+    useEffect(() => {
+        if (!bodyEditorOpen) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                e.preventDefault();
+                onBodyEditCancel?.();
+            }
+        };
+        window.addEventListener('keydown', onKey, true);
+        return () => window.removeEventListener('keydown', onKey, true);
+    }, [bodyEditorOpen, onBodyEditCancel]);
+
+    /**
+     * R10: body editor.
+     *
+     * Portalled to <body> so it is not trapped by the virtual list's transform/overflow
+     * or by the item's hover styles. Only rendered when the renderer hook supplied
+     * `onBodyEditSave`, which it does only for text-like content types.
+     */
+    const renderBodyEditor = () => {
+        if (!bodyEditorOpen || !onBodyEditSave) return null;
+        const warnsDowngrade = bodyEditDowngradesFormat(item.content_type);
+
+        return createPortal(
+            <div
+                className={`modal-overlay theme-${theme}`}
+                onClick={() => onBodyEditCancel?.()}
+                onMouseDown={(e) => e.stopPropagation()}
+                onContextMenu={(e) => e.stopPropagation()}
+            >
+                <div
+                    className="confirm-dialog entry-body-editor-dialog"
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ maxWidth: '520px', width: '100%' }}
+                >
+                    {/* TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳 */}
+                    <h3 style={{ margin: '0 0 12px 0', fontSize: '15px', fontWeight: 600 }}>
+                        {t('edit_item') || '编辑条目内容'}
+                    </h3>
+                    {/* R10: rich_text loses its HTML on save — say so before the user commits. */}
+                    {warnsDowngrade && (
+                        <p
+                            className="entry-body-editor-warning"
+                            style={{
+                                margin: '0 0 10px 0',
+                                fontSize: '12px',
+                                lineHeight: 1.5,
+                                color: 'var(--text-secondary)'
+                            }}
+                        >
+                            该条目为富文本，保存后格式会转为纯文本（原有 HTML 排版将丢失）。
+                        </p>
+                    )}
+                    <textarea
+                        ref={bodyEditorTextareaRef}
+                        className="entry-body-editor-textarea"
+                        autoFocus
+                        value={bodyDraft}
+                        onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
+                        onFocus={() => invoke('activate_window_focus').catch(console.error)}
+                        onChange={(e) => setBodyDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                            e.stopPropagation();
+                            if (e.key === 'Escape') {
+                                e.preventDefault();
+                                onBodyEditCancel?.();
+                                return;
+                            }
+                            // Ctrl/Cmd+Enter saves, matching the muscle memory of the
+                            // tag manager's editor while plain Enter stays a newline.
+                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bodyEditSaving) {
+                                e.preventDefault();
+                                onBodyEditSave(bodyDraft);
+                            }
+                        }}
+                        style={{
+                            width: '100%',
+                            minHeight: '132px',
+                            marginBottom: '12px',
+                            padding: '12px',
+                            border: 'var(--input-border)',
+                            borderRadius: 'var(--input-radius)',
+                            background: 'var(--bg-input)',
+                            boxShadow: 'var(--input-shadow)',
+                            color: 'var(--text-primary)',
+                            fontFamily: 'inherit',
+                            fontSize: '13px',
+                            lineHeight: 1.55,
+                            outline: 'none',
+                            resize: 'vertical',
+                            boxSizing: 'border-box'
+                        }}
+                    />
+                    {bodyEditError && (
+                        <div
+                            className="entry-body-editor-error"
+                            style={{ marginBottom: '10px', fontSize: '12px', color: 'var(--accent-color)' }}
+                        >
+                            {bodyEditError}
+                        </div>
+                    )}
+                    <div className="confirm-dialog-buttons">
+                        <button
+                            className="confirm-dialog-button"
+                            disabled={bodyEditSaving}
+                            onClick={() => onBodyEditCancel?.()}
+                        >
+                            {t('cancel')}
+                        </button>
+                        <button
+                            className="confirm-dialog-button primary"
+                            disabled={bodyEditSaving}
+                            onClick={() => onBodyEditSave(bodyDraft)}
+                        >
+                            {t('save')}
+                        </button>
+                    </div>
+                </div>
+            </div>,
+            document.body
+        );
+    };
+
     return (
         <motion.div
             ref={itemRef}
@@ -1648,6 +1889,18 @@ const ClipboardItem = ({
                                 title={isRevealed ? t('hide') : t('reveal')}
                             >
                                 {isRevealed ? <EyeOff size={12} /> : <Eye size={12} />}
+                            </button>
+                        )}
+                        {onEdit && (
+                            <button
+                                className={`btn-icon ${bodyEditorOpen ? "active" : ""}`}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onEdit(e);
+                                }}
+                                title={t('edit_item') || '编辑条目内容'}
+                            >
+                                <Pencil size={12} />
                             </button>
                         )}
                         <button
@@ -1973,6 +2226,9 @@ const ClipboardItem = ({
             </AnimatePresence>
 
             {!overlayTagsInPreview && hasTagsSection && renderTagsContainer()}
+            {/* R6: note is shown for every content type, above the tag chips. */}
+            {!noteIsEmpty && renderNote()}
+            {renderBodyEditor()}
         </motion.div >
     );
 };
@@ -1991,6 +2247,16 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.item.is_external === nextProps.item.is_external &&
         prevProps.item.file_preview_exists === nextProps.item.file_preview_exists &&
         prevProps.item.tags === nextProps.item.tags &&
+        // R6: the note is part of what this row renders.
+        getEntryNote(prevProps.item) === getEntryNote(nextProps.item) &&
+        // R10: without these the body editor would never appear — the memo would
+        // keep reporting "unchanged" while the dialog state flips on the parent.
+        prevProps.isEditingBody === nextProps.isEditingBody &&
+        prevProps.bodyInitialDraft === nextProps.bodyInitialDraft &&
+        prevProps.bodyEditSaving === nextProps.bodyEditSaving &&
+        prevProps.bodyEditError === nextProps.bodyEditError &&
+        !!prevProps.onEdit === !!nextProps.onEdit &&
+        !!prevProps.onBodyEditSave === !!nextProps.onBodyEditSave &&
         prevProps.isRevealed === nextProps.isRevealed &&
         prevProps.isEditingTags === nextProps.isEditingTags &&
         prevProps.isAIProcessing === nextProps.isAIProcessing &&

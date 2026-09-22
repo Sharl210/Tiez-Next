@@ -48,10 +48,58 @@ export interface ClipboardItemProps {
   onAIAction?: (type: string) => void;
   onAIOptionsToggle?: () => void;
   onInputSubmit?: (val: string) => void;
+  /** R10: open the body editor for this entry. Omitted for types whose body is not text. */
+  onEdit?: (e: MouseEvent) => void;
+  /** R10: this entry's body editor is open. */
+  isEditingBody?: boolean;
+  /** R10: draft the editor starts from; only read when the dialog mounts. */
+  bodyInitialDraft?: string;
+  /** R10: a save is in flight (dialog disables its buttons). */
+  bodyEditSaving?: boolean;
+  /** R10: error text from the last failed save, shown inside the dialog. */
+  bodyEditError?: string | null;
+  /** R10: commit the edited body. The renderer hook owns the backend call. */
+  onBodyEditSave?: (newContent: string) => void;
+  /** R10: close the body editor without saving. */
+  onBodyEditCancel?: () => void;
   dragControls?: DragControls;
   id?: string;
   disableLayout?: boolean;
 }
+
+/**
+ * R6: safe accessor for the per-entry note.
+ *
+ * `ClipboardEntry.note` is optional (`src/shared/types/clipboard.ts`), because a payload
+ * from a build that predates the column carries no `note` at all. This collapses the
+ * optional field and any unexpected runtime shape into a plain string, so every call
+ * site can treat "no note" and "empty note" identically.
+ */
+export const getEntryNote = (item: ClipboardEntry): string => {
+  const note = item.note;
+  return typeof note === "string" ? note : "";
+};
+
+/** R10: content types whose `content` column holds editable text. */
+export const EDITABLE_BODY_TYPES: readonly string[] = ["text", "code", "url", "rich_text"];
+
+/**
+ * R10: whether this entry's body can be edited as text.
+ *
+ * `image` / `file` / `video` store a filesystem path or a `data:` URL. Rewriting it
+ * would leave `content_hash` pointing at the previous payload, so those rows get the
+ * note editor only — the backend refuses body edits for them as well.
+ */
+export const isBodyEditable = (contentType: string): boolean =>
+  EDITABLE_BODY_TYPES.includes(contentType);
+
+/**
+ * R10: `rich_text` is editable, but saving downgrades it to plain text and drops
+ * `html_content` (backend behaviour in `update_entry_content_with_conn`). The editor
+ * warns about that before the user commits.
+ */
+export const bodyEditDowngradesFormat = (contentType: string): boolean =>
+  contentType === "rich_text";
 
 export type ClipboardRenderItem = (
   item: ClipboardEntry,

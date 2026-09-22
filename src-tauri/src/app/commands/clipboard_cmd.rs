@@ -182,6 +182,15 @@ pub async fn update_item_content(
 ) -> AppResult<()> {
     let preview = truncate_chars_with_suffix(&new_content, 500, "...");
 
+    // Persist first, then mirror into the session list. The reverse order left the
+    // in-memory copy updated even when the repository refused the edit (binary
+    // content types are rejected there), so the session list disagreed with the
+    // database until the next refresh.
+    state
+        .repo
+        .update_entry_content(id, &new_content, &preview)
+        .map_err(AppError::from)?;
+
     {
         let mut session_items = session.inner().0.lock().unwrap();
         if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
@@ -190,10 +199,61 @@ pub async fn update_item_content(
         }
     }
 
-    state
-        .repo
-        .update_entry_content(id, &new_content, &preview)
-        .map_err(AppError::from)?;
+    let _ = app_handle.emit("clipboard-changed", ());
+    crate::services::cloud_sync::request_cloud_sync(app_handle);
+    Ok(())
+}
+
+/// R4: `image` / `file` / `video` store a path or a `data:` URL in `content`, so
+/// their body is not editable text. Editing one would rewrite `content` while
+/// leaving `content_hash` on the old payload — a row whose hash and content
+/// disagree, which dedup and cloud sync then mis-handle.
+///
+/// The authoritative guard lives in the repository
+/// (`SqliteClipboardRepository::update_entry_content_with_conn`), so it also covers
+/// the AI-rewrite and `open_content` callers; the tag manager additionally hides the
+/// body field for these types. Nothing in this module needs the predicate directly,
+/// only the reasoning, which is recorded here because this is where the command is
+/// exposed to the UI.
+
+
+/// R6: set or clear the user note of one entry.
+///
+/// Naming is fixed to `update_entry_note` to match the beta branch so the two can
+/// be merged without a rename. The note is stored independently of `content`, so
+/// this is valid for every content type, including the binary ones that
+/// [`is_binary_content_type`] protects from body edits. An empty or
+/// whitespace-only `note` clears it.
+#[tauri::command]
+pub async fn update_entry_note(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    id: i64,
+    note: String,
+) -> AppResult<()> {
+    use crate::infrastructure::repository::clipboard_repo::normalize_note;
+
+    let normalized = normalize_note(&note);
+
+    // Session (not-yet-persisted) entries: mirror the `update_item_content`
+    // approach. A session row with a negative id has no database counterpart yet,
+    // so updating the in-memory copy is the only meaningful write; it will be
+    // persisted later by `save`, which already round-trips the note column.
+    {
+        let mut session_items = session.inner().0.lock().unwrap();
+        if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
+            item.note = normalized.clone();
+        }
+    }
+
+    if id > 0 {
+        state
+            .repo
+            .update_entry_note(id, &normalized)
+            .map_err(AppError::from)?;
+    }
+
     let _ = app_handle.emit("clipboard-changed", ());
     crate::services::cloud_sync::request_cloud_sync(app_handle);
     Ok(())

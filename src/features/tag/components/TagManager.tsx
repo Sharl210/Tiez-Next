@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
-    Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy
+    Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
+    StickyNote, AlertTriangle
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
@@ -18,8 +19,200 @@ interface TagInfo {
     count: number;
 }
 
+/** R4: content types whose `content` is a path or a data URL, not editable text. */
+const BINARY_CONTENT_TYPES = ['image', 'file', 'video'];
+
+const isBinaryContentType = (contentType: string | undefined | null) =>
+    !!contentType && BINARY_CONTENT_TYPES.includes(contentType);
+
+/** R6: mirror of `MAX_ENTRY_NOTE_CHARS` in `clipboard_repo.rs`. */
+const MAX_NOTE_CHARS = 2000;
+
+/**
+ * R3: the tag names the back end treats as "sensitive" (`SENSITIVE_TAGS` plus the
+ * `password` spelling used by the main-page blur check).
+ *
+ * These are ordinary tag rows; they were only special-cased in this component to
+ * make them un-deletable, and that protection is gone. The list survives because an
+ * *empty leftover* row needs to follow the feature that produces it — see the
+ * filter in `fetchTags`.
+ */
+const BUILTIN_SENSITIVE_TAG_NAMES = ['sensitive', '密码', 'password'];
+
+const isBuiltinSensitiveTag = (name: string) =>
+    BUILTIN_SENSITIVE_TAG_NAMES.some((n) => n.toLowerCase() === name.toLowerCase());
+
+/**
+ * R3: should a built-in sensitive group be shown?
+ *
+ * Two independent reasons keep it visible:
+ *  - the feature that produces it is on, so it is a normal, usable group; or
+ *  - it actually holds entries, in which case hiding it would strand real data.
+ *
+ * Only the combination "feature off AND empty" hides it — that state is a leftover
+ * seeded row nothing can put an entry into, so showing it would offer a permanently
+ * un-actionable group. Note this never *deletes* the row; it only stops rendering it,
+ * and the group stays fully deletable once it holds anything.
+ *
+ * Exported for tests: an off-by-one in this predicate silently hides user data or
+ * silently resurrects a deleted seed, and neither is visible in a type check.
+ */
+export function shouldShowTag(
+    tag: { name: string; count: number },
+    sensitiveFeatureEnabled: boolean
+): boolean {
+    if (!isBuiltinSensitiveTag(tag.name)) return true;
+    if (tag.count > 0) return true;
+    return sensitiveFeatureEnabled;
+}
+
+/**
+ * R3: read the privacy-protection setting, treating "unreadable" as enabled.
+ *
+ * The database seeds `app.privacy_protection` to `true`, and the capture pipeline
+ * only appends the `sensitive` tag while that stored value is on. A failed settings
+ * read must therefore not be interpreted as "feature off", or a transient error would
+ * hide the group; only the literal string `false` counts as disabled.
+ */
+export function isSensitiveFeatureEnabled(
+    settings: Record<string, string> | null | undefined
+): boolean {
+    return settings?.['app.privacy_protection'] !== 'false';
+}
+
+/**
+ * R2: persisted geometry of the tag sidebar.
+ *
+ * The wide and stacked layouts are dragged along different axes (horizontal for
+ * the column, vertical for the rail above the editor), so each keeps its own
+ * numbers and its own collapsed flag. `width` / `height` / `collapsed` keep the
+ * beta branch's key names so a settings blob written by beta still loads.
+ */
+interface TagManagerSidebarSize {
+    width: number;
+    height: number;
+    collapsed: boolean;
+    stackedWidth: number;
+    stackedHeight: number;
+    stackedCollapsed: boolean;
+}
+
+const DEFAULT_SIDEBAR_WIDTH = 130;
+const DEFAULT_SIDEBAR_HEIGHT = 180;
+/** `handleMouseMove` clamps the drag to these bounds; the parser accepts the same. */
+const MIN_SIDEBAR_WIDTH = 48;
+/** Below this drag position the sidebar folds to the collapsed rail (see `handleMouseMove`). */
+export const COLLAPSE_THRESHOLD_PX = 110;
+/** Width restored when the sidebar is expanded from the collapsed rail. */
+export const EXPANDED_SIDEBAR_WIDTH = 160;
+const MAX_SIDEBAR_WIDTH = 320;
+const MIN_SIDEBAR_HEIGHT = 120;
+const MAX_SIDEBAR_HEIGHT = 4000;
+
+const DEFAULT_TAG_MANAGER_SIZE: TagManagerSidebarSize = {
+    width: DEFAULT_SIDEBAR_WIDTH,
+    height: DEFAULT_SIDEBAR_HEIGHT,
+    collapsed: false,
+    stackedWidth: DEFAULT_SIDEBAR_WIDTH,
+    stackedHeight: DEFAULT_SIDEBAR_HEIGHT,
+    stackedCollapsed: false,
+};
+
+/**
+ * R2: read a numeric field, rejecting anything that is not a finite number inside
+ * the range the drag interaction can produce.
+ *
+ * Storage can be absent, truncated, hand-edited, written by an older build, or
+ * hold a string where a number belongs. Every one of those must degrade to the
+ * default instead of reaching the layout as `NaN` or an absurd size, so this is
+ * deliberately strict and total: it never throws.
+ */
+const readBoundedNumber = (raw: unknown, min: number, max: number): number | null =>
+    typeof raw === 'number' && Number.isFinite(raw) && raw >= min && raw <= max ? raw : null;
+
+/**
+ * R2: parse the persisted sidebar geometry, falling back to defaults per field.
+ *
+ * Accepts either the raw settings string or an already-parsed object. A single
+ * corrupt field only resets that field; the rest of the stored geometry survives.
+ * `raw` being `null` / `undefined` / `''` is the normal first-run case and yields
+ * the defaults, so this function is safe to call unconditionally on boot.
+ */
+export function parseTagManagerSidebarSize(raw: unknown): TagManagerSidebarSize {
+    let source: unknown = raw;
+    if (typeof raw === 'string') {
+        if (!raw.trim()) return { ...DEFAULT_TAG_MANAGER_SIZE };
+        try {
+            source = JSON.parse(raw);
+        } catch {
+            return { ...DEFAULT_TAG_MANAGER_SIZE };
+        }
+    }
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+        return { ...DEFAULT_TAG_MANAGER_SIZE };
+    }
+
+    const record = source as Record<string, unknown>;
+    const width = readBoundedNumber(record.width, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    const height = readBoundedNumber(record.height, MIN_SIDEBAR_HEIGHT, MAX_SIDEBAR_HEIGHT);
+    const stackedWidth = readBoundedNumber(record.stackedWidth, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    const stackedHeight = readBoundedNumber(record.stackedHeight, MIN_SIDEBAR_HEIGHT, MAX_SIDEBAR_HEIGHT);
+
+    return {
+        width: width ?? DEFAULT_SIDEBAR_WIDTH,
+        height: height ?? DEFAULT_SIDEBAR_HEIGHT,
+        collapsed: record.collapsed === true,
+        // A layout the user never dragged inherits the wide-layout geometry, which is
+        // what beta stored, so upgrading from beta does not reset the stacked view.
+        stackedWidth: stackedWidth ?? width ?? DEFAULT_SIDEBAR_WIDTH,
+        stackedHeight: stackedHeight ?? height ?? DEFAULT_SIDEBAR_HEIGHT,
+        stackedCollapsed: record.stackedCollapsed === true,
+    };
+}
+
+/**
+ * R2: fold a collapse-toggle click into the stored geometry.
+ *
+ * Pure so it can be unit-tested: the click path is the one geometry change that does
+ * not go through a drag, and a regression there is invisible until the next launch.
+ *
+ * Rules, matching the drag behaviour:
+ *  - toggling writes only to the layout currently in effect (`stacked`), leaving the
+ *    other layout's remembered numbers untouched;
+ *  - expanding a sidebar that was folded at the collapsed rail width restores a
+ *    usable width (160) instead of leaving it at the rail width, because a
+ *    yet-unset width would otherwise reopen at 48px;
+ *  - `collapsed` is stored as a real boolean so `parseTagManagerSidebarSize`'s
+ *    strict `=== true` check round-trips it.
+ */
+export function applyCollapseToggle(
+    stored: TagManagerSidebarSize,
+    current: { stacked: boolean; width: number; collapsed: boolean },
+    expandedWidthFallback: number = EXPANDED_SIDEBAR_WIDTH
+): TagManagerSidebarSize {
+    const nextCollapsed = !current.collapsed;
+    const nextWidth =
+        !nextCollapsed && current.width < COLLAPSE_THRESHOLD_PX
+            ? expandedWidthFallback
+            : current.width;
+
+    if (current.stacked) {
+        return {
+            ...stored,
+            stackedCollapsed: nextCollapsed,
+            stackedWidth: nextWidth,
+        };
+    }
+    return {
+        ...stored,
+        collapsed: nextCollapsed,
+        width: nextWidth,
+    };
+}
+
 export default function TagManager({ t, theme }: TagManagerProps) {
     const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
+    const TAG_MANAGER_SIZE_KEY = "app.tag_manager_size";
     const [tags, setTags] = useState<TagInfo[]>([]);
     const [tagSearch, setTagSearch] = useState('');
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
@@ -37,15 +230,29 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         }
     });
     const [isDeleting, setIsDeleting] = useState(false);
-    const [deleteConfirmation, setDeleteConfirmation] = useState<{ show: boolean, tagName: string | null }>({ show: false, tagName: null });
+    const [deleteConfirmation, setDeleteConfirmation] = useState<{ show: boolean, tagName: string | null, affected: number }>({ show: false, tagName: null, affected: 0 });
     const [itemDeleteConfirmation, setItemDeleteConfirmation] = useState<{ show: boolean, id: number | null }>({ show: false, id: null });
     const [isCollapsed, setIsCollapsed] = useState(false);
     const [sortBy, setSortBy] = useState<'time' | 'count'>('time');
     const [isCreatingItem, setIsCreatingItem] = useState(false);
-    const [editingItem, setEditingItem] = useState<{ id: number, content: string } | null>(null);
+    /**
+     * R4/R6: the edit dialog now serves every content type. `originalContent` /
+     * `originalNote` are kept so saving only issues the commands for what actually
+     * changed — firing `update_item_content` on an untouched body would otherwise
+     * be a no-op that still emits a refresh, and `update_entry_note` on an untouched
+     * note would rewrite the row for nothing.
+     */
+    const [editingItem, setEditingItem] = useState<{
+        id: number;
+        content: string;
+        note: string;
+        contentType: string;
+        originalContent: string;
+        originalNote: string;
+    } | null>(null);
     const [newItemContent, setNewItemContent] = useState('');
-    const [sidebarWidth, setSidebarWidth] = useState(130);
-    const [sidebarHeight, setSidebarHeight] = useState(180);
+    const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+    const [sidebarHeight, setSidebarHeight] = useState(DEFAULT_SIDEBAR_HEIGHT);
     const [isResizing, setIsResizing] = useState(false);
     const [isStacked, setIsStacked] = useState(false);
     const [isManageMode, setIsManageMode] = useState(false);
@@ -54,6 +261,145 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
     const selectedTagRef = useRef<string | null>(null);
     useEffect(() => { selectedTagRef.current = selectedTag; }, [selectedTag]);
+
+    // ---------------------------------------------------------------------
+    // R2: sidebar geometry persistence
+    // ---------------------------------------------------------------------
+
+    /**
+     * R2: the geometry as it should be written to settings.
+     *
+     * A collapsed sidebar has a fixed width, so persisting the collapsed *width*
+     * would destroy the width the user had before collapsing — reopening would then
+     * have to guess. The expanded width is therefore what gets stored, together with
+     * the collapsed flag; that is also exactly what the beta branch stores.
+     */
+    const sidebarSizeRef = useRef<TagManagerSidebarSize>({ ...DEFAULT_TAG_MANAGER_SIZE });
+
+    /**
+     * R2: geometry state must be readable by the drag handlers without adding
+     * `sidebarWidth` / `isCollapsed` to their dependency arrays, because those
+     * change on every mousemove and would tear down and re-add the listeners
+     * mid-drag. A ref mirror keeps the drag effect keyed only on `isResizing`.
+     */
+    const geometryRef = useRef({
+        width: DEFAULT_SIDEBAR_WIDTH,
+        height: DEFAULT_SIDEBAR_HEIGHT,
+        collapsed: false,
+        stacked: false,
+    });
+
+    useEffect(() => {
+        geometryRef.current = {
+            width: sidebarWidth,
+            height: sidebarHeight,
+            collapsed: isCollapsed,
+            stacked: isStacked,
+        };
+        const current = sidebarSizeRef.current;
+        if (isStacked) {
+            current.stackedWidth = sidebarWidth;
+            current.stackedHeight = sidebarHeight;
+            current.stackedCollapsed = isCollapsed;
+        } else {
+            current.width = sidebarWidth;
+            current.height = sidebarHeight;
+            current.collapsed = isCollapsed;
+        }
+    }, [sidebarWidth, sidebarHeight, isCollapsed, isStacked]);
+
+    /**
+     * R2: write the current geometry through `save_setting` (the beta approach).
+     *
+     * Settings rather than `localStorage` so the values live in the same store as the
+     * rest of the configuration (and therefore ride along with a future backup/export)
+     * instead of being stranded inside a WebView origin that an identifier rename can
+     * invalidate. Note that this key is deliberately NOT cloud-synced — see the
+     * exclusion list in `services/cloud_sync.rs` — so "travels with cloud sync" would
+     * be wrong here. A failure is logged and swallowed: losing a remembered split
+     * position must never break the tag manager.
+     */
+    const persistSidebarSize = useCallback(() => {
+        invoke('save_setting', {
+            key: TAG_MANAGER_SIZE_KEY,
+            value: JSON.stringify(sidebarSizeRef.current),
+        }).catch(console.error);
+    }, []);
+
+    /**
+     * R2: apply a collapse-toggle click to the stored geometry and return the record
+     * to persist.
+     *
+     * Extracted as a pure function for two reasons: the click happens outside the
+     * drag, so the width/height mirror ref has not been refreshed when the click runs
+     * and the new values have to be written explicitly; and exportable pure logic can
+     * carry a regression test, unlike a handler closed over component state.
+     *
+     * Only the layout currently in effect is touched, so toggling the sidebar while
+     * wide never disturbs the remembered stacked geometry (and vice versa).
+     */
+    const toggleCollapse = (current: TagManagerSidebarSize) =>
+        applyCollapseToggle(current, geometryRef.current);
+
+    /**
+     * R2: restore the geometry on open.
+     *
+     * Runs once per mount. The value is parsed by `parseTagManagerSidebarSize`, which
+     * is total: unset, truncated, hand-edited or wrong-typed storage all degrade to
+     * the defaults instead of producing `NaN` sizes or throwing.
+     */
+    useEffect(() => {
+        let cancelled = false;
+        invoke<Record<string, string>>('get_settings')
+            .then((settings) => {
+                if (cancelled) return;
+                const restored = parseTagManagerSidebarSize(settings?.[TAG_MANAGER_SIZE_KEY]);
+                sidebarSizeRef.current = restored;
+                // The layout in effect at mount decides which of the two remembered
+                // geometries applies. `isStacked` is resolved by its own effect on the
+                // very first commit, so it is already correct here; read the *stacked*
+                // fields on a narrow window rather than always taking the wide ones,
+                // otherwise a user who only ever opened the manager stacked would have
+                // their remembered height replaced by the wide-layout default.
+                if (geometryRef.current.stacked) {
+                    setSidebarWidth(restored.stackedWidth);
+                    setSidebarHeight(restored.stackedHeight);
+                    setIsCollapsed(restored.stackedCollapsed);
+                } else {
+                    setSidebarWidth(restored.width);
+                    setSidebarHeight(restored.height);
+                    setIsCollapsed(restored.collapsed);
+                }
+            })
+            .catch(console.error);
+        return () => { cancelled = true; };
+    }, []);
+
+    /**
+     * R2: geometry is remembered per layout, so switching between the wide and
+     * stacked arrangements restores the numbers that belong to the arrangement now
+     * in effect rather than reusing the other one's.
+     */
+    const appliedStackedRef = useRef<boolean | null>(null);
+    useEffect(() => {
+        if (appliedStackedRef.current === isStacked) return;
+        const isFirstApplication = appliedStackedRef.current === null;
+        appliedStackedRef.current = isStacked;
+        // The initial application must not overwrite what the restore effect just
+        // loaded, otherwise a saved stacked geometry would be replaced by the wide
+        // one on the very first render.
+        if (isFirstApplication) return;
+        const stored = sidebarSizeRef.current;
+        if (isStacked) {
+            setSidebarWidth(stored.stackedWidth);
+            setSidebarHeight(stored.stackedHeight);
+            setIsCollapsed(stored.stackedCollapsed);
+        } else {
+            setSidebarWidth(stored.width);
+            setSidebarHeight(stored.height);
+            setIsCollapsed(stored.collapsed);
+        }
+    }, [isStacked]);
 
     useEffect(() => {
         try {
@@ -109,8 +455,8 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
             const dragPos = event.clientX - bounds.left;
             
-            // Auto collapse threshold: 110px
-            if (dragPos < 110) {
+            // Auto collapse threshold (shared with the toggle button).
+            if (dragPos < COLLAPSE_THRESHOLD_PX) {
                 if (!isCollapsed) setIsCollapsed(true);
                 setSidebarWidth(48);
             } else {
@@ -124,6 +470,9 @@ export default function TagManager({ t, theme }: TagManagerProps) {
             setIsResizing(false);
             document.body.style.cursor = "";
             document.body.style.userSelect = "";
+            // R2: the drag position is only meaningful once the user lets go, so the
+            // write happens here rather than on every mousemove.
+            persistSidebarSize();
         };
 
         document.body.style.cursor = isStacked ? "row-resize" : "col-resize";
@@ -137,16 +486,32 @@ export default function TagManager({ t, theme }: TagManagerProps) {
             document.body.style.cursor = "";
             document.body.style.userSelect = "";
         };
-    }, [isResizing, isStacked]);
+    }, [isResizing, isStacked, persistSidebarSize]);
 
     const fetchTags = async () => {
         try {
-            const [tagMap, colors] = await Promise.all([
+            const [tagMap, colors, settings] = await Promise.all([
                 invoke<Record<string, number>>('get_all_tags_info'),
-                invoke<Record<string, string>>('get_tag_colors')
+                invoke<Record<string, string>>('get_tag_colors'),
+                // R3: read on every refresh rather than once, so toggling the feature in
+                // settings is reflected without remounting the tag manager.
+                invoke<Record<string, string>>('get_settings').catch(() => ({} as Record<string, string>)),
             ]);
 
-            const tagArray = Object.entries(tagMap).map(([name, count]) => ({ name, count }));
+            // R3: the privacy-protection switch is the feature that *produces* the
+            // `sensitive` tag — the capture pipeline only appends it while that setting
+            // is on (`services/clipboard/pipeline.rs`), and the main-page blur reads the
+            // same tag names. Missing / unreadable setting counts as enabled, matching
+            // the database default of `true`, so a read failure hides nothing.
+            const sensitiveFeatureEnabled = isSensitiveFeatureEnabled(settings);
+
+            const tagArray = Object.entries(tagMap)
+                .map(([name, count]) => ({ name, count }))
+                // R3: hide a built-in sensitive tag only when both conditions hold — the
+                // feature that would produce it is off, and it holds nothing. A group with
+                // entries is always shown (and is fully deletable); a leftover seeded row
+                // follows the feature instead of lingering as an un-actionable group.
+                .filter((tag) => shouldShowTag(tag, sensitiveFeatureEnabled));
             tagArray.sort((a, b) => b.count - a.count);
             setTags(tagArray);
             setTagColors(colors || {});
@@ -186,14 +551,23 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         } catch (err) { console.error(err); }
     };
 
+    /**
+     * R3: rename any group, including the built-in sensitive ones.
+     *
+     * These two names used to be refused here (and the buttons hidden at the call
+     * site), which made them the only groups in the product that could be renamed
+     * into existence but never renamed or removed. They are ordinary `saved_tags`
+     * rows; the back end has no built-in-tag concept, so the refusal existed purely
+     * in this component.
+     *
+     * Renaming `sensitive` is a real behaviour change and is called out in the
+     * confirmation-free rename path only in the sense that the main page's blur check
+     * keys off the tag *name*: after a rename nothing is blurred until the entry is
+     * tagged again. That is the user's explicit choice to make here.
+     */
     const handleRenameTag = async (oldName: string) => {
         const trimmed = newTagName.trim();
         if (!trimmed || trimmed === oldName) { setEditingTag(null); return; }
-
-        if (oldName === 'sensitive' || oldName === '密码') {
-            setEditingTag(null);
-            return;
-        }
 
         try {
             await invoke('rename_tag_globally', { oldName, newName: trimmed });
@@ -205,11 +579,25 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         } catch (err) { console.error(err); }
     };
 
+    /**
+     * R3: delete any group.
+     *
+     * The back end (`delete_tag_from_all` → `tag_repo.delete_globally`) removes the
+     * `saved_tags` row and the `entry_tags` links and leaves every entry in place, so
+     * this is a group operation, not a data operation. The confirmation dialog states
+     * how many entries will be unlinked before it runs.
+     */
     const handleDeleteTag = async (tagName: string) => {
-        if (tagName === 'sensitive' || tagName === '密码') return;
         setIsDeleting(true);
+        // Remember whether the group we are removing is the one on screen, so a stale
+        // selection cannot leave the item pane pointing at a tag that no longer exists.
+        const wasSelected = selectedTagRef.current === tagName;
         try {
             await invoke('delete_tag_from_all', { tagName });
+            if (wasSelected) {
+                setSelectedTag(null);
+                setTagItems([]);
+            }
             await emit('clipboard-changed'); // Notify App.tsx to refresh
             await fetchTags();
         } catch (err) { console.error(err); }
@@ -232,16 +620,59 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         } catch (err) { console.error(err); }
     };
 
-    const handleUpdateItemContent = async () => {
-        if (!editingItem || !editingItem.content.trim()) return;
+    /**
+     * R4/R6: save the edit dialog.
+     *
+     * Two independent writes:
+     *   - the *note* is sent for every content type, because a note is entry
+     *     metadata and never touches `content`;
+     *   - the *body* is sent only for text-like types. For `image` / `file` /
+     *     `video` the body is a path or a data URL, so the textarea is not rendered
+     *     for them and this branch is unreachable from the UI; the back end rejects
+     *     it as well (`update_entry_content` → `is_binary_content_type`), so a stale
+     *     caller cannot corrupt a row either.
+     *
+     * Each write is guarded by a dirty check so opening the dialog and pressing save
+     * does not emit a pointless `clipboard-changed` round trip.
+     */
+    const handleSaveItem = async () => {
+        if (!editingItem) return;
+        const { id, contentType, content, note, originalContent, originalNote } = editingItem;
+        const isBinary = isBinaryContentType(contentType);
+        const bodyChanged = !isBinary && content !== originalContent;
+        const noteChanged = note !== originalNote;
+
+        if (bodyChanged && !content.trim()) return;
+
         try {
-            await invoke('update_item_content', {
-                id: editingItem.id,
-                newContent: editingItem.content
-            });
+            if (bodyChanged) {
+                await invoke('update_item_content', { id, newContent: content });
+            }
+            if (noteChanged) {
+                await invoke('update_entry_note', { id, note });
+            }
             setEditingItem(null);
             if (selectedTag) await loadTagItems(selectedTag);
         } catch (err) { console.error(err); }
+    };
+
+    /**
+     * R6: open the quick note editor for one card.
+     *
+     * The dialog is shared with the body editor (R4), so this seeds it with the
+     * entry's current body and note and lets the user change either. Keeping one
+     * dialog means the two features cannot drift apart in behaviour.
+     */
+    const openItemEditor = (item: ClipboardEntry) => {
+        const note = item.note || '';
+        setEditingItem({
+            id: item.id,
+            content: item.content,
+            note,
+            contentType: item.content_type,
+            originalContent: item.content,
+            originalNote: note,
+        });
     };
 
     const copyToClipboard = async (id: number, content: string, type: string) => {
@@ -293,11 +724,22 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                         className="collapse-toggle"
                         title={isCollapsed ? (t('open') || '展开') : (t('collapse') || '收起')}
                         onClick={() => {
-                            const newCollapsed = !isCollapsed;
-                            setIsCollapsed(newCollapsed);
-                            if (!newCollapsed && sidebarWidth < 110) {
-                                setSidebarWidth(160);
-                            }
+                            // R2: collapsing is a geometry change, so it is remembered
+                            // even though no drag happened. `applyCollapseToggle` writes
+                            // the new values into the ref explicitly, because the mirror
+                            // effect that normally maintains it has not run yet at click
+                            // time and persisting would store the pre-click value.
+                            const updated = toggleCollapse(sidebarSizeRef.current);
+                            sidebarSizeRef.current = updated;
+                            // Read the values back from the layout that was actually
+                            // updated instead of assuming which one it was.
+                            const stackedNow = geometryRef.current.stacked;
+                            setIsCollapsed(
+                                stackedNow ? updated.stackedCollapsed : updated.collapsed
+                            );
+                            const nextWidth = stackedNow ? updated.stackedWidth : updated.width;
+                            if (nextWidth !== sidebarWidth) setSidebarWidth(nextWidth);
+                            persistSidebarSize();
                         }}
                     >
                         {isCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
@@ -392,28 +834,24 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                 <>
                                     <span className="tag-name">{tag.name}</span>
                                     <div className="tag-hover-actions">
-                                        {(tag.name !== 'sensitive' && tag.name !== '密码') && (
-                                            <span title="重命名" onClick={(e) => {
-                                                e.stopPropagation();
-                                                setEditingTag(tag.name);
-                                                setNewTagName(tag.name);
-                                            }} style={{
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                cursor: 'pointer'
-                                            }}>
-                                                <Edit2 size={12} />
-                                            </span>
-                                        )}
-                                        {(tag.name !== 'sensitive' && tag.name !== '密码') && (
-                                            <span title="删除" onClick={(e) => {
-                                                e.stopPropagation();
-                                                e.preventDefault();
-                                                setDeleteConfirmation({ show: true, tagName: tag.name });
-                                            }} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
-                                                <Trash2 size={12} />
-                                            </span>
-                                        )}
+                                        <span title={t('rename')} onClick={(e) => {
+                                            e.stopPropagation();
+                                            setEditingTag(tag.name);
+                                            setNewTagName(tag.name);
+                                        }} style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            cursor: 'pointer'
+                                        }}>
+                                            <Edit2 size={12} />
+                                        </span>
+                                        <span title={t('delete')} onClick={(e) => {
+                                            e.stopPropagation();
+                                            e.preventDefault();
+                                            setDeleteConfirmation({ show: true, tagName: tag.name, affected: tag.count });
+                                        }} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                                            <Trash2 size={12} />
+                                        </span>
                                     </div>
                                     <span className="tag-badge">{tag.count}</span>
                                 </>
@@ -580,14 +1018,17 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                                 </div>
                                             ) : (
                                                 <>
-                                                    {(item.content_type === 'text' || item.content_type === 'code') && (
-                                                        <button className="card-action-btn" title="编辑" onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            setEditingItem({ id: item.id, content: item.content });
-                                                        }}>
-                                                            <Edit2 size={10} />
-                                                        </button>
-                                                    )}
+                                                    {/* R4: the edit entry point is offered for every
+                                                        content type. For text-like bodies the dialog edits
+                                                        the text; for image/file/video it edits the note and
+                                                        the body field is not rendered, because those rows
+                                                        store a path or a data URL in `content`. */}
+                                                    <button className="card-action-btn" title={t('edit_item')} onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        openItemEditor(item);
+                                                    }}>
+                                                        <Edit2 size={10} />
+                                                    </button>
                                                     <button
                                                         className="card-action-btn"
                                                         onClick={(e) => {
@@ -628,6 +1069,18 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                         <div className="card-body-text">{item.preview || item.content}</div>
                                     )}
 
+                                    {/* R6: the note is shown on the card, for every content type.
+                                        The full text lives in the `title` attribute so a note that
+                                        is visually clamped to two lines is still readable on hover,
+                                        which is what keeps a 2000-character note from breaking the
+                                        grid layout. */}
+                                    {item.note ? (
+                                        <div className="card-note" title={item.note}>
+                                            <StickyNote size={9} />
+                                            <span className="card-note-text">{item.note}</span>
+                                        </div>
+                                    ) : null}
+
                                     <div className="card-divider" />
                                     <div className="card-footer">
                                         <span className="meta-time">{formatItemDate(item.timestamp)}</span>
@@ -657,7 +1110,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
             {/* Tag Delete Confirmation Modal */}
             {deleteConfirmation.show && (
-                <div className="modal-overlay" onClick={() => setDeleteConfirmation({ show: false, tagName: null })}>
+                <div className="modal-overlay" onClick={() => setDeleteConfirmation({ show: false, tagName: null, affected: 0 })}>
                     <div className={`confirm-dialog tag-manager-dialog theme-${theme}`} onClick={(e) => e.stopPropagation()}>
                         <h3>{t('confirm_delete')}</h3>
                         <p>
@@ -667,15 +1120,24 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                 {deleteConfirmation.tagName}
                             </span>
                         </p>
+                        {/* R3: deleting a group must never look like deleting data. The
+                            impact is stated before the action runs, in the same dialog the
+                            user is already reading, rather than in a toast afterwards. */}
+                        <p className="tag-delete-scope">
+                            {t('confirm_delete_tag_scope').replace(
+                                '{count}',
+                                String(deleteConfirmation.affected)
+                            )}
+                        </p>
                         <div className="confirm-dialog-buttons">
-                            <button className="confirm-dialog-button" onClick={() => setDeleteConfirmation({ show: false, tagName: null })}>
+                            <button className="confirm-dialog-button" onClick={() => setDeleteConfirmation({ show: false, tagName: null, affected: 0 })}>
                                 {t('cancel')}
                             </button>
                             <button className="confirm-dialog-button primary" onClick={() => {
                                 if (deleteConfirmation.tagName) {
                                     handleDeleteTag(deleteConfirmation.tagName);
                                 }
-                                setDeleteConfirmation({ show: false, tagName: null });
+                                setDeleteConfirmation({ show: false, tagName: null, affected: 0 });
                             }}>
                                 {t('delete')}
                             </button>
@@ -751,19 +1213,60 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                 <div className="modal-overlay" onClick={() => setEditingItem(null)}>
                     <div className={`confirm-dialog tag-manager-dialog theme-${theme}`} onClick={e => e.stopPropagation()}>
                         <h3>{t('edit_item')}</h3>
+
+                        {/* R4: the body field is rendered only for text-like content.
+                            For image/file/video the row stores a path or a data URL, so
+                            editing it as text would break the reference; the dialog then
+                            offers the note alone instead of a disabled field. */}
+                        {isBinaryContentType(editingItem.contentType) ? (
+                            <p className="edit-item-body-notice">
+                                {t('edit_item_binary_notice')}
+                            </p>
+                        ) : (
+                            <div className="modal-input-field">
+                                <label className="edit-item-label">{t('edit_item_content_label')}</label>
+                                <textarea
+                                    className="tag-manager-textarea"
+                                    value={editingItem.content}
+                                    onChange={e => setEditingItem({ ...editingItem, content: e.target.value })}
+                                    autoFocus
+                                />
+                                {/* R4: the back end rewrites a rich-text row as plain text and
+                                    drops `html_content` whenever its body is edited. Stating the
+                                    consequence before saving is the honest option, since it cannot
+                                    be undone from the UI. */}
+                                {editingItem.contentType === 'rich_text' && (
+                                    <p className="edit-item-warning">
+                                        <AlertTriangle size={11} />
+                                        <span>{t('edit_item_rich_text_warning')}</span>
+                                    </p>
+                                )}
+                            </div>
+                        )}
+
+                        {/* R6: the note is editable for every content type and is written
+                            through its own command, so it never touches the body. */}
                         <div className="modal-input-field">
+                            <label className="edit-item-label">{t('edit_item_note_label')}</label>
                             <textarea
-                                className="tag-manager-textarea"
-                                value={editingItem.content}
-                                onChange={e => setEditingItem({ ...editingItem, content: e.target.value })}
-                                autoFocus
+                                className="tag-manager-textarea note-textarea"
+                                value={editingItem.note}
+                                placeholder={t('edit_item_note_placeholder')}
+                                maxLength={MAX_NOTE_CHARS}
+                                onChange={e => setEditingItem({ ...editingItem, note: e.target.value })}
+                                onKeyDown={e => e.stopPropagation()}
                             />
+                            <div className="edit-item-note-meta">
+                                <span>{t('edit_item_note_clear_hint')}</span>
+                                <span>{editingItem.note.length} / {MAX_NOTE_CHARS}</span>
+                            </div>
                         </div>
+
                         <div className="confirm-dialog-buttons">
                             <button className="confirm-dialog-button" onClick={() => setEditingItem(null)}>
                                 {t('cancel')}
                             </button>
-                            <button className="confirm-dialog-button primary" onClick={handleUpdateItemContent}>
+                            <button className="confirm-dialog-button primary" onClick={handleSaveItem}>
                                 {t('save')}
                             </button>
                         </div>
@@ -1026,6 +1529,30 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                 .card-body-text { font-size: 13px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; color: var(--text-primary); }
                 .card-footer { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--text-secondary); opacity: 0.8; }
                 .meta-usage { display: flex; align-items: center; gap: 4px; }
+
+                /* R6: per-entry note on a card and its editors.
+                   Kept inside this component's own <style> block: the note is a
+                   TagManager feature and the shared stylesheet is outside this change.
+                   The note is free text up to 2000 chars, so the layout must be
+                   indifferent to its length — clamped to two lines here, with the full
+                   text in the element title attribute. */
+                .card-note { display: flex; align-items: flex-start; gap: 4px; margin-top: 6px; padding: 4px 6px; border-radius: var(--radius-sm); background: var(--bg-main); color: var(--text-secondary); font-size: 10px; line-height: 1.35; }
+                .card-note svg { flex-shrink: 0; margin-top: 2px; }
+                .card-note-text { flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; white-space: pre-wrap; }
+                /* The stacked list renders cards as a grid whose grid-template-areas
+                   live in the shared stylesheet, which is outside this change. The note
+                   therefore claims a full-width auto row (1 / -1) instead of a named
+                   area, so the template stays authoritative and no implicit track is
+                   invented next to its columns. */
+                .stacked-layout .items-list .card-note { grid-column: 1 / -1; margin-top: 4px; }
+                .stacked-layout .items-grid .card-note { font-size: 9px; }
+                .note-textarea { min-height: 56px; max-height: 140px; }
+                .edit-item-label { display: block; margin-bottom: 4px; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+                .edit-item-body-notice { margin: 0 0 12px; padding: 8px; border-radius: var(--radius-sm); background: var(--bg-element); color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+                .edit-item-warning { display: flex; align-items: flex-start; gap: 4px; margin: 6px 0 0; color: #d08c30; font-size: 10px; line-height: 1.4; }
+                .edit-item-warning svg { flex-shrink: 0; margin-top: 2px; }
+                .edit-item-note-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--text-secondary); font-size: 10px; }
+                .tag-delete-scope { margin: 8px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
                 
                 .add-item-btn {
                     margin-left: 12px;

@@ -137,6 +137,7 @@ fn main() {
             app::commands::update_tags,
             app::commands::add_manual_item,
             app::commands::update_item_content,
+            app::commands::update_entry_note,
             app::commands::save_emoji_favorite,
             app::commands::remove_emoji_favorite,
             app::commands::list_emoji_favorites,

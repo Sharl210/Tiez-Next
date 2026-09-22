@@ -16,6 +16,37 @@ use urlencoding::decode;
 const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
 
+/// R4/R6: content types whose `content` column is bytes-adjacent rather than
+/// editable text — a filesystem path (`file`), an on-disk attachment path
+/// (`image`/`video`) or a `data:` URL.
+///
+/// Body edits are refused for these (see [`ClipboardRepository::update_entry_content`])
+/// because rewriting `content` without recomputing `content_hash` leaves a row
+/// whose hash and payload disagree. Notes remain editable for every type, which is
+/// how R4's "every entry is editable, regardless of format" is honoured without
+/// corrupting the payload.
+pub fn is_binary_content_type(content_type: &str) -> bool {
+    matches!(content_type, "image" | "file" | "video")
+}
+
+/// R6: upper bound for a per-entry note, counted in `char`s (not bytes) so a note
+/// made of CJK text is not silently cut at a third of the advertised length.
+pub const MAX_ENTRY_NOTE_CHARS: usize = 2000;
+
+/// R6: normalize a note before it reaches the database.
+///
+/// Trims surrounding whitespace (so "clear the note" can be expressed as an empty
+/// or whitespace-only string) and clamps to [`MAX_ENTRY_NOTE_CHARS`] on a char
+/// boundary. Invalid input is therefore *narrowed*, never rejected: the UI can
+/// always save something and the stored value can never break a layout or a query.
+pub fn normalize_note(note: &str) -> String {
+    let trimmed = note.trim();
+    if trimmed.chars().count() <= MAX_ENTRY_NOTE_CHARS {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(MAX_ENTRY_NOTE_CHARS).collect()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,6 +88,10 @@ pub trait ClipboardRepository {
         content_type: Option<&str>,
     ) -> Result<Option<i64>, String>;
     fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String>;
+    /// R6: per-entry user note. `clipboard_history.note` is the single source of truth;
+    /// the note never participates in content hashing, so it can be updated for any
+    /// content_type (including image/file/video whose `content` is a path).
+    fn update_entry_note(&self, id: i64, note: &str) -> Result<(), String>;
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String>;
     fn get_entry_content_full(&self, id: i64) -> Result<Option<(String, String)>, String>;
     fn get_entry_content_with_html(
@@ -420,10 +455,15 @@ impl SqliteClipboardRepository {
             self.sync_entry_tags_with_conn(conn, entry.id, &cleaned_tags)?;
             Ok(entry.id)
         } else {
-            // Insert new entry
+            // Insert new entry.
+            // `note` is included here so a remark written on a not-yet-persisted
+            // session row survives the first save (which happens whenever such a row
+            // is tagged). Note that the UPDATE branch above deliberately does NOT
+            // touch `note`: callers pass an entry they captured earlier, so writing it
+            // would let a stale copy clobber a remark the user just edited.
             conn.execute(
-                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path, note) 
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     entry.content_type,
                     content,
@@ -436,7 +476,8 @@ impl SqliteClipboardRepository {
                     serde_json::to_string(&cleaned_tags).unwrap_or_else(|_| "[]".to_string()),
                     if final_is_external { 1 } else { 0 },
                     entry.pinned_order,
-                    entry.source_app_path.as_deref()
+                    entry.source_app_path.as_deref(),
+                    entry.note
                 ],
             ).map_err(|e| e.to_string())?;
 
@@ -734,6 +775,25 @@ impl SqliteClipboardRepository {
             .map_err(|e| e.to_string())?;
 
         let old_content = self.maybe_decrypt_text(&old_content_raw);
+
+        // R4: refuse body edits when `content` is a filesystem path. Rewriting such a
+        // row as text would leave the stale `content_hash` in place, so dedup /
+        // cloud-sync / content lookups would later see a row whose hash and payload
+        // disagree.
+        //
+        // Self-contained data URLs are a different case: they carry their own bytes
+        // and their hash can simply be recomputed, so they are allowed through. That
+        // matters because the file watcher rewrites an edited image back as a
+        // `data:image/...;base64,` URL, and rejecting it would silently break
+        // "edit the picture externally, the entry follows".
+        let is_self_contained_data_url = content.starts_with("data:");
+        if is_binary_content_type(&content_type) && !is_self_contained_data_url {
+            return Err(format!(
+                "content_type '{}' stores a filesystem path and cannot be edited as text",
+                content_type
+            ));
+        }
+
         // Procceed if content changed, OR if content is same but we need to transition away from rich text/clear HTML
         if old_content == content && content_type != "rich_text" && !has_html {
             return Ok(());
@@ -764,19 +824,50 @@ impl SqliteClipboardRepository {
             }
             return Ok(());
         }
+        // Non-text payloads that reached this point are self-contained data URLs
+        // (filesystem paths were rejected above). Their hash must be recomputed, or
+        // the row would keep a hash that no longer describes its content.
+        let recomputed_hash = calc_image_hash(content).unwrap_or(0);
         if should_encrypt {
             let encrypted_content = self.maybe_encrypt_text(content);
             let encrypted_preview = self.maybe_encrypt_text(preview);
             conn.execute(
-                "UPDATE clipboard_history SET content = ?, preview = ?, html_content = NULL WHERE id = ?",
-                params![encrypted_content, encrypted_preview, id],
+                "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = NULL WHERE id = ?",
+                params![encrypted_content, encrypted_preview, recomputed_hash, id],
             ).map_err(|e| e.to_string())?;
         } else {
             conn.execute(
-                "UPDATE clipboard_history SET content = ?, preview = ?, html_content = NULL WHERE id = ?",
-                params![content, preview, id],
+                "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = NULL WHERE id = ?",
+                params![content, preview, recomputed_hash, id],
             ).map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+
+    /// R6: persist a per-entry note.
+    ///
+    /// Deliberately independent from `update_entry_content_with_conn`: a note is
+    /// attached to the entry, never to its bytes, so this never touches
+    /// `content` / `preview` / `content_hash` / `content_type` / `html_content`.
+    /// That separation is exactly what makes notes safe for `image` / `file` /
+    /// `video` rows whose `content` is a filesystem path or data URL, and it is
+    /// why R4 can offer "edit the note" for every content type while refusing to
+    /// offer "edit the body" for binary ones.
+    ///
+    /// Not found rows affect zero rows and still return `Ok(())`, so an optimistic
+    /// UI cannot be tripped by an entry deleted in another window.
+    pub fn update_entry_note_with_conn(
+        &self,
+        conn: &Connection,
+        id: i64,
+        note: &str,
+    ) -> Result<(), String> {
+        let normalized = normalize_note(note);
+        conn.execute(
+            "UPDATE clipboard_history SET note = ? WHERE id = ?",
+            params![normalized, id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1291,6 +1382,11 @@ impl ClipboardRepository for SqliteClipboardRepository {
     fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.update_entry_content_with_conn(&conn, id, content, preview)
+    }
+
+    fn update_entry_note(&self, id: i64, note: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        self.update_entry_note_with_conn(&conn, id, note)
     }
 
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String> {

@@ -499,14 +499,25 @@ const App = () => {
     if (!effectiveShowTagManager && !showTagFilter && editingTagsId === null) return [];
 
     const set = new Set<string>();
-    for (const tag of BUILTIN_SENSITIVE_TAG_NAMES) {
-      set.add(tag);
+    // R3: the built-in sensitive tag names used to be injected unconditionally, which
+    // made them impossible to get rid of — deleting the group removed the row from
+    // `saved_tags`, and the next render put it straight back into every tag picker.
+    // They are now offered as suggestions only while privacy protection is on, which
+    // is the only state in which the capture pipeline can produce them
+    // (`services/clipboard/pipeline.rs`). The blur check itself is untouched: an
+    // entry tagged `sensitive` is still blurred whenever the setting is on.
+    // Missing / unreadable setting counts as enabled (the database default is `true`),
+    // so the suggestions are never lost to a failed settings read.
+    if (privacyProtection !== false) {
+      for (const tag of BUILTIN_SENSITIVE_TAG_NAMES) {
+        set.add(tag);
+      }
     }
     history.forEach((item) => {
       (item.tags || []).forEach((tag) => set.add(tag));
     });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [history, effectiveShowTagManager, showTagFilter, editingTagsId]);
+  }, [history, effectiveShowTagManager, showTagFilter, editingTagsId, privacyProtection]);
 
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
