@@ -21,10 +21,22 @@ const PRESERVED_NAMED_FORMAT_MAX_COUNT: usize = 12;
 const PRESERVED_NAMED_FORMAT_MAX_BYTES: usize = 1_500_000;
 const PRESERVED_NAMED_FORMAT_TOTAL_BYTES: usize = 4_000_000;
 
-fn clear_recent_image_echo_state() {
-    crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
-    crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
-    crate::LAST_APP_SET_IMAGE_VISUAL_HASH.store(0, Ordering::SeqCst);
+/// Clear the echo markers that match the given hashes.
+///
+/// This used to clear all three markers unconditionally. That was too broad: an
+/// echo match on one marker wiped the others, so a genuine later echo could no
+/// longer be recognised and got recorded as a brand-new entry (duplicates).
+/// Only the marker that actually matched is cleared now.
+fn clear_recent_image_echo_state(raw_hash: u64, visual_hash: u64) {
+    if crate::LAST_APP_SET_HASH.load(Ordering::SeqCst) == raw_hash {
+        crate::LAST_APP_SET_HASH.store(0, Ordering::SeqCst);
+    }
+    if crate::LAST_APP_SET_HASH_ALT.load(Ordering::SeqCst) == raw_hash {
+        crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
+    }
+    if crate::LAST_APP_SET_IMAGE_VISUAL_HASH.load(Ordering::SeqCst) == visual_hash {
+        crate::LAST_APP_SET_IMAGE_VISUAL_HASH.store(0, Ordering::SeqCst);
+    }
 }
 
 fn should_ignore_recent_image_echo(raw_hash: u64, visual_hash: u64) -> bool {
@@ -47,6 +59,26 @@ fn should_ignore_recent_image_echo(raw_hash: u64, visual_hash: u64) -> bool {
 
 fn should_capture_file_entries(capture_files_enabled: bool) -> bool {
     capture_files_enabled
+}
+
+/// Is this image already stored?
+///
+/// Mirrors the database fallback the text branch has always had. Without it, any
+/// image whose hash matched the previous one was silently dropped (`handled = true`),
+/// so an image that had never actually been recorded could be lost forever.
+/// Asking the database makes the decision about what is already persisted, rather
+/// than about what happened to be in the in-memory last-seen slot.
+fn image_already_in_db(app: &tauri::AppHandle, data_url: &str) -> bool {
+    let Some(db_state) = app.try_state::<DbState>() else {
+        return false;
+    };
+    let Ok(conn) = db_state.conn.lock() else {
+        return false;
+    };
+    matches!(
+        db_state.repo.find_by_content_with_conn(&conn, data_url, Some("image")),
+        Ok(Some(_))
+    )
 }
 
 fn is_snipping_tool_source(
@@ -826,7 +858,7 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
 
                     if hash != monitor_state.last_image_hash {
                         if should_ignore_recent_image_echo(hash, visual_hash) {
-                            clear_recent_image_echo_state();
+                            clear_recent_image_echo_state(hash, visual_hash);
                         } else {
                             let b64 = base64::engine::general_purpose::STANDARD.encode(gif_data);
                             process_new_entry(
@@ -851,7 +883,7 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
 
                     if hash != monitor_state.last_image_hash {
                         if should_ignore_recent_image_echo(hash, visual_hash) {
-                            clear_recent_image_echo_state();
+                            clear_recent_image_echo_state(hash, visual_hash);
                         } else {
                             process_new_entry(
                                 &app,
@@ -912,7 +944,7 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
                     if let Some((data_url, hash, visual_hash)) = fast_data_url {
                         if hash != monitor_state.last_image_hash {
                             if should_ignore_recent_image_echo(hash, visual_hash) {
-                                clear_recent_image_echo_state();
+                                clear_recent_image_echo_state(hash, visual_hash);
                                 handled = true;
                             } else {
                                 process_new_entry(
@@ -924,7 +956,18 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
                                 handled = true;
                             }
                             monitor_state.last_image_hash = hash;
+                        } else if image_already_in_db(&app, &data_url) {
+                            // Same hash as last time AND it really is stored — nothing to do.
+                            handled = true;
                         } else {
+                            // Same hash but absent from the database: the earlier event was
+                            // never recorded, so record it now instead of dropping it.
+                            process_new_entry(
+                                &app,
+                                ClipboardData::Image { data_url },
+                                None,
+                                Some(source_snapshot.clone()),
+                            );
                             handled = true;
                         }
                     }
@@ -946,7 +989,7 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
 
                             if hash != monitor_state.last_image_hash {
                                 if should_ignore_recent_image_echo(hash, visual_hash) {
-                                    clear_recent_image_echo_state();
+                                    clear_recent_image_echo_state(hash, visual_hash);
                                     handled = true;
                                 } else {
                                     if let Some(img_buf) = image::RgbaImage::from_raw(
