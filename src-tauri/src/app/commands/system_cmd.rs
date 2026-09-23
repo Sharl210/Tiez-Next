@@ -1122,6 +1122,265 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 }
 
 // ---------------------------------------------------------------------------
+// 备份导出 / 导入恢复
+// ---------------------------------------------------------------------------
+
+/// 把内部错误转成前端可读的 [`AppError`]。
+///
+/// 错误信息序列化成 `{"code":"...","detail":"..."}` 的 JSON 串：`code` 是稳定的
+/// 机器可读原因码，前端据此映射成当前语言的人话（与项目里既有的
+/// `legacy_migrate_notice_<code>` 约定一致）；`detail` 是后端原文，用于排障与
+/// 在界面折叠展示。这样"拒绝原版"这类提示不会出现半英文，也不会因为后端只写中文
+/// 而让英/繁用户看不懂。
+fn backup_err(e: crate::services::backup::BackupError) -> AppError {
+    let payload = serde_json::json!({
+        "code": e.code(),
+        "detail": e.to_string(),
+    });
+    AppError::Validation(payload.to_string())
+}
+
+/// 导出备份包的前置检查结果。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupPreflight {
+    /// 当前数据目录。
+    pub data_dir: String,
+    /// 受管数据的总字节数（数据库 + 附件 + 表情收藏 + 背景）。
+    pub managed_bytes: u64,
+    /// 受管文件总数。
+    pub managed_files: u64,
+    /// 是否需要用户为背景图单独做决定（设置指向数据目录之外）。
+    pub background_outside: bool,
+    /// 该背景图的绝对路径（若有）。
+    pub background_path: Option<String>,
+}
+
+/// 导出前的只读清点：让用户在点"导出"之前看到**将要打包多少东西**。
+///
+/// 尤其重要的是把"自定义背景图在数据目录之外"这件事提前告知——不然用户会以为
+/// 背景图没进包，或者以为进了包却发现导入后没背景。
+#[tauri::command]
+pub fn backup_preflight(state: State<'_, AppDataDir>) -> AppResult<BackupPreflight> {
+    let data_dir = state.0.lock().unwrap().clone();
+    let db_path = data_dir.join("clipboard.db");
+
+    let background_path = if db_path.is_file() {
+        Connection::open(&db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM settings WHERE key = 'app.custom_background'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else {
+        None
+    };
+
+    let background_outside = background_path
+        .as_ref()
+        .map(|p| !std::path::Path::new(p).starts_with(&data_dir))
+        .unwrap_or(false);
+
+    let (managed_files, managed_bytes) = count_managed(&data_dir);
+
+    Ok(BackupPreflight {
+        data_dir: data_dir.to_string_lossy().to_string(),
+        managed_bytes,
+        managed_files,
+        background_outside,
+        background_path: if background_outside { background_path } else { None },
+    })
+}
+
+/// 统计受管数据的文件数与字节数（只读）。
+fn count_managed(data_dir: &std::path::Path) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    // 数据库三件套
+    for name in ["clipboard.db", "clipboard.db-wal", "clipboard.db-shm"] {
+        let p = data_dir.join(name);
+        if let Ok(m) = std::fs::metadata(&p) {
+            if m.is_file() {
+                files += 1;
+                bytes += m.len();
+            }
+        }
+    }
+    // 两个目录
+    for dir_name in ["attachments", "emoji_favorites"] {
+        let dir = data_dir.join(dir_name);
+        let mut stack = vec![dir];
+        while let Some(cur) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&cur) else { continue };
+            for entry in rd.flatten() {
+                let Ok(ty) = entry.file_type() else { continue };
+                if ty.is_dir() {
+                    stack.push(entry.path());
+                } else if ty.is_file() {
+                    files += 1;
+                    bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// 为导出选一个**默认输出路径**并回传（只计算，不写文件）。
+///
+/// 【为什么不弹系统保存对话框】保存对话框需要额外的 fs/dialog 权限（`dialog:allow-save`），
+/// 而本功能要的是"用户确切知道文件落在哪里"。改为由后端挑一个稳妥位置（优先用户
+/// 「文档」目录，退回数据目录同级），把完整路径回传界面**明示**给用户，并允许一键
+/// 打开所在文件夹。这样既不扩权限，也不牺牲透明度。
+#[tauri::command]
+pub fn suggest_backup_path(
+    state: State<'_, AppDataDir>,
+    app_version: String,
+) -> AppResult<String> {
+    let data_dir = state.0.lock().unwrap().clone();
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let file_name = format!("Tiez-Next-backup-{}-{}.zip", app_version, stamp);
+
+    // 优先「文档」目录；拿不到就退回数据目录同级（保证一定可写）。
+    let base = dirs_documents_dir()
+        .filter(|p| p.is_dir())
+        .or_else(|| data_dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| data_dir.clone());
+
+    Ok(base.join(file_name).to_string_lossy().to_string())
+}
+
+/// 取用户「文档」目录。不引入新依赖：Windows 上读注册表 shell 文件夹是常见做法，
+/// 但这里只需一个"尽力而为"的候选，因此用环境变量 + 约定路径即可。
+fn dirs_documents_dir() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("USERPROFILE") {
+        let p = std::path::PathBuf::from(v).join("Documents");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(v) = std::env::var("HOME") {
+        let p = std::path::PathBuf::from(v).join("Documents");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 打开某个文件所在的位置（导出成功后让用户立刻找到产物）。
+///
+/// 是**尽力而为**的操作：失败只记日志、不向用户报错——定位文件失败不该让"导出成功"
+/// 这个事实变成一次错误弹窗。
+#[tauri::command]
+pub fn reveal_path(path: String) -> AppResult<()> {
+    let p = std::path::PathBuf::from(path.trim());
+
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,<完整路径>` 让资源管理器打开父目录并高亮该文件本身。
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", p.to_string_lossy()))
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 其他平台没有统一的"定位文件"入口，退化为打开父目录。
+        let dir = if p.is_dir() {
+            p.clone()
+        } else {
+            p.parent().map(|v| v.to_path_buf()).unwrap_or(p.clone())
+        };
+        let _ = dir;
+    }
+
+    Ok(())
+}
+
+/// 导出备份包。
+///
+/// `output_path` 由前端用系统保存对话框取得，因此用户确切知道文件会落在哪里。
+/// 导出全程只读数据目录（数据库用 `VACUUM INTO` 在线快照）。
+#[tauri::command]
+pub fn export_backup(
+    state: State<'_, AppDataDir>,
+    output_path: String,
+    app_version: String,
+) -> AppResult<crate::services::backup::export::BackupReport> {
+    let data_dir = state.0.lock().unwrap().clone();
+    let out = std::path::PathBuf::from(output_path.trim());
+    if out.as_os_str().is_empty() {
+        return Err(AppError::Validation("未指定导出路径".to_string()));
+    }
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::Validation(format!(
+                "导出目录不存在：{}",
+                parent.display()
+            )));
+        }
+    }
+
+    crate::services::backup::create_backup(&crate::services::backup::BackupRequest {
+        data_dir,
+        output_path: out,
+        app_version,
+    })
+    .map_err(backup_err)
+}
+
+/// 只读预览一份备份包：在**二次确认弹窗**里告诉用户这个包是谁导出的、里面有多少数据。
+///
+/// 这是破坏性操作四层防护里的"让用户看到将发生什么"：拒绝原版的判定也在这里发生，
+/// 用户点确认之前就知道包能不能用。
+#[tauri::command]
+pub fn inspect_backup_package(
+    path: String,
+) -> AppResult<crate::services::backup::import::InspectReport> {
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(AppError::Validation(format!(
+            "备份包不存在：{}",
+            p.display()
+        )));
+    }
+    crate::services::backup::import::inspect_backup(&p).map_err(backup_err)
+}
+
+/// 导入备份包并完全恢复。
+///
+/// # 安全链（任一步失败，现有数据保持完好）
+///
+/// 1. 只读校验整包（归属 / 版本 / sha256 / 数量对账）——**不写任何文件**；
+/// 2. 给当前数据目录建立带时间戳的旁路备份，路径随结果回传；
+/// 3. 在数据目录同级的暂存目录里组装完整的新数据；
+/// 4. 执行导入后重置（路径改写 / 云同步游标 / 迁移 / 默认值 / WAL 作废 / 背景还原）；
+/// 5. 逐个受管条目换上去，失败即原样放回。
+///
+/// 返回后界面必须提示用户**重启应用**：进程内的数据库连接仍指向替换前的数据。
+#[tauri::command]
+pub fn import_backup(
+    state: State<'_, AppDataDir>,
+    archive_path: String,
+) -> AppResult<crate::services::backup::import::RestoreReport> {
+    let data_dir = state.0.lock().unwrap().clone();
+    let archive = std::path::PathBuf::from(archive_path.trim());
+    crate::services::backup::restore_backup(&crate::services::backup::RestoreRequest {
+        data_dir,
+        archive_path: archive,
+    })
+    .map_err(backup_err)
+}
+
+// ---------------------------------------------------------------------------
 // 迁移安全回归测试（复核 G-2 的直接证据）
 //
 // 这些测试守护本任务里**最危险**的一条路径：把"用户已经用过的新版数据目录"误判成

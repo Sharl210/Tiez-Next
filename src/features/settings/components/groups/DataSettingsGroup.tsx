@@ -1,13 +1,15 @@
-import { useEffect, useState } from "react";
-import { open, ask, message } from "@tauri-apps/plugin-dialog";
+import { useCallback, useEffect, useState } from "react";
+import { open, ask, message, confirm } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
     ChevronDown,
     ChevronRight,
     CopyCheck,
+    Download,
     FolderInput,
     FolderOpen,
     Trash2,
+    Upload,
 } from "lucide-react";
 
 interface DataSettingsGroupProps {
@@ -55,6 +57,74 @@ interface MigrationReport {
     supersededDb: string | null;
 }
 
+/** 导出前的只读清点（对应后端 `backup_preflight`）。 */
+interface BackupPreflight {
+    dataDir: string;
+    managedBytes: number;
+    managedFiles: number;
+    /** 自定义背景图在数据目录之外时为 true（导出会一并打包）。 */
+    backgroundOutside: boolean;
+    backgroundPath: string | null;
+}
+
+/** 导出结果（对应后端 `export_backup` 的 `BackupReport`）。 */
+interface BackupReport {
+    outputPath: string;
+    entriesWritten: number;
+    bytesWritten: number;
+    counts: {
+        entries: number;
+        tags: number;
+        attachments: number;
+        emojiFavorites: number;
+        settings: number;
+    };
+    skipped: string[];
+    notes: string[];
+    sha256: string;
+}
+
+/** 包预览（对应后端 `inspect_backup_package` 的 `InspectReport`）。 */
+interface InspectReport {
+    appId: string;
+    appVersion: string;
+    formatVersion: number;
+    exportedAt: string;
+    schemaVersion: number;
+    counts: {
+        entries: number;
+        tags: number;
+        attachments: number;
+        emojiFavorites: number;
+        settings: number;
+    };
+    archiveEntries: number;
+    notes: string[];
+    fileBytes: number;
+}
+
+/** 导入结果（对应后端 `import_backup` 的 `RestoreReport`）。 */
+interface RestoreReport {
+    archivePath: string;
+    formatVersion: number;
+    exportedAt: string;
+    exportedAppVersion: string;
+    preRestoreBackup: string | null;
+    restoredFiles: number;
+    restoredBytes: number;
+    verifiedEntries: number;
+    counts: {
+        entries: number;
+        tags: number;
+        attachments: number;
+        emojiFavorites: number;
+        settings: number;
+    };
+    resetsApplied: string[];
+    warnings: string[];
+    restartRequired: boolean;
+}
+
 /** 把字节数格式化为人类可读形式。 */
 const formatBytes = (bytes: number): string => {
     if (!bytes) return "0 B";
@@ -62,6 +132,53 @@ const formatBytes = (bytes: number): string => {
     const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
     const value = bytes / Math.pow(1024, i);
     return `${value >= 100 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+};
+
+/**
+ * 取当前应用版本号。
+ *
+ * 用 `core:app:allow-version` 权限（capabilities 已声明）向后端要；拿不到就返回空串，
+ * 只是 package 的 manifest 少一个展示字段，不影响备份本身的可用性——因此这里
+ * **不**抛错，避免"版本查询失败导致整个导出不可用"。
+ */
+const appVersionSafe = async (): Promise<string> => {
+    try {
+        return await invoke<string>("plugin:app|version");
+    } catch (e) {
+        console.warn("app version unavailable:", e);
+        return "";
+    }
+};
+
+/**
+ * 从后端错误里取出**机器可读原因码**与明细。
+ *
+ * 后端把备份类错误序列化成 `{"code":..,"detail":..}` 的 JSON 串（见
+ * `system_cmd::backup_err`），这样界面能把它翻成当前语言，而不是把后端的中文原文
+ * 直接甩给英文/繁体用户。取不到 code 时（例如纯 IO 报错）退化为原文展示。
+ */
+const parseBackendError = (e: unknown): { code: string | null; detail: string } => {
+    const raw = e instanceof Error ? e.message : String(e);
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
+            return { code: parsed.code, detail: String(parsed.detail ?? parsed.code) };
+        }
+    } catch {
+        /* 不是 JSON：按原文处理 */
+    }
+    return { code: null, detail: raw };
+};
+
+/** 备份类错误码 → 当前语言文案。未知码退化为后端明细原文。 */
+const backupErrorText = (t: (key: string) => string, e: unknown): string => {
+    const { code, detail } = parseBackendError(e);
+    if (!code) return detail;
+    const key = `backup_err_${code}`;
+    const text = t(key);
+    if (text === key) return detail;
+    // 需要明细的码（如 land_failed / io / count_mismatch）把 `{detail}` / `{e}` 填进去。
+    return text.replace("{detail}", detail).replace("{e}", detail);
 };
 
 const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGroupProps) => {
@@ -72,6 +189,12 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
     // 而不是只看一句"成功/失败"。
     const [lastResult, setLastResult] = useState<MigrationReport | null>(null);
 
+    // 备份与恢复
+    const [preflight, setPreflight] = useState<BackupPreflight | null>(null);
+    const [lastBackup, setLastBackup] = useState<BackupReport | null>(null);
+    const [lastRestore, setLastRestore] = useState<RestoreReport | null>(null);
+    const [backupBusy, setBackupBusy] = useState<"export" | "import" | null>(null);
+
     const refreshLegacyDirs = () => {
         invoke<LegacyDir[]>("list_legacy_data_dirs")
             .then(setLegacyDirs)
@@ -81,9 +204,21 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
             });
     };
 
+    const refreshPreflight = useCallback(() => {
+        invoke<BackupPreflight>("backup_preflight")
+            .then(setPreflight)
+            .catch((e) => {
+                console.error("backup_preflight failed:", e);
+                setPreflight(null);
+            });
+    }, []);
+
     useEffect(() => {
         // 展开时才查询：折叠状态下不做无谓的磁盘统计。
-        if (!collapsed) refreshLegacyDirs();
+        if (!collapsed) {
+            refreshLegacyDirs();
+            refreshPreflight();
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [collapsed]);
 
@@ -219,6 +354,131 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
         }
     };
 
+    // ------------------------------------------------------------------
+    // 备份导出 / 导入恢复
+    // ------------------------------------------------------------------
+
+    /**
+     * 导出备份。
+     *
+     * 路径不弹系统保存对话框（那需要额外的 fs 权限），而是由后端挑一个稳妥位置并
+     * 在界面上**明示**完整路径，再提供"打开所在文件夹"。用户始终确切知道文件落在哪。
+     */
+    const handleExport = async () => {
+        setBackupBusy("export");
+        setLastBackup(null);
+        try {
+            const version = await appVersionSafe();
+            // 由后端挑一个稳妥的默认位置并回传完整路径——界面随后明示给用户，
+            // 因此不弹系统保存对话框（那会额外要求 fs/dialog 保存权限）。
+            const target = await invoke<string>("suggest_backup_path", {
+                appVersion: version,
+            });
+            const report = await invoke<BackupReport>("export_backup", {
+                outputPath: target,
+                appVersion: version,
+            });
+            setLastBackup(report);
+            await message(
+                t("backup_export_done")
+                    .replace("{path}", report.outputPath)
+                    .replace("{files}", String(report.entriesWritten))
+                    .replace("{size}", formatBytes(report.bytesWritten)) +
+                    (report.notes.length ? `\n\n${report.notes.join("\n")}` : ""),
+                { title: t("notice"), kind: "info" }
+            );
+        } catch (e: unknown) {
+            await message(t("backup_export_failed").replace("{e}", backupErrorText(t, e)), {
+                title: t("error"),
+                kind: "error",
+            });
+        } finally {
+            setBackupBusy(null);
+            refreshPreflight();
+        }
+    };
+
+    /**
+     * 导入备份（**破坏性操作**，四层防护）。
+     *
+     * 1. 后端只接受"具体的一个 zip 文件路径"，不是任意目录（白名单式输入）；
+     * 2. 先只读预览包：拒绝原版 TieZ / 缺 manifest / 比本版新的包，并展示包内数量；
+     * 3. 二次确认弹窗明确写出"当前数据将被替换"以及包内到底有多少数据；
+     * 4. 后端先给当前数据做完整旁路备份，再把备份路径回传，界面明确告知用户
+     *    "可回退到哪里"。
+     */
+    const handleImport = async () => {
+        const selected = await open({
+            multiple: false,
+            directory: false,
+            filters: [{ name: "zip", extensions: ["zip"] }],
+            title: t("backup_import"),
+        });
+        if (!selected) return;
+
+        // ---- 只读预览：把"将发生什么"提前摆给用户看 ----
+        let info: InspectReport;
+        try {
+            info = await invoke<InspectReport>("inspect_backup_package", {
+                path: selected as string,
+            });
+        } catch (e: unknown) {
+            await message(t("backup_inspect_failed").replace("{e}", backupErrorText(t, e)), {
+                title: t("error"),
+                kind: "error",
+            });
+            return;
+        }
+
+        // ---- 二次确认：破坏性操作必须让用户明确点头 ----
+        const ok = await confirm(
+            t("backup_import_confirm")
+                .replace("{entries}", String(info.counts.entries))
+                .replace("{tags}", String(info.counts.tags))
+                .replace("{attachments}", String(info.counts.attachments))
+                .replace("{settings}", String(info.counts.settings))
+                .replace("{exported_at}", info.exportedAt || "—")
+                .replace("{version}", info.appVersion || "—"),
+            {
+                title: t("backup_import_confirm_title"),
+                kind: "warning",
+                okLabel: t("backup_import_confirm_ok"),
+                cancelLabel: t("cancel"),
+            }
+        );
+        if (!ok) return;
+
+        setBackupBusy("import");
+        setLastRestore(null);
+        try {
+            const report = await invoke<RestoreReport>("import_backup", {
+                archivePath: selected as string,
+            });
+            setLastRestore(report);
+            const summary = report.preRestoreBackup
+                ? t("backup_import_done")
+                      .replace("{files}", String(report.restoredFiles))
+                      .replace("{size}", formatBytes(report.restoredBytes))
+                      .replace("{backup}", report.preRestoreBackup)
+                : t("backup_import_done_no_backup")
+                      .replace("{files}", String(report.restoredFiles))
+                      .replace("{size}", formatBytes(report.restoredBytes));
+            const warnings = report.warnings.length ? `\n\n${report.warnings.join("\n")}` : "";
+            await message(`${summary}${warnings}\n\n${t("backup_import_restart")}`, {
+                title: t("notice"),
+                kind: "info",
+            });
+        } catch (e: unknown) {
+            await message(t("backup_import_failed").replace("{e}", backupErrorText(t, e)), {
+                title: t("error"),
+                kind: "error",
+            });
+        } finally {
+            setBackupBusy(null);
+            refreshPreflight();
+        }
+    };
+
     const totalBytes = legacyDirs.reduce((sum, d) => sum + d.bytes, 0);
 
     return (
@@ -293,6 +553,156 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                         <div className="data-panel" style={{ fontSize: '11px', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
                             {dataPath}
                         </div>
+                    </div>
+
+                    {/*
+                      备份与恢复：导出 zip / 导入即完全恢复。
+                      导入是破坏性操作，因此按钮旁始终写明"会先自动备份当前数据"，
+                      且导入走「只读预览 → 二次确认 → 落地」三步。
+                    */}
+                    <div className="setting-item column no-border">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                            <span className="item-label" style={{ textTransform: 'uppercase', fontSize: '11px', opacity: 0.8 }}>
+                                {t('backup_section')}
+                            </span>
+                            {preflight && (
+                                <span style={{ fontSize: '10px', color: 'var(--text-secondary)' }}>
+                                    {t('backup_preflight')
+                                        .replace('{files}', String(preflight.managedFiles))
+                                        .replace('{size}', formatBytes(preflight.managedBytes))}
+                                </span>
+                            )}
+                        </div>
+
+                        <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '8px', lineHeight: 1.5 }}>
+                            {t('backup_intro')}
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' }}>
+                            <button
+                                className="btn-icon"
+                                disabled={backupBusy !== null}
+                                onClick={handleExport}
+                                style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '26px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                            >
+                                <Download size={12} />
+                                {backupBusy === 'export' ? t('backup_export_running') : t('backup_export')}
+                            </button>
+                            <button
+                                className="btn-icon"
+                                disabled={backupBusy !== null}
+                                onClick={handleImport}
+                                style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '26px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                            >
+                                <Upload size={12} />
+                                {backupBusy === 'import' ? t('backup_import_running') : t('backup_import')}
+                            </button>
+                        </div>
+
+                        <div style={{ fontSize: '10px', color: 'var(--text-secondary)', opacity: 0.85, lineHeight: 1.5, marginBottom: '6px' }}>
+                            {t('backup_export_hint')}
+                        </div>
+                        <div style={{ fontSize: '10px', color: 'var(--text-secondary)', opacity: 0.85, lineHeight: 1.5, marginBottom: '6px' }}>
+                            {t('backup_import_hint')}
+                        </div>
+
+                        {/* 自定义背景图在数据目录之外：提前告知会被一并打包，避免用户以为丢了 */}
+                        {preflight?.backgroundOutside && preflight.backgroundPath && (
+                            <div style={{ fontSize: '10px', color: 'var(--text-secondary)', opacity: 0.9, lineHeight: 1.5, marginBottom: '6px' }}>
+                                {t('backup_background_outside').replace('{path}', preflight.backgroundPath)}
+                            </div>
+                        )}
+
+                        <div style={{ fontSize: '10px', color: 'var(--text-secondary)', opacity: 0.75, lineHeight: 1.5 }}>
+                            {t('backup_datapath_note')}
+                        </div>
+
+                        {/* 导出结果：路径、条目数与校验和——用户能核对自己拿到了什么 */}
+                        {lastBackup && (
+                            <div
+                                style={{
+                                    border: '1px solid rgba(64,160,96,0.5)',
+                                    borderRadius: '6px',
+                                    padding: '8px 10px',
+                                    marginTop: '8px',
+                                    fontSize: '10px',
+                                    lineHeight: 1.6,
+                                    wordBreak: 'break-all',
+                                }}
+                            >
+                                <div style={{ fontWeight: 600, marginBottom: '4px' }}>{t('backup_export')}</div>
+                                <div>
+                                    {t('backup_export_path').replace('{path}', lastBackup.outputPath)}
+                                </div>
+                                <div>
+                                    {t('backup_preflight')
+                                        .replace('{files}', String(lastBackup.entriesWritten))
+                                        .replace('{size}', formatBytes(lastBackup.bytesWritten))}
+                                </div>
+                                <button
+                                    className="btn-icon"
+                                    onClick={() => invoke('reveal_path', { path: lastBackup.outputPath }).catch(console.error)}
+                                    style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '24px', marginTop: '6px' }}
+                                >
+                                    {t('backup_reveal')}
+                                </button>
+                            </div>
+                        )}
+
+                        {/* 导入结果：明确写出"导入前的数据备份在哪"，这是可回退性的凭据 */}
+                        {lastRestore && (
+                            <div
+                                style={{
+                                    border: '1px solid rgba(64,160,96,0.5)',
+                                    borderRadius: '6px',
+                                    padding: '8px 10px',
+                                    marginTop: '8px',
+                                    fontSize: '10px',
+                                    lineHeight: 1.6,
+                                    wordBreak: 'break-all',
+                                }}
+                            >
+                                <div style={{ fontWeight: 600, marginBottom: '4px' }}>
+                                    {t('backup_import')}
+                                </div>
+                                <div>
+                                    {t('backup_preflight')
+                                        .replace('{files}', String(lastRestore.restoredFiles))
+                                        .replace('{size}', formatBytes(lastRestore.restoredBytes))}
+                                </div>
+                                {lastRestore.preRestoreBackup ? (
+                                    <div>
+                                        {t('backup_import_done')
+                                            .replace('{files}', String(lastRestore.restoredFiles))
+                                            .replace('{size}', formatBytes(lastRestore.restoredBytes))
+                                            .replace('{backup}', lastRestore.preRestoreBackup)}
+                                    </div>
+                                ) : (
+                                    <div>{t('backup_import_done_no_backup')
+                                        .replace('{files}', String(lastRestore.restoredFiles))
+                                        .replace('{size}', formatBytes(lastRestore.restoredBytes))}</div>
+                                )}
+                                {lastRestore.warnings.map((w) => (
+                                    <div key={w} style={{ opacity: 0.85 }}>
+                                        {w}
+                                    </div>
+                                ))}
+                                {lastRestore.restartRequired && (
+                                    <>
+                                        <div style={{ marginTop: '4px', fontWeight: 600 }}>
+                                            {t('backup_import_restart')}
+                                        </div>
+                                        <button
+                                            className="btn-icon"
+                                            onClick={() => invoke('relaunch').catch(console.error)}
+                                            style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '24px', marginTop: '6px' }}
+                                        >
+                                            {t('backup_import_restart_now')}
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        )}
                     </div>
 
                     {/*

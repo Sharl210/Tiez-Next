@@ -66,6 +66,12 @@ sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 windows-version = "0.1.1"
 dotenvy = "0.15"
+# 备份包（导出/导入）使用的 zip 容器。
+#
+# 必须显式 `default-features = false` + 仅 `deflate`：`deflate-flate2` 变体与默认
+# features 在交叉编译到 x86_64-pc-windows-msvc 时都会编译失败。这一行是实测通过的
+# 组合，勿改成其它 feature 组合。
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"
