@@ -250,10 +250,19 @@ describe("shouldShowTag（R3 分组显示规则）", () => {
     expect(shouldShowTag({ name: "密码", count: 0 }, true)).toBe(true);
   });
 
+  // Decision (user, 2026-09-23): `密码` / `password` are legacy names with no
+  // producer anywhere in the code base, so they are no longer tied to the privacy
+  // setting. Only `sensitive` — the one name the capture pipeline actually pushes —
+  // follows that feature. Deleting any of them is permanent: nothing reseeds them.
   it("内置敏感分组：空且功能关闭时才隐藏（唯一的隐藏条件）", () => {
     expect(shouldShowTag({ name: "sensitive", count: 0 }, false)).toBe(false);
-    expect(shouldShowTag({ name: "密码", count: 0 }, false)).toBe(false);
-    expect(shouldShowTag({ name: "password", count: 0 }, false)).toBe(false);
+  });
+
+  it("历史遗留名称不再跟随隐私开关（无产生者，按普通分组处理）", () => {
+    for (const name of ["密码", "password", "PASSWORD"]) {
+      expect(shouldShowTag({ name, count: 0 }, false)).toBe(true);
+      expect(shouldShowTag({ name, count: 0 }, true)).toBe(true);
+    }
   });
 
   it("相似但非内置的名称不受影响", () => {

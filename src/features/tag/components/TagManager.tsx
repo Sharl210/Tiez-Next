@@ -29,30 +29,39 @@ const isBinaryContentType = (contentType: string | undefined | null) =>
 const MAX_NOTE_CHARS = 2000;
 
 /**
- * R3: the tag names the back end treats as "sensitive" (`SENSITIVE_TAGS` plus the
- * `password` spelling used by the main-page blur check).
+ * R3: the one built-in tag name that a feature actually produces.
  *
- * These are ordinary tag rows; they were only special-cased in this component to
- * make them un-deletable, and that protection is gone. The list survives because an
- * *empty leftover* row needs to follow the feature that produces it — see the
- * filter in `fetchTags`.
+ * `sensitive` is pushed onto an entry by the capture pipeline
+ * (`services/clipboard/pipeline.rs`) while privacy protection is on, so an empty
+ * leftover row for it should follow that setting.
+ *
+ * `密码` / `password` are deliberately NOT in this list. They have no producer
+ * anywhere in the code base — they only ever came from the schema seed — so tying
+ * them to the privacy setting would attach them to a feature that does not create
+ * them. They are treated as legacy names: freely deletable, and shown like any other
+ * group.
+ *
+ * The back end still treats all three as sensitive when blurring, which is why the
+ * names are recognised in the main page's blur check regardless of this list.
  */
-const BUILTIN_SENSITIVE_TAG_NAMES = ['sensitive', '密码', 'password'];
+const FEATURE_PRODUCED_SENSITIVE_TAGS = ['sensitive'];
 
-const isBuiltinSensitiveTag = (name: string) =>
-    BUILTIN_SENSITIVE_TAG_NAMES.some((n) => n.toLowerCase() === name.toLowerCase());
+const isFeatureProducedSensitiveTag = (name: string) =>
+    FEATURE_PRODUCED_SENSITIVE_TAGS.some((n) => n.toLowerCase() === name.toLowerCase());
 
 /**
- * R3: should a built-in sensitive group be shown?
+ * R3: should a tag group be shown?
  *
- * Two independent reasons keep it visible:
+ * For the one feature-produced name (`sensitive`), two independent reasons keep it
+ * visible:
  *  - the feature that produces it is on, so it is a normal, usable group; or
  *  - it actually holds entries, in which case hiding it would strand real data.
+ * Only "feature off AND empty" hides it — a leftover seeded row nothing can put an
+ * entry into. This never *deletes* the row; it only stops rendering it.
  *
- * Only the combination "feature off AND empty" hides it — that state is a leftover
- * seeded row nothing can put an entry into, so showing it would offer a permanently
- * un-actionable group. Note this never *deletes* the row; it only stops rendering it,
- * and the group stays fully deletable once it holds anything.
+ * A legacy name (`密码` / `password`) has no producing feature to consult, so it is
+ * shown on its own merits: entries mean it is real and stays; an empty row is hidden
+ * like any other empty group would be. Deleting it is permanent either way.
  *
  * Exported for tests: an off-by-one in this predicate silently hides user data or
  * silently resurrects a deleted seed, and neither is visible in a type check.
@@ -61,7 +70,7 @@ export function shouldShowTag(
     tag: { name: string; count: number },
     sensitiveFeatureEnabled: boolean
 ): boolean {
-    if (!isBuiltinSensitiveTag(tag.name)) return true;
+    if (!isFeatureProducedSensitiveTag(tag.name)) return true;
     if (tag.count > 0) return true;
     return sensitiveFeatureEnabled;
 }
