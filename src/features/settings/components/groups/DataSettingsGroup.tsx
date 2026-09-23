@@ -836,10 +836,11 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                             {dir.has_database ? ` · ${t('legacy_dir_has_db')}` : ''}
                                         </div>
                                     </div>
-                                    <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+                                    <div style={{ display: 'flex', gap: '6px', flexShrink: 0, alignItems: 'center' }}>
+                                        {/* 主操作：迁移（只读源，不改动原版） */}
                                         <button
                                             className="btn-icon"
-                                            title={t('legacy_migrate')}
+                                            title={t('legacy_migrate_hint')}
                                             disabled={busyPath !== null}
                                             onClick={() => handleMigrate(dir.path, dir.identifier)}
                                             style={{ width: 'auto', padding: '4px 10px', fontSize: '10px', height: '24px', display: 'flex', alignItems: 'center', gap: '6px' }}
@@ -855,12 +856,25 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                         >
                                             <FolderOpen size={12} />
                                         </button>
+                                        {/* 危险操作：删除原版数据。
+                                            刻意与「迁移」拉开距离并弱化配色 —— 两者语义相反
+                                            （一个只读源、一个销毁源），并排放置容易被当成同一件事。 */}
+                                        <span
+                                            aria-hidden="true"
+                                            style={{ width: '1px', height: '16px', background: 'var(--border-color, rgba(128,128,128,0.3))' }}
+                                        />
                                         <button
                                             className="btn-icon"
-                                            title={t('legacy_dir_delete')}
+                                            title={t('legacy_dir_delete_hint')}
                                             disabled={busyPath === dir.path}
                                             onClick={() => handleRemove(dir)}
-                                            style={{ width: 'auto', padding: '4px 8px', height: '24px' }}
+                                            style={{
+                                                width: 'auto',
+                                                padding: '4px 8px',
+                                                height: '24px',
+                                                opacity: 0.7,
+                                                color: 'var(--danger-color, #c05050)',
+                                            }}
                                         >
                                             <Trash2 size={12} />
                                         </button>
