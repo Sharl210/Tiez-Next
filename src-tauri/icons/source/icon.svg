@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Tiez-Next 图形标：剪贴板。
+       设计约束：必须在 16×16 下仍能读出"一块板 + 顶部大夹子 + 三道内容"。
+       因此只保留三个高对比剪影元素，不用细线、不用小装饰。 -->
+  <defs>
+    <linearGradient id="board" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2f6595"/>
+      <stop offset="100%" stop-color="#1b3a5c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 板身 -->
+  <rect x="88" y="120" width="336" height="344" rx="56" fill="url(#board)"/>
+
+  <!-- 顶部夹子：做得更大更突出，作为 16px 下的辨识特征 -->
+  <rect x="160" y="64" width="192" height="112" rx="44" fill="#1b3a5c"/>
+  <circle cx="256" cy="120" r="26" fill="#8fc4ef"/>
+
+  <!-- 三道内容条：等距、粗，小尺寸下是"三道杠" -->
+  <rect x="152" y="228" width="208" height="42" rx="21" fill="#ffffff"/>
+  <rect x="152" y="300" width="208" height="42" rx="21" fill="#ffffff" opacity="0.8"/>
+  <rect x="152" y="372" width="120" height="42" rx="21" fill="#8fc4ef"/>
+</svg>
