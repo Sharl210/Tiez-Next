@@ -1,7 +1,7 @@
 !include "LogicLib.nsh"
 
 !macro NSIS_HOOK_PREUNINSTALL
-  DetailPrint "Stopping TieZ before uninstall..."
+  DetailPrint "Stopping Tiez-Next before uninstall..."
 
   # 应用关闭主窗口时会缩到托盘，卸载器不能依赖普通的关闭请求。
   # 这里在开始删除文件前强制结束已安装的进程，避免 exe 被占用。

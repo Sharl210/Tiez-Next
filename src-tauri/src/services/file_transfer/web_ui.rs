@@ -329,7 +329,7 @@ pub fn render_index(theme: &str, color_mode: &str, logo_base64: &str) -> String 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
-    <title>TieZ 终端传输</title>
+    <title>Tiez-Next 终端传输</title>
     <style>
         * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
         
@@ -700,7 +700,7 @@ pub fn render_index(theme: &str, color_mode: &str, logo_base64: &str) -> String 
             <div class="status-dot"></div>
             <span id="device-count">Linked</span>
         </div>
-        <h1>TieZ 终端</h1>
+        <h1>Tiez-Next 终端</h1>
     </header>
 
     <div id="chat-box">
@@ -758,7 +758,7 @@ pub fn render_index(theme: &str, color_mode: &str, logo_base64: &str) -> String 
         localStorage.setItem('tiez_device_id', deviceId);
         
         const deviceName = "Mobile";
-        const TIEZ_LOGO = "{logo_base64}";
+        const APP_LOGO = "{logo_base64}";
         const pendingUploads = new Map(); // filename -> [elements]
 
         function scrollToBottom() {{
@@ -871,7 +871,7 @@ pub fn render_index(theme: &str, color_mode: &str, logo_base64: &str) -> String 
                     const lower = name.toLowerCase();
                     const isPc = name === '电脑' || name === 'PC' || lower === 'pc' || lower === 'tiez';
                     if (isPc) {{
-                        return `<div class="avatar"><img src="${{TIEZ_LOGO}}" alt="TieZ"></div>`;
+                        return `<div class="avatar"><img src="${{APP_LOGO}}" alt="Tiez-Next"></div>`;
                     }}
                     return `<div class="avatar">${{name ? escapeHTML(name[0]) : '?'}}</div>`;
                 }})() : ''}}
