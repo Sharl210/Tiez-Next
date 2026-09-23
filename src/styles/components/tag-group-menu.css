@@ -1,0 +1,129 @@
+/* 标签组的右键菜单（重命名 / 删除）。
+ *
+ * 这个菜单 portal 到 `document.body`，因此**它的祖先不是侧栏**——主题作用域类
+ * （`.theme-mica` / `.theme-acrylic` / `.dark-mode` 等）挂在被 portal 的那个根节点上，
+ * 不会自动继承给 body 下的节点。所以这里只用 `:root` 上的变量（`base.css` 与
+ * `styles/themes/*.css` 都定义在 `:root` / `body` 上），不写任何依赖主题类的选择器。
+ *
+ * 尺寸与配色沿用项目既有的浮层令牌（`--menu-*`、`--shadow-*`、`--radius-*`），
+ * 这样六套主题下都不用单独调；危险色用条目管理页 `sort-btn.danger` 的同一个红
+ * （`#ff4d4f`），保持"危险动作 = 同一个红"。
+ *
+ * z-index 取 4000：高于 `modal.css` 里确认对话框遮罩的 3000，菜单永远在内容之上；
+ * 菜单打开时若弹出确认框，菜单已经先关闭，两者不会叠在一起。 */
+
+.tag-group-menu {
+    position: fixed;
+    z-index: 4000;
+    min-width: 152px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: var(--bg-input);
+    border: var(--menu-border);
+    border-radius: var(--menu-radius);
+    box-shadow: var(--menu-shadow);
+    font-family: var(--font-main);
+    animation: tag-group-menu-in 0.1s ease-out;
+}
+
+@keyframes tag-group-menu-in {
+    from {
+        opacity: 0;
+        transform: translateY(-3px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tag-group-menu {
+        animation: none;
+    }
+}
+
+.tag-group-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 9px;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    line-height: 1.3;
+    text-align: left;
+    color: var(--text-primary);
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tag-group-menu-item > svg {
+    flex-shrink: 0;
+    color: var(--text-secondary);
+    transition: color 0.12s ease;
+}
+
+.tag-group-menu-item > span:first-of-type {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tag-group-menu-item:hover,
+.tag-group-menu-item:focus-visible {
+    background: var(--menu-item-hover-background);
+    color: var(--menu-item-hover-color);
+    outline: none;
+}
+
+.tag-group-menu-item:hover > svg,
+.tag-group-menu-item:focus-visible > svg {
+    color: var(--menu-item-hover-color);
+}
+
+.tag-group-menu-item.danger {
+    color: #ff4d4f;
+}
+
+.tag-group-menu-item.danger > svg {
+    color: #ff4d4f;
+}
+
+.tag-group-menu-item.danger:hover,
+.tag-group-menu-item.danger:focus-visible {
+    background: rgba(255, 77, 79, 0.12);
+    color: #ff4d4f;
+}
+
+.tag-group-menu-item.danger:hover > svg,
+.tag-group-menu-item.danger:focus-visible > svg {
+    color: #ff4d4f;
+}
+
+/* 删除项右侧的条目数：提示"这一组牵动多少条"，真正的拦截在确认对话框里。 */
+.tag-group-menu-count {
+    flex: 0 0 auto;
+    min-width: 20px;
+    padding: 0 5px;
+    text-align: center;
+    font-size: 10.5px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    background: rgba(128, 128, 128, 0.14);
+    border-radius: var(--radius-pill, 9999px);
+}
+
+.tag-group-menu-item.danger:hover .tag-group-menu-count,
+.tag-group-menu-item.danger:focus-visible .tag-group-menu-count {
+    color: #ff4d4f;
+    background: rgba(255, 77, 79, 0.16);
+}

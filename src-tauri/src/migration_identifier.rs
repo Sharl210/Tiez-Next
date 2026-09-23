@@ -1,4 +1,10 @@
-//! 应用标识符变更的数据目录迁移（`com.tiez` / `com.tiez.app` → `com.tieznext`）。
+//! 应用数据目录的迁移：把**旧数据目录**里的数据安全地搬进当前数据目录。
+//!
+//! 迁移来源分两类（见 [`MIGRATABLE_SOURCES`]）：
+//!
+//! - **旧版 TieZ**（`com.tiez.app` / `com.tiez`）——本项目改名前的上游版本；
+//! - **历史版本的 Tiez-Next**（`com.tieznext`）——标识符跨版本不变，因此这条来源
+//!   对**之后的所有版本**同样成立，不需要每发一版就回来改来源表。
 //!
 //! ## 为什么需要它
 //!
@@ -10,6 +16,13 @@
 //!
 //! 既有的 `perform_migration_v028`（`贴汁` → `TieZ`）只处理更早的一次改名，不覆盖
 //! 标识符变更，因此单独实现本模块。
+//!
+//! ## 便携版：数据不在 `%APPDATA%`
+//!
+//! 便携版的用户数据放在**程序目录**里，不在系统应用数据目录。目录形状是
+//! `程序目录/data/{clipboard.db, attachments/, …}`（见 [`resolve_source_dir`]）。
+//! 因此"用户手动选目录"是便携版场景下的主要路径，而选中的那一层既可能是程序目录、
+//! 也可能是里面的 `data`——本模块对两者都接受。
 //!
 //! ## 安全契约（硬约束，不得放宽）
 //!
@@ -26,13 +39,23 @@
 //!
 //! ## 两条入口：自动候选 vs 用户手动指定
 //!
-//! - [`migrate_legacy_identifier_data`]：扫描白名单历史标识符目录（`com.tiez` /
-//!   `com.tiez.app`）。**本函数不再由启动流程调用**——用户明确要求迁移必须由自己
-//!   手动触发，应用启动不得自作主张搬数据。
+//! - [`migrate_legacy_identifier_data`]：扫描同名父目录下的**可迁移来源**目录
+//!   （见 [`MIGRATABLE_SOURCES`]）。**本函数不再由启动流程调用**——用户明确要求迁移
+//!   必须由自己手动触发，应用启动不得自作主张搬数据。
 //! - [`migrate_from_source_dir`]：迁移用户在界面上**手动选定的任意旧数据目录**。
 //!   与前者共用同一套安全契约与交付实现（本模块只有 [`migrate_from`] 一条实现路径，
 //!   两条入口不会漂移）。源路径由参数给出，因此必须做更严格的防御性检查：
 //!   源不能等于目标、不能是目标已包含的目录、不能是既有目标的祖先。
+//!
+//! ## 可迁移来源（不止"旧版 TieZ"）
+//!
+//! 早先这里叫"历史标识符白名单"，只认 TieZ 的两个旧标识符。现在语义放宽为
+//! **"可迁移来源"**：本应用自己的标识符 `com.tieznext` 同样是合法来源，于是
+//! "旧版 Tiez-Next → 新版 Tiez-Next"也可以迁移。因为标识符跨版本不变，这条规则
+//! **对未来版本自动成立**，不需要每发一版就回来改白名单。
+//!
+//! 来源分两类，界面据此如实告诉用户"这条是旧版 TieZ 的数据"还是"这是旧版
+//! Tiez-Next 的数据"，见 [`SourceOrigin`]。
 //!
 //! ## 依赖约束
 //!
@@ -44,15 +67,103 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 历史标识符对应的目录名。
+/// 本应用当前的标识符（`tauri.conf.json` 的 `identifier`）。
 ///
-/// 只认这个白名单，不做前缀/模糊匹配——避免误伤同级的其他应用目录。
-/// - `com.tiez.app`：Windows 主线 v0.3.1–v0.3.3
-/// - `com.tiez`：macOS 与 beta 分支
+/// 它同时是**新数据目录名**和**可迁移来源之一**：从 `com.tieznext` 目录迁移，
+/// 就是把"旧版本 Tiez-Next 的数据"搬进当前版本。标识符不随版本变化，因此这条
+/// 来源对之后所有版本都成立。
+pub const CURRENT_IDENTIFIER: &str = "com.tieznext";
+
+/// 一个可迁移来源的标识符及其出处。
+///
+/// `id` 既是目录名，也是判定"这个目录是谁的数据"的依据；界面用它显示来源类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigratableSource {
+    /// 目录名（等于历史 identifier）。
+    pub id: &'static str,
+    /// 该目录属于哪一类来源。
+    pub origin: SourceOrigin,
+}
+
+/// 数据目录的出处：这条目录里的数据**原本是哪个应用写的**。
+///
+/// 纯粹是**如实展示**用的分类，不参与安全判定——无论哪一类来源，迁移契约完全一致
+/// （源只读、失败只清暂存、绝不覆盖既有数据、成功后保留源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// 旧版 **TieZ**（应用改名前的上游版本）：`com.tiez.app` / `com.tiez`。
+    LegacyTiez,
+    /// **历史版本的 Tiez-Next**：`com.tieznext`。标识符未变，因此适用于后续所有版本。
+    PreviousTiezNext,
+}
+
+impl SourceOrigin {
+    /// 稳定的机器可读分类码，供界面按语言映射文案。
+    pub fn code(&self) -> &'static str {
+        match self {
+            SourceOrigin::LegacyTiez => "legacy_tiez",
+            SourceOrigin::PreviousTiezNext => "previous_tiez_next",
+        }
+    }
+}
+
+/// **可迁移来源**列表：允许作为迁移源的应用数据目录（按标识符）。
+///
+/// 只认这张表，不做前缀/模糊匹配——避免误伤同级的其他应用目录。表内每一项都必须
+/// 能明确指出"它是谁的数据"，界面才能如实分类展示。
+pub const MIGRATABLE_SOURCES: &[MigratableSource] = &[
+    // 旧版 TieZ：Windows 主线 v0.3.1–v0.3.3 用 `com.tiez.app`，macOS/beta 用 `com.tiez`。
+    MigratableSource {
+        id: "com.tiez.app",
+        origin: SourceOrigin::LegacyTiez,
+    },
+    MigratableSource {
+        id: "com.tiez",
+        origin: SourceOrigin::LegacyTiez,
+    },
+    // 本应用自己的标识符：历史版本的 Tiez-Next，以及之后所有版本。
+    MigratableSource {
+        id: CURRENT_IDENTIFIER,
+        origin: SourceOrigin::PreviousTiezNext,
+    },
+];
+
+/// 兼容别名：只保留"旧版 TieZ"那两个标识符。
+///
+/// 保留它是为了让**清理白名单**的语义继续精确——删除是破坏性动作，只应作用于会
+/// 被本应用取代的 TieZ 旧目录。查看/迁移用的是 [`MIGRATABLE_SOURCES`]。
 pub const LEGACY_IDENTIFIERS: &[&str] = &["com.tiez.app", "com.tiez"];
+
+/// 查一个目录名（identifier）属于哪一类可迁移来源；不在表内则返回 `None`。
+pub fn source_origin_of(identifier: &str) -> Option<SourceOrigin> {
+    MIGRATABLE_SOURCES
+        .iter()
+        .find(|s| s.id == identifier)
+        .map(|s| s.origin)
+}
+
+/// 查一个目录名是否可用于**迁移**（`com.tieznext` 也是合法来源）。
+///
+/// 与 [`is_cleanable_identifier`] 的区别很关键：迁移是只读动作，可以由本应用自己的
+/// 标识符发起（那是旧版 Tiez-Next）；删除是破坏性动作，不允许作用于当前标识符。
+pub fn is_migratable_identifier(identifier: &str) -> bool {
+    source_origin_of(identifier).is_some()
+}
+
+/// 查一个目录名是否允许被**备份后删除**（只允许旧版 TieZ 的两个标识符）。
+pub fn is_cleanable_identifier(identifier: &str) -> bool {
+    LEGACY_IDENTIFIERS.contains(&identifier)
+}
+
 
 /// 迁移是否成功由"新目录存在可用数据库"作为最终判据。
 const DB_FILE: &str = "clipboard.db";
+
+/// 便携版把数据放在**程序目录下这个子目录**里。
+///
+/// 依据是应用自身的 portable 判定（新旧版本一致）：可执行文件同级存在名为 `data`
+/// 的目录时，数据目录即切到该目录。见 [`resolve_source_dir`]。
+pub const PORTABLE_DATA_DIR: &str = "data";
 
 /// 一次迁移的结果。调用方据此决定是否继续做数据库内路径重写。
 #[derive(Debug)]
@@ -126,10 +237,14 @@ impl SkipReason {
     }
 }
 
-/// 由新数据目录推导同名父目录下的历史目录候选。
+/// 由新数据目录推导**可迁移来源**目录候选（同名父目录下）。
 ///
 /// 例如新目录为 `%APPDATA%\com.tieznext`，则返回
 /// `[%APPDATA%\com.tiez.app, %APPDATA%\com.tiez]`。
+///
+/// 【为什么这里**不含** `com.tieznext` 自己】它就是 `new_dir` 本身，列进来只会被
+/// `same_path` 跳过。旧版 Tiez-Next 的作品位于**别的**数据目录（用户手动选定的
+/// 便携目录、旧路径、备份位置），那条路走 [`migrate_from_source_dir`]。
 pub fn legacy_dirs_for(new_dir: &Path) -> Vec<PathBuf> {
     let Some(parent) = new_dir.parent() else {
         return Vec::new();
@@ -137,6 +252,25 @@ pub fn legacy_dirs_for(new_dir: &Path) -> Vec<PathBuf> {
     LEGACY_IDENTIFIERS
         .iter()
         .map(|id| parent.join(id))
+        .collect()
+}
+
+/// 由新数据目录推导**全部**可迁移来源目录候选：旧版 TieZ 两个 + 本应用标识符。
+///
+/// 用途是"用户没手动选路径时，自动发现同级的可迁移来源"。同名父目录下的
+/// `com.tieznext` 通常就是 `new_dir` 本身（会被 `same_path` 跳过），但在以下场景
+/// 它是**真实的不同目录**，因此不能省略：
+///
+/// - 用户把数据目录改到了别处（`datapath.txt` 重定向），或使用了便携版；
+/// - 此时 `%APPDATA%\com.tieznext` 里躺着的是**旧版本 Tiez-Next 的数据**，
+///   正是要迁进来的东西。
+pub fn migratable_dirs_for(new_dir: &Path) -> Vec<PathBuf> {
+    let Some(parent) = new_dir.parent() else {
+        return Vec::new();
+    };
+    MIGRATABLE_SOURCES
+        .iter()
+        .map(|s| parent.join(s.id))
         .collect()
 }
 
@@ -215,7 +349,113 @@ pub fn migrate_from_source_dir(
     target: &Path,
     allow_takeover: bool,
 ) -> MigrationOutcome {
-    migrate_from_inner(source, target, allow_takeover)
+    // 用户手选的路径可能不是"数据目录本身"，而是**包着数据目录的上一层**，
+    // 这在便携版上是常态（见 `resolve_source_dir`）。先在那里归一化，再做真正的
+    // 迁移；契约完全一致，只是源路径被定位到了正确的那一层。
+    let resolved = resolve_source_dir(source);
+    migrate_from_inner(resolved.as_path(), target, allow_takeover)
+}
+
+/// 把用户手选的源路径**归一化**到真正的数据目录。
+///
+/// ## 为什么需要它
+///
+/// 用户实际用的是**便携版**，数据不在 `%APPDATA%`，而在程序目录里。便携版发布包
+/// 解压后是**两层同名目录**（外层是压缩包解出的目录，内层才是程序本体）：
+///
+/// ```text
+/// TieZ_0.3.3-portable\                    <- 外层：与压缩包同名
+///   TieZ_0.3.3-portable\                  <- 内层：真正的程序目录
+///     tiez-app.exe
+///     说明.txt
+///     data\                               <- 真正的数据目录（clipboard.db 在这里）
+///       clipboard.db
+///       attachments\
+/// ```
+///
+/// 用户点「选择其它目录…」时，选中哪一层**取决于他打开到哪一步**：外层、内层、
+/// 或里面的 `data`，三种都有可能。旧版 TieZ 与新版本一样，只在可执行文件同级存在
+/// 名为 `data` 的目录时才切到便携模式（见 `app/setup.rs` 的 portable 检查），
+/// 因此 `data/` 是唯一确定的便携数据目录名。
+///
+/// ## 判定规则（保守，逐层下探）
+///
+/// 1. 所选目录**直接**含 `clipboard.db` → 它本身就是数据目录，原样返回。
+/// 2. 否则，若所选目录下恰有一个名为 `data` 的子目录，且**它**含 `clipboard.db`
+///    → 返回那个子目录。
+/// 3. 否则，若所选目录下恰有一个子目录，且从它出发按规则 1–2 能定位到含
+///    `clipboard.db` 的数据目录 → 返回那个结果（只穿透**恰好一个**子目录）。
+/// 4. 其余情况一律原样返回。
+///
+/// 【为什么必须让规则 3 生效】用户给的真实路径就是两层同名目录。若只认规则 1–2，
+/// 他选中**外层**时归一化会原样返回，于是迁移把外层目录整个复制进目标目录，数据落进
+/// `目标\TieZ_0.3.3-portable\data\clipboard.db`——而应用只读 `目标\clipboard.db`，
+/// 结果是**迁完看不到任何数据**，且因目标根层已有数据库，重复执行只会一致跳过。
+///
+/// 【为什么是"恰好一个子目录"而不是递归搜索】递归全树搜索会沿 `attachments/` 之类的
+/// 兄弟目录乱钻，可能定位到备份副本甚至无关目录。限制为"唯一的子目录"使下探方向没有
+/// 歧义：只有一个候选时不存在选错的可能。歧义（多个子目录）时定位失败，退回用户原选
+/// 路径——**绝不猜测**，让后续的 `EmptySource` / `SourceMissing` 如实回报，用户再往下
+/// 选一层即可。
+///
+/// 本函数**只读**（`is_file` / `is_dir` / `read_dir` 探测），不创建、不修改任何路径。
+pub fn resolve_source_dir(source: &Path) -> PathBuf {
+    locate_data_dir(source, true).unwrap_or_else(|| source.to_path_buf())
+}
+
+/// 定位真正的数据目录：成功返回 `Some(数据目录)`，无法确定时返回 `None`。
+///
+/// `allow_descent` 控制是否允许"穿透唯一子目录"（外层包目录 → 内层程序目录）。
+/// 穿透只做一轮：进入子目录后必须传 `false`，避免在畸形结构上无限深入；深度上限为
+/// 2（唯一子目录 + 其下的 `data`），足以覆盖真实的便携包形状。
+///
+/// 【关键：返回 `None` 而不是"尽力而为的猜测"】只有真的找到了含 `clipboard.db` 的
+/// 目录才算定位成功。这样调用方在失败时能安全地退回用户原选的路径，而不是把一个
+/// 没有数据库的目录（例如别的软件留下的同名 `data/`）当成数据目录去迁移。
+fn locate_data_dir(source: &Path, allow_descent: bool) -> Option<PathBuf> {
+    // 规则 1：选中的就是数据目录。
+    if source.join(DB_FILE).is_file() {
+        return Some(source.to_path_buf());
+    }
+
+    // 规则 2：便携版——数据在程序目录下的 `data/`。
+    let portable = source.join(PORTABLE_DATA_DIR);
+    if portable.join(DB_FILE).is_file() {
+        return Some(portable);
+    }
+
+    // 规则 3：穿透**恰好一个**子目录（外层包目录 → 内层程序目录）。
+    if allow_descent {
+        if let Some(child) = sole_subdirectory(source) {
+            return locate_data_dir(&child, false);
+        }
+    }
+
+    // 规则 4：定位失败。
+    None
+}
+
+/// 返回 `dir` 下**恰好一个**子目录；没有子目录或有多个（含符号链接歧义）时返回 `None`。
+///
+/// 只读 `read_dir`，不跟随也不创建任何东西。读不到目录时返回 `None`（由调用方按
+/// "原样返回"处理）。
+fn sole_subdirectory(dir: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        // `file_type()` 不跟随符号链接：符号链接一律不视为可下探的子目录，避免
+        // 借由链接把迁移引到目录树之外。
+        let Ok(ft) = entry.file_type() else {
+            return None;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        if found.is_some() {
+            return None; // 存在歧义
+        }
+        found = Some(entry.path());
+    }
+    found
 }
 
 /// 迁移的完整入口（带"目标空库是否允许接管"开关）。
@@ -301,40 +541,77 @@ pub fn check_source_is_readable(source: &Path) -> io::Result<(u64, u64)> {
 // 迁移中心：供 UI 展示旧目录占用，并在用户明确要求时备份后清理。
 // ---------------------------------------------------------------------------
 
-/// 一个历史数据目录的现状快照，供"迁移中心"展示。
+/// 一个可迁移来源目录的现状快照，供"迁移中心"展示。
 #[derive(Debug, Clone)]
 pub struct LegacyDirInfo {
     /// 目录绝对路径。
     pub path: PathBuf,
-    /// 该目录对应的历史标识符（目录名）。
+    /// 该目录对应的标识符（目录名）。
     pub identifier: String,
+    /// 这条目录里的数据原本由哪个应用写入（旧版 TieZ / 历史版本 Tiez-Next）。
+    pub origin: SourceOrigin,
     /// 占用的总字节数。
     pub bytes: u64,
     /// 文件总数。
     pub files: u64,
     /// 是否包含主数据库（含则说明是真实数据目录，而非残留空壳）。
     pub has_database: bool,
-    /// 是否与当前数据目录重合（重合时不得视为可清理的旧目录）。
-    pub is_current: bool,
+    /// 是否允许"备份后删除"。
+    ///
+    /// 只有**旧版 TieZ**的目录可以被清理：本应用已经取代它，删掉是有意义的动作。
+    /// 本应用自己标识符的目录（`com.tieznext`）**不可删**——那是用户留着的旧版
+    /// Tiez-Next 数据，不该由清理按钮销毁。
+    pub can_delete: bool,
 }
 
-/// 列出当前存在的历史数据目录及其占用情况。
+/// 列出当前存在的**可迁移来源**目录及其占用情况。
 ///
-/// 只做只读统计，不做任何修改。`current_dir` 用于标记"与当前数据目录重合"的条目，
-/// 避免 UI 把正在使用的目录误列为可清理对象。
-pub fn list_legacy_dirs(current_dir: &Path) -> Vec<LegacyDirInfo> {
-    let mut out = Vec::new();
+/// 只做只读统计，不做任何修改。
+///
+/// ## 扫描范围：`current_dir` 同级，**外加** `extra_roots` 各自的同级
+///
+/// `current_dir` 是应用当前使用的数据目录；它的同级里能找到旧版 TieZ 的目录，以及
+/// （当数据目录被改到别处时）当前标识符留下的旧数据。
+///
+/// `extra_roots` 用于补上**应用数据目录的原生位置**（Tauri 由 identifier 推导的那个
+/// 目录）。存在的必要性：用户一旦改了数据目录或用了便携版，`current_dir` 就搬到了
+/// 别处，而 `%APPDATA%\com.tieznext` 里那份**旧版本 Tiez-Next 的数据**并不在
+/// `current_dir` 同级——不额外扫这一处就会漏掉它。
+///
+/// ## 当前数据目录**不入选**
+///
+/// 与当前数据目录重合的条目直接剔除：它不是"来源"，对它发起迁移只会命中
+/// `same_path` 而被跳过。把它摆在界面上只会让用户以为"这里也能迁"，点下去却没有
+/// 任何效果——本模块宁可少列，也不给用户一个注定无效的按钮。
+///
+/// 结果按路径去重。
+pub fn list_legacy_dirs(current_dir: &Path, extra_roots: &[PathBuf]) -> Vec<LegacyDirInfo> {
+    let mut out: Vec<LegacyDirInfo> = Vec::new();
 
-    for legacy in legacy_dirs_for(current_dir) {
-        if !legacy.is_dir() {
+    for candidate in migratable_source_dirs(current_dir, extra_roots) {
+        if !candidate.is_dir() {
             continue;
         }
-        let identifier = legacy
+        // 当前正在使用的数据目录不是迁移来源（见函数文档）。
+        if candidate == current_dir {
+            continue;
+        }
+        let identifier = candidate
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let (files, bytes) = match scan_tree(&legacy) {
+        // 表里查不到就跳过：前缀/模糊匹配会误伤同级的其他应用目录。
+        let Some(origin) = source_origin_of(&identifier) else {
+            continue;
+        };
+
+        // 同一个目录可能同时被两条根推导出来（例如数据目录就在原生位置）。
+        if out.iter().any(|i| i.path == candidate) {
+            continue;
+        }
+
+        let (files, bytes) = match scan_tree(&candidate) {
             Ok(entries) => (
                 entries.iter().filter(|(k, _)| !k.ends_with('/')).count() as u64,
                 entries.iter().map(|(_, s)| *s).sum(),
@@ -343,16 +620,34 @@ pub fn list_legacy_dirs(current_dir: &Path) -> Vec<LegacyDirInfo> {
         };
 
         out.push(LegacyDirInfo {
-            has_database: legacy.join(DB_FILE).exists(),
-            path: legacy,
+            has_database: candidate.join(DB_FILE).exists(),
+            can_delete: is_cleanable_identifier(&identifier),
+            path: candidate,
             identifier,
+            origin,
             bytes,
             files,
-            is_current: false, // legacy_dirs_for 只产出历史标识符，天然不等于当前目录
         });
     }
 
     out
+}
+
+/// 汇总**所有可能位置**的可迁移来源目录候选（去重）。
+///
+/// 两条来源根：`current_dir` 的同级，以及 `extra_roots` 各自的同级（调用方传应用数据
+/// 目录的原生位置）。列表展示与删除校验共用同一份候选集，避免出现"UI 列出来了、
+/// 点删除却说不白名单"的不一致。
+pub fn migratable_source_dirs(current_dir: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = migratable_dirs_for(current_dir);
+    for root in extra_roots {
+        for candidate in migratable_dirs_for(root) {
+            if !roots.contains(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+    roots
 }
 
 /// 备份并删除一个历史数据目录。
@@ -360,16 +655,28 @@ pub fn list_legacy_dirs(current_dir: &Path) -> Vec<LegacyDirInfo> {
 /// 安全设计（与迁移同一套思路：宁可没做成，不可丢数据）：
 /// 1. **先完整备份**到同级带时间戳的目录，备份校验通过后才删除原目录；
 /// 2. 备份失败则**不删除**源目录，直接返回错误；
-/// 3. 删除目标**必须在白名单标识符之内**——防止误传路径删掉用户的其他数据；
+/// 3. 删除目标**必须在候选集之内，且标识符属于可清理白名单**（即只允许旧版 TieZ
+///    的两个标识符）——本应用自己的标识符目录不得被删除；
 /// 4. 拒绝删除当前正在使用的数据目录。
 ///
 /// 返回备份目录路径，便于 UI 告知用户"备份在哪"。
 pub fn backup_and_remove_legacy_dir(
     current_dir: &Path,
+    extra_roots: &[PathBuf],
     target: &Path,
 ) -> Result<PathBuf, String> {
-    // ---- 安全校验：只允许删除白名单内的历史标识符目录 ----
-    let allowed: Vec<PathBuf> = legacy_dirs_for(current_dir);
+    // ---- 安全校验：只允许删除候选位置里的、可清理标识符目录 ----
+    let identifier = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !is_cleanable_identifier(&identifier) {
+        return Err(format!(
+            "拒绝操作：{} 不是旧版应用的数据目录，不在允许清理的白名单内",
+            target.display()
+        ));
+    }
+    let allowed = migratable_source_dirs(current_dir, extra_roots);
     if !allowed.iter().any(|p| p == target) {
         return Err(format!(
             "拒绝操作：{} 不在允许清理的历史数据目录白名单内",
@@ -856,7 +1163,8 @@ fn verify_delivered(
 
 // ---------------------------------------------------------------------------
 // 测试：使用真实文件系统操作，覆盖成功路径与各类失败路径。
-// 这些测试只依赖 std，可在独立 harness 中运行（见 README/提交说明）。
+// 本模块只依赖 `std`，因此这些测试可以脱离 Tauri 与平台专用代码单独编译运行，
+// 不必等整个 crate 能在当前平台编译通过。
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1114,12 +1422,14 @@ mod tests {
         let current = root.join("com.tieznext");
         seed_legacy(&root.join("com.tiez.app"));
 
-        let list = list_legacy_dirs(&current);
+        let list = list_legacy_dirs(&current, &[]);
 
         assert_eq!(list.len(), 1);
         let info = &list[0];
         assert_eq!(info.identifier, "com.tiez.app");
+        assert_eq!(info.origin, SourceOrigin::LegacyTiez);
         assert!(info.has_database);
+        assert!(info.can_delete, "旧版 TieZ 目录允许清理");
         // seed_legacy 造 7 个文件：db, db-wal, db-shm, tiez.log, datapath.txt,
         // attachments/a.png, emoji_favorites/e.json（目录不计入 files）
         assert_eq!(info.files, 7);
@@ -1132,11 +1442,313 @@ mod tests {
         let current = root.join("com.tieznext");
         fs::create_dir_all(&current).unwrap();
 
-        // 两个历史目录都不存在
-        assert!(list_legacy_dirs(&current).is_empty());
-        // 当前目录本身不会被列为可清理项
-        let list = list_legacy_dirs(&current);
+        // 两个旧版 TieZ 目录都不存在；当前目录存在但**不提供任何可迁移价值**
+        // （它就是正在使用的目录），因此列表必须为空。
+        let list = list_legacy_dirs(&current, &[]);
+        assert!(
+            list.is_empty(),
+            "只有当前目录存在时，无可迁移来源，实际: {:?}",
+            list.iter().map(|i| &i.identifier).collect::<Vec<_>>()
+        );
+        // 当前目录本身不会被列为可迁移/可清理项
         assert!(!list.iter().any(|i| i.path == current));
+    }
+
+    /// `extra_roots` 让"数据目录已被改到别处"时仍能发现原生位置里的旧数据。
+    ///
+    /// 这是便携版/自定义数据目录用户的真实情形：`%APPDATA%\com.tieznext` 里留着
+    /// 旧版本 Tiez-Next 的数据，而当前数据目录在另一个磁盘上。
+    #[test]
+    fn extra_roots_reveal_native_location_sources() {
+        let root = tmp("extra-roots");
+        // 当前数据目录在别处（便携盘）
+        let current = root.join("portable").join("data");
+        fs::create_dir_all(&current).unwrap();
+        // 原生应用数据目录位置（Tauri 由 identifier 推导），同级有旧数据与旧版 TieZ
+        let native = root.join("appdata").join(CURRENT_IDENTIFIER);
+        fs::create_dir_all(&native).unwrap();
+        let native_own = root.join("appdata").join(CURRENT_IDENTIFIER);
+        seed_legacy(&native_own);
+        let native_tiez = root.join("appdata").join("com.tiez.app");
+        seed_legacy(&native_tiez);
+
+        // 不额外扫原生位置 -> 什么都找不到（当前目录同级没有这些）
+        assert!(list_legacy_dirs(&current, &[]).is_empty());
+
+        // 加上原生位置 -> 两条来源都被发现，且分类正确
+        let list = list_legacy_dirs(&current, &[native.clone()]);
+        assert_eq!(list.len(), 2, "实际: {:?}", list.iter().map(|i| &i.identifier).collect::<Vec<_>>());
+
+        let own = list.iter().find(|i| i.path == native_own).unwrap();
+        assert_eq!(own.origin, SourceOrigin::PreviousTiezNext);
+        assert!(!own.can_delete);
+
+        let tiez = list.iter().find(|i| i.path == native_tiez).unwrap();
+        assert_eq!(tiez.origin, SourceOrigin::LegacyTiez);
+        assert!(tiez.can_delete);
+    }
+
+    /// 本应用标识符（`com.tieznext`）是**合法的迁移来源**。
+    ///
+    /// 场景：用户把数据目录改到了别处（或用了便携版），于是 `%APPDATA%\com.tieznext`
+    /// 里留着的是**旧版本 Tiez-Next 的数据**——那是要迁进来的东西，必须被发现。
+    /// 标识符跨版本不变，所以这条规则对未来版本同样成立。
+    #[test]
+    fn lists_own_identifier_dir_as_a_migratable_source() {
+        let root = tmp("list-own");
+        // 当前数据目录在另一处（模拟 datapath.txt 重定向 / 便携版）
+        let current = root.join("elsewhere").join("com.tieznext");
+        fs::create_dir_all(&current).unwrap();
+        // 原生位置同级还留着一份旧版本 Tiez-Next 的数据
+        let native_parent = root.join("appdata");
+        let previous = native_parent.join(CURRENT_IDENTIFIER);
+        let native_root = native_parent.join("anchor");
+        seed_legacy(&previous);
+
+        let list = list_legacy_dirs(&current, &[native_root]);
+
+        let own = list
+            .iter()
+            .find(|i| i.path == previous)
+            .expect("com.tieznext 目录必须被列为可迁移来源");
+        assert_eq!(own.identifier, "com.tieznext");
+        assert_eq!(
+            own.origin,
+            SourceOrigin::PreviousTiezNext,
+            "来源应如实标为「历史版本的 Tiez-Next」"
+        );
+        assert!(own.has_database);
+        // 当前正在使用的目录不得出现在列表里
+        assert!(!list.iter().any(|i| i.path == current));
+        // 本应用自己的目录**不允许被清理**（它不是被取代的旧应用）
+        assert!(!own.can_delete, "com.tieznext 目录不得被清理按钮删除");
+    }
+
+    /// 来源分类必须如实区分"旧版 TieZ"与"历史版本 Tiez-Next"。
+    #[test]
+    fn source_origins_distinguish_legacy_tiez_from_previous_tiez_next() {
+        assert_eq!(
+            source_origin_of("com.tiez.app"),
+            Some(SourceOrigin::LegacyTiez)
+        );
+        assert_eq!(source_origin_of("com.tiez"), Some(SourceOrigin::LegacyTiez));
+        assert_eq!(
+            source_origin_of(CURRENT_IDENTIFIER),
+            Some(SourceOrigin::PreviousTiezNext)
+        );
+        // 不在表内的目录名一律不认（不做前缀/模糊匹配）
+        assert_eq!(source_origin_of("com.tie"), None);
+        assert_eq!(source_origin_of("com.tieznext.other"), None);
+        assert_eq!(source_origin_of(""), None);
+
+        // 稳定机器码：界面按它映射文案
+        assert_eq!(SourceOrigin::LegacyTiez.code(), "legacy_tiez");
+        assert_eq!(
+            SourceOrigin::PreviousTiezNext.code(),
+            "previous_tiez_next"
+        );
+    }
+
+    /// 迁移来源 ⊇ 清理白名单：自己的标识符能迁移，但**不能删**。
+    #[test]
+    fn own_identifier_is_migratable_but_never_cleanable() {
+        assert!(is_migratable_identifier(CURRENT_IDENTIFIER));
+        assert!(
+            !is_cleanable_identifier(CURRENT_IDENTIFIER),
+            "删除是破坏性动作，不得作用于本应用自己的标识符目录"
+        );
+        for id in LEGACY_IDENTIFIERS {
+            assert!(is_migratable_identifier(id), "{} 应可迁移", id);
+            assert!(is_cleanable_identifier(id), "{} 应可清理", id);
+        }
+    }
+
+    /// **本条需求的核心用例**：从 `com.tieznext`（旧版本 Tiez-Next）目录迁移成功。
+    ///
+    /// 断言四件事：迁移确实发生、源逐项未变、目标拿到全部文件、来源分类正确。
+    #[test]
+    fn migrates_from_previous_tiez_next_dir_and_keeps_source_intact() {
+        let root = tmp("own-migrate");
+        // 老版本 Tiez-Next 的数据目录（标识符与新版本相同）
+        let source = root.join("old-install").join(CURRENT_IDENTIFIER);
+        // 当前数据目录在别处，且**是全新的**（没有数据库），避免被"目标已有数据"跳过
+        let target = root.join("new-install").join(CURRENT_IDENTIFIER);
+        seed_legacy(&source);
+        let before = scan_tree(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        let (delivered_files, delivered_bytes) = match &outcome {
+            MigrationOutcome::Migrated {
+                delivered_files,
+                delivered_bytes,
+                ..
+            } => (*delivered_files, *delivered_bytes),
+            other => panic!("从 com.tieznext 目录迁移应成功，实际: {:?}", other),
+        };
+        assert_eq!(delivered_files, 7, "seed_legacy 造 7 个文件");
+        assert!(delivered_bytes > 0);
+
+        // 目标拿到全部文件
+        assert!(target.join(DB_FILE).exists());
+        assert!(target.join("attachments/a.png").exists());
+        assert!(target.join("emoji_favorites/e.json").exists());
+
+        // 源只读：逐项指纹完全一致，且目录仍在
+        assert!(source.is_dir(), "源目录必须保留");
+        assert_eq!(scan_tree(&source).unwrap(), before, "源目录不得被改动");
+
+        // 来源分类如实
+        let identifier = source.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            source_origin_of(&identifier),
+            Some(SourceOrigin::PreviousTiezNext)
+        );
+    }
+
+    // ---- 便携版：数据在程序目录下的 data/ ----
+
+    /// 便携版目录形状：用户选中**程序目录**，数据在其下的 `data/`。
+    #[test]
+    fn resolves_portable_program_dir_to_its_data_subdir() {
+        let root = tmp("portable");
+        // 形状照搬真实便携包：TieZ_0.3.3-portable/{tiez-app.exe, 说明.txt, data/…}
+        let program_dir = root.join("TieZ_0.3.3-portable");
+        let data_dir = program_dir.join(PORTABLE_DATA_DIR);
+        seed_legacy(&data_dir);
+        fs::write(program_dir.join("tiez-app.exe"), b"MZ fake exe").unwrap();
+        fs::write(program_dir.join("说明.txt"), b"portable readme").unwrap();
+
+        // 用户选中程序目录 -> 归一化到 data/
+        assert_eq!(resolve_source_dir(&program_dir), data_dir);
+        // 用户选中 data/ 本身 -> 原样返回
+        assert_eq!(resolve_source_dir(&data_dir), data_dir);
+    }
+
+    /// 便携版迁移端到端：选程序目录即可迁走 `data/` 里的数据，程序目录本身零改动。
+    #[test]
+    fn migrates_from_portable_program_dir_without_touching_the_bundle() {
+        let root = tmp("portable-migrate");
+        let program_dir = root.join("TieZ_0.3.3-portable");
+        seed_legacy(&program_dir.join(PORTABLE_DATA_DIR));
+        fs::write(program_dir.join("tiez-app.exe"), b"MZ fake exe").unwrap();
+        let bundle_before = scan_tree(&program_dir).unwrap();
+
+        let target = root.join("appdata").join(CURRENT_IDENTIFIER);
+        let outcome = migrate_from_source_dir(&program_dir, &target, false);
+
+        match &outcome {
+            MigrationOutcome::Migrated {
+                delivered_files, ..
+            } => assert_eq!(*delivered_files, 7, "data/ 里的 7 个文件都应迁走"),
+            other => panic!("便携版目录应能迁移成功，实际: {:?}", other),
+        }
+        // 目标拿到数据
+        assert!(target.join(DB_FILE).exists());
+        assert!(target.join("attachments/a.png").exists());
+        // 程序目录（含 exe、说明.txt、data/）逐项未变
+        assert_eq!(
+            scan_tree(&program_dir).unwrap(),
+            bundle_before,
+            "整个便携程序目录必须零改动"
+        );
+    }
+
+    /// 归一化必须**保守**：凑不出"含数据库的数据目录"时原样返回，绝不猜测。
+    #[test]
+    fn resolve_source_dir_never_guesses() {
+        let root = tmp("resolve-none");
+
+        // 空目录
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(resolve_source_dir(&empty), empty);
+
+        // 有 data/ 但里面没有数据库 -> 不得当成分数据目录（可能是别的软件的 data），
+        // 而且此时的 data/ 是**唯一子目录**，因此这条同时验证了"下探按定位结果收敛、
+        // 不会把没有库的 data/ 当数据目录"。
+        let decoy = root.join("decoy");
+        fs::create_dir_all(decoy.join(PORTABLE_DATA_DIR)).unwrap();
+        fs::write(decoy.join(PORTABLE_DATA_DIR).join("something.bin"), b"x").unwrap();
+        assert_eq!(resolve_source_dir(&decoy), decoy);
+
+        // 不存在的路径
+        let missing = root.join("nope");
+        assert_eq!(resolve_source_dir(&missing), missing);
+
+        // 路径本身就是个文件（用户选错）
+        let file = root.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(resolve_source_dir(&file), file);
+
+        // **多个**子目录 -> 歧义，不下探（唯一的子目录规则）
+        let ambiguous = root.join("ambiguous");
+        for name in ["one", "two"] {
+            fs::create_dir_all(ambiguous.join(name).join(PORTABLE_DATA_DIR)).unwrap();
+            seed_legacy(&ambiguous.join(name).join(PORTABLE_DATA_DIR));
+        }
+        assert_eq!(
+            resolve_source_dir(&ambiguous),
+            ambiguous,
+            "存在多个子目录时不得猜测该下探哪一个"
+        );
+    }
+
+    /// **用户实测的真实路径形状**：解压后是两层同名目录。
+    ///
+    /// 原始报告：
+    /// `C:\Users\Sharl.Jiang\Downloads\TieZ_0.3.3-portable\TieZ_0.3.3-portable`
+    ///
+    /// 无论用户选中**外层**、**内层**还是**内层下的 data**，都必须定位到同一个数据
+    /// 目录，且迁移后目标**根层**就有 `clipboard.db`——这正是"迁完能看到数据"的判据。
+    /// 若只下探一层，选外层时数据会落进 `目标\TieZ_0.3.3-portable\data\`，应用读不到。
+    #[test]
+    fn resolves_the_real_two_layer_portable_path_from_any_level() {
+        let root = tmp("portable-two-layer");
+        let outer = root.join("Downloads").join("TieZ_0.3.3-portable");
+        let inner = outer.join("TieZ_0.3.3-portable");
+        let data = inner.join(PORTABLE_DATA_DIR);
+        seed_legacy(&data);
+        fs::write(inner.join("tiez-app.exe"), b"MZ fake exe").unwrap();
+        fs::write(inner.join("说明.txt"), b"portable readme").unwrap();
+
+        // 三层任选其一，都定位到同一个数据目录
+        assert_eq!(resolve_source_dir(&outer), data, "选中外层应下探到 data/");
+        assert_eq!(resolve_source_dir(&inner), data, "选中内层应定位到 data/");
+        assert_eq!(resolve_source_dir(&data), data, "选中 data/ 应原样返回");
+
+        // 端到端：从**外层**迁移，目标根层必须直接得到数据库
+        let target = root.join("appdata").join(CURRENT_IDENTIFIER);
+        let outcome = migrate_from_source_dir(&outer, &target, false);
+        match &outcome {
+            MigrationOutcome::Migrated {
+                delivered_files, ..
+            } => assert_eq!(*delivered_files, 7, "data/ 里的 7 个文件都应迁走"),
+            other => panic!("两层便携目录应能迁移成功，实际: {:?}", other),
+        }
+        assert!(
+            target.join(DB_FILE).is_file(),
+            "目标**根层**必须有 clipboard.db，否则应用读不到迁入的数据"
+        );
+        assert!(
+            !target.join("TieZ_0.3.3-portable").exists(),
+            "不得把整个包目录搬成目标的子目录"
+        );
+        assert!(target.join("attachments/a.png").exists());
+    }
+
+    /// 归一化后再迁移仍受"源 == 目标/祖先/内部"等既有防御检查约束。
+    #[test]
+    fn portable_resolution_still_respects_path_defences() {
+        let root = tmp("portable-defence");
+        let program_dir = root.join("bundle");
+        let data_dir = program_dir.join(PORTABLE_DATA_DIR);
+        seed_legacy(&data_dir);
+
+        // 目标恰是那个 data/ 目录 -> 归一化后判定为 same_path，跳过而不是自复制
+        let outcome = migrate_from_source_dir(&program_dir, &data_dir, false);
+        assert_eq!(outcome_as_reason(&outcome), Some(SkipReason::SamePath));
+        assert!(data_dir.join(DB_FILE).exists(), "数据必须完好");
     }
 
     #[test]
@@ -1147,7 +1759,7 @@ mod tests {
         seed_legacy(&legacy);
         let before = scan_tree(&legacy).unwrap();
 
-        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+        let backup = backup_and_remove_legacy_dir(&current, &[], &legacy).unwrap();
 
         // 源目录已删除
         assert!(!legacy.exists(), "源目录应已被删除");
@@ -1165,10 +1777,43 @@ mod tests {
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("thesis.docx"), b"irreplaceable").unwrap();
 
-        let err = backup_and_remove_legacy_dir(&current, &victim).unwrap_err();
+        let err = backup_and_remove_legacy_dir(&current, &[], &victim).unwrap_err();
 
         assert!(err.contains("白名单"), "应因白名单拒绝，实际: {}", err);
         assert!(victim.join("thesis.docx").exists(), "用户数据必须完好");
+    }
+
+    /// 本应用自己的标识符目录**绝不允许被清理**。
+    ///
+    /// 它与旧版 TieZ 的目录长得一样（都是同级的一个数据目录），但语义完全不同：
+    /// 那是用户留着的旧版 Tiez-Next 数据，不是待淘汰的旧应用。清理按钮不能碰它。
+    #[test]
+    fn refuses_to_delete_own_identifier_dir() {
+        let root = tmp("deny-own");
+        let current = root.join("elsewhere").join(CURRENT_IDENTIFIER);
+        fs::create_dir_all(&current).unwrap();
+        let previous = root.join(CURRENT_IDENTIFIER);
+        seed_legacy(&previous);
+        let before = scan_tree(&previous).unwrap();
+
+        let err = backup_and_remove_legacy_dir(&current, &[], &previous).unwrap_err();
+
+        assert!(
+            err.contains("白名单"),
+            "应因不在可清理白名单而拒绝，实际: {}",
+            err
+        );
+        assert!(previous.is_dir(), "目录必须保留");
+        assert_eq!(scan_tree(&previous).unwrap(), before, "内容必须零改动");
+        // 也不得留下任何备份
+        assert!(
+            !root
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".backup-")),
+            "拒绝时不得创建备份目录"
+        );
     }
 
     #[test]
@@ -1178,7 +1823,7 @@ mod tests {
         let current = root.join("com.tiez.app");
         seed_legacy(&current);
 
-        let err = backup_and_remove_legacy_dir(&current, &current).unwrap_err();
+        let err = backup_and_remove_legacy_dir(&current, &[], &current).unwrap_err();
 
         assert!(err.contains("当前"), "应拒绝删除当前目录，实际: {}", err);
         assert!(current.join(DB_FILE).exists(), "数据必须完好");
@@ -1191,7 +1836,7 @@ mod tests {
         let legacy = root.join("com.tiez.app");
         fs::create_dir_all(&legacy).unwrap(); // 空目录
 
-        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+        let backup = backup_and_remove_legacy_dir(&current, &[], &legacy).unwrap();
 
         assert!(!legacy.exists());
         assert!(backup.as_os_str().is_empty(), "空目录无需备份");
@@ -1205,10 +1850,10 @@ mod tests {
         seed_legacy(&legacy);
 
         // 正常删除应成功并留下备份
-        let backup = backup_and_remove_legacy_dir(&current, &legacy).unwrap();
+        let backup = backup_and_remove_legacy_dir(&current, &[], &legacy).unwrap();
         assert!(backup.exists());
         // 再次删除同一目录应报"不存在"，且不误删备份
-        let err = backup_and_remove_legacy_dir(&current, &legacy).unwrap_err();
+        let err = backup_and_remove_legacy_dir(&current, &[], &legacy).unwrap_err();
         assert!(err.contains("不存在"), "实际: {}", err);
         assert!(backup.exists(), "备份不得被后续调用删除");
     }

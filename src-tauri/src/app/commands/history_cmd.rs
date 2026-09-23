@@ -1,4 +1,4 @@
-use crate::app_state::{AppDataDir, SessionHistory};
+use crate::app_state::{AppDataDir, EncryptionQueueState, SessionHistory};
 use crate::database::DbState;
 use crate::domain::models::ClipboardEntry;
 use crate::error::{AppError, AppResult};
@@ -7,7 +7,9 @@ use crate::infrastructure::repository::tag_repo::TagRepository;
 use crate::services::clipboard::{
     build_entry_preview, derive_rich_text_content, truncate_html_for_preview,
 };
-use tauri::{AppHandle, Emitter, State};
+use crate::services::clipboard_mutation::{self, TagTransfer};
+use crate::services::encryption_queue::EncryptionJob;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 fn normalize_rich_text_item_content(item: &mut ClipboardEntry) {
     if item.content_type != "rich_text" {
@@ -317,6 +319,115 @@ pub fn delete_tag_from_all(
 #[tauri::command]
 pub fn create_new_tag(state: State<'_, DbState>, tag_name: String) -> AppResult<()> {
     state.tag_repo.create(&tag_name).map_err(AppError::from)
+}
+
+/// 把条目从标签 `from_tag` **移动**到标签 `to_tag`。
+///
+/// 语义（与 MCP 的 `move_entry_to_tag` 逐字一致，因为判定与写入都在
+/// `clipboard_mutation::apply_entry_tag_transfer`）：`entry_tags` 是
+/// `(entry_id, tag)` 的多对多表，所以"移动"是**在集合里把源标签换成目标标签**，
+/// 条目上的其他标签一个都不动。`[工作, 待办]` 执行 `工作 → 归档` 之后是
+/// `[归档, 待办]`，不是 `[归档]`。
+///
+/// 副作用与 `update_tags` 同源：先在共享内核里算敏感性翻转，再决定是否入队加解密。
+/// 这里额外发一次 `clipboard-changed`（`update_tags` 没有发），让标签计数等派生视图
+/// 立刻跟上——不改这一点也不会出错，但会让界面在标签页里显示陈旧计数。
+#[tauri::command]
+pub fn move_entry_to_tag(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    app_data: State<'_, AppDataDir>,
+    id: i64,
+    from_tag: String,
+    to_tag: String,
+) -> AppResult<i64> {
+    transfer_entry_tag(
+        app_handle,
+        state,
+        session,
+        app_data,
+        id,
+        &from_tag,
+        &to_tag,
+        TagTransfer::Move,
+    )
+}
+
+/// 把条目**复制**到标签 `to_tag`：源标签保留，目标标签追加（已存在则不重复）。
+#[tauri::command]
+pub fn copy_entry_to_tag(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    app_data: State<'_, AppDataDir>,
+    id: i64,
+    from_tag: String,
+    to_tag: String,
+) -> AppResult<i64> {
+    transfer_entry_tag(
+        app_handle,
+        state,
+        session,
+        app_data,
+        id,
+        &from_tag,
+        &to_tag,
+        TagTransfer::Copy,
+    )
+}
+
+/// 移动与复制的共同实现。两个命令的差别只有 [`TagTransfer`] 这一个枚举值，
+/// 其余（会话态条目落库、敏感性判定、加解密入队、云同步）逐字相同。
+#[allow(clippy::too_many_arguments)]
+fn transfer_entry_tag(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    app_data: State<'_, AppDataDir>,
+    id: i64,
+    from_tag: &str,
+    to_tag: &str,
+    kind: TagTransfer,
+) -> AppResult<i64> {
+    // 尚未落库的会话条目（id < 0）只存在于内存里，`entry_tags` 里没有它。
+    // 因此在这里就地算出结果集合，再照 `update_tags` 的老路落库。
+    if id < 0 {
+        let mut session_items = session.inner().0.lock().unwrap();
+        if let Some(index) = session_items.iter().position(|item| item.id == id) {
+            let mut item = session_items[index].clone();
+            let next = clipboard_mutation::transferred_tags(&item.tags, from_tag, to_tag, kind)?;
+            item.tags = next.clone();
+
+            let data_dir = app_data.0.lock().unwrap().clone();
+            let new_id = state.repo.save(&item, Some(&data_dir))?;
+
+            session_items[index].id = new_id;
+            session_items[index].tags = next;
+            drop(session_items);
+
+            let _ = app_handle.emit("clipboard-changed", ());
+            crate::services::cloud_sync::request_cloud_sync(app_handle);
+            return Ok(new_id);
+        }
+        return Err(AppError::Validation("Item not found".to_string()));
+    }
+
+    let transition = clipboard_mutation::apply_entry_tag_transfer(
+        &state.conn,
+        &state.tag_repo,
+        id,
+        from_tag,
+        to_tag,
+        kind,
+    )?;
+    if let Some(action) = super::clipboard_cmd::encryption_action_for(transition) {
+        let queue = app_handle.state::<EncryptionQueueState>();
+        queue.0.enqueue(EncryptionJob { id, action });
+    }
+    let _ = app_handle.emit("clipboard-changed", ());
+    crate::services::cloud_sync::request_cloud_sync(app_handle);
+    Ok(id)
 }
 
 #[tauri::command]

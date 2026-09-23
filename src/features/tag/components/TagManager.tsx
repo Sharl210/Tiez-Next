@@ -4,14 +4,27 @@ import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
     Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
-    StickyNote, AlertTriangle
+    Sparkles, AlertTriangle
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
+import TagGroupContextMenu from "./TagGroupContextMenu";
+import "../../../styles/components/tag-group-menu.css";
 
 interface TagManagerProps {
     t: (key: string) => string;
     theme: string;
+    /**
+     * R2: the remembered split geometry, handed over by the caller that already
+     * holds the settings blob (`useSettingsInit` loads it at app boot).
+     *
+     * It exists so the first painted frame can already be the remembered geometry:
+     * waiting for this component to fetch the same value would show the default
+     * split for a frame and then jump, which is the flicker this prop removes.
+     * Optional and deliberately `unknown` — absent, truncated or hand-edited values
+     * all go through `resolveTagManagerLayout`, which falls back to the defaults.
+     */
+    persistedSize?: unknown;
 }
 
 interface TagInfo {
@@ -219,7 +232,104 @@ export function applyCollapseToggle(
     };
 }
 
-export default function TagManager({ t, theme }: TagManagerProps) {
+/**
+ * R2: the viewport width at which the sidebar is arranged as a rail above the
+ * editor instead of a column beside it. It mirrors the media query the `isStacked`
+ * effect listens to, and lives here so the first-frame geometry and that effect
+ * cannot drift apart.
+ */
+const STACKED_VIEWPORT_MAX_WIDTH = 340;
+
+/** R2: the media query the stacked-arrangement effect listens to. */
+const STACKED_VIEWPORT_QUERY = `(max-width: ${STACKED_VIEWPORT_MAX_WIDTH}px)`;
+
+/** R2: is the stacked arrangement the one in effect at this viewport width? */
+export function isStackedViewport(viewportWidth: number): boolean {
+    return Number.isFinite(viewportWidth) && viewportWidth <= STACKED_VIEWPORT_MAX_WIDTH;
+}
+
+/**
+ * R2: resolve the arrangement in effect at first paint.
+ *
+ * The `isStacked` effect answers the same question, but only after the first
+ * commit — too late to pick which remembered geometry the first frame should
+ * show. Asking the same media query here keeps the two answers identical instead
+ * of guessing from `innerWidth`.
+ *
+ * Total by construction: a renderer without `window` (static markup in tests) or
+ * without `matchMedia` simply takes the non-stacked arrangement, which is the
+ * previous first-frame default.
+ */
+const readStackedAtFirstFrame = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    try {
+        if (typeof window.matchMedia === 'function') {
+            return window.matchMedia(STACKED_VIEWPORT_QUERY).matches;
+        }
+        if (typeof window.innerWidth === 'number') {
+            return isStackedViewport(window.innerWidth);
+        }
+    } catch {
+        // Fall through to the non-stacked arrangement below.
+    }
+    return false;
+};
+
+/**
+ * R2: fold a stored geometry into the three numbers the layout actually renders.
+ *
+ * This is the single place that decides "which remembered numbers apply right now",
+ * which is what lets the sidebar be painted with them on the very first render
+ * instead of after a settings round trip. Pure and total: a missing or corrupt
+ * stored value degrades to the defaults, which is also the normal first-run case.
+ *
+ * Exported for tests: a regression here is exactly the visible bug this exists to
+ * prevent — the split showing the default geometry for a frame before snapping to
+ * the remembered one.
+ */
+export function resolveTagManagerLayout(
+    storedRaw: unknown,
+    stacked: boolean
+): { width: number; height: number; collapsed: boolean } {
+    const stored = parseTagManagerSidebarSize(storedRaw);
+    return stacked
+        ? {
+              width: stored.stackedWidth,
+              height: stored.stackedHeight,
+              collapsed: stored.stackedCollapsed,
+          }
+        : { width: stored.width, height: stored.height, collapsed: stored.collapsed };
+}
+
+/**
+ * R2: the geometry this session last wrote to settings.
+ *
+ * `persistedSize` is read from the settings blob the app loaded at *boot*, so a
+ * value written while the app is running would still be absent from that prop when
+ * the manager is reopened in the same session — the first frame would then show the
+ * previous split and snap once the fetch landed, i.e. the very flicker being fixed.
+ * This component is the only writer of that key (it is excluded from cloud sync),
+ * so remembering our own last write closes that gap with no settings round trip.
+ * A fresh app start simply has nothing cached and uses the prop.
+ */
+let sessionWrittenSize: unknown;
+
+/**
+ * R2: pick the geometry for the first frame.
+ *
+ * Same-session write beats the value captured at boot; anything else defers to the
+ * boot value, and `resolveTagManagerLayout` degrades absent/corrupt input to the
+ * defaults. Pure so the precedence itself is testable.
+ */
+export function resolveInitialTagManagerLayout(
+    persistedSize: unknown,
+    sessionWritten: unknown,
+    stacked: boolean
+): { width: number; height: number; collapsed: boolean } {
+    return resolveTagManagerLayout(sessionWritten ?? persistedSize, stacked);
+}
+
+export default function TagManager({ t, theme, persistedSize }: TagManagerProps) {
     const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
     const TAG_MANAGER_SIZE_KEY = "app.tag_manager_size";
     const [tags, setTags] = useState<TagInfo[]>([]);
@@ -239,9 +349,26 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         }
     });
     const [isDeleting, setIsDeleting] = useState(false);
+    /**
+     * B9: the group's rename/delete actions live in a right-click menu.
+     *
+     * They used to be two inline icons that appeared on hover, sharing the row with the
+     * tag name. That is exactly where the user aims when they mean "select this group",
+     * so the icons stole clicks meant for selection. Moving them behind `contextmenu`
+     * leaves the row with only color dot + name + count, and the pointer has nothing
+     * else to land on.
+     *
+     * `null` = menu closed. The coordinates are viewport coordinates of the right-click.
+     */
+    const [tagMenu, setTagMenu] = useState<{ x: number; y: number; tagName: string; affected: number } | null>(null);
     const [deleteConfirmation, setDeleteConfirmation] = useState<{ show: boolean, tagName: string | null, affected: number }>({ show: false, tagName: null, affected: 0 });
     const [itemDeleteConfirmation, setItemDeleteConfirmation] = useState<{ show: boolean, id: number | null }>({ show: false, id: null });
-    const [isCollapsed, setIsCollapsed] = useState(false);
+    /**
+     * R2: the arrangement in effect is decided before the first paint, not by the
+     * listener effect below, because the first frame has to pick which remembered
+     * geometry to show and cannot wait a commit for that answer.
+     */
+    const [isStacked, setIsStacked] = useState(readStackedAtFirstFrame);
     const [sortBy, setSortBy] = useState<'time' | 'count'>('time');
     const [isCreatingItem, setIsCreatingItem] = useState(false);
     /**
@@ -260,10 +387,30 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         originalNote: string;
     } | null>(null);
     const [newItemContent, setNewItemContent] = useState('');
-    const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
-    const [sidebarHeight, setSidebarHeight] = useState(DEFAULT_SIDEBAR_HEIGHT);
+    /**
+     * R2: the first frame carries the remembered split geometry.
+     *
+     * `persistedSize` comes from the settings blob the app already loaded at boot,
+     * so this component has the value synchronously and can seed the layout with it.
+     * The previous arrangement started from the defaults and swapped in the
+     * remembered numbers from an effect after `get_settings` resolved, which is
+     * exactly the "opens at one ratio, then snaps to another" flicker.
+     *
+     * Computed once, in a lazy `useRef` initialiser, so it neither re-runs on later
+     * renders nor depends on an async round trip.
+     */
+    const initialLayout = useRef(
+        resolveInitialTagManagerLayout(persistedSize, sessionWrittenSize, isStacked)
+    ).current;
+    /**
+     * R2: once the user has dragged or toggled the split, the live geometry is the
+     * authority and a late-arriving remembered value must not overwrite it.
+     */
+    const hasUserAdjustedGeometryRef = useRef(false);
+    const [sidebarWidth, setSidebarWidth] = useState(initialLayout.width);
+    const [sidebarHeight, setSidebarHeight] = useState(initialLayout.height);
     const [isResizing, setIsResizing] = useState(false);
-    const [isStacked, setIsStacked] = useState(false);
+    const [isCollapsed, setIsCollapsed] = useState(initialLayout.collapsed);
     const [isManageMode, setIsManageMode] = useState(false);
     const [selectedItemIds, setSelectedItemIds] = useState<Set<number>>(new Set());
     const containerRef = useRef<HTMLDivElement>(null);
@@ -282,8 +429,14 @@ export default function TagManager({ t, theme }: TagManagerProps) {
      * would destroy the width the user had before collapsing — reopening would then
      * have to guess. The expanded width is therefore what gets stored, together with
      * the collapsed flag; that is also exactly what the beta branch stores.
+     *
+     * Seeded from the caller's remembered value (both layouts, not just the one on
+     * screen) so that what gets written back on the first drag already carries the
+     * other layout's remembered numbers.
      */
-    const sidebarSizeRef = useRef<TagManagerSidebarSize>({ ...DEFAULT_TAG_MANAGER_SIZE });
+    const sidebarSizeRef = useRef<TagManagerSidebarSize>(
+        parseTagManagerSidebarSize(sessionWrittenSize ?? persistedSize)
+    );
 
     /**
      * R2: geometry state must be readable by the drag handlers without adding
@@ -292,10 +445,10 @@ export default function TagManager({ t, theme }: TagManagerProps) {
      * mid-drag. A ref mirror keeps the drag effect keyed only on `isResizing`.
      */
     const geometryRef = useRef({
-        width: DEFAULT_SIDEBAR_WIDTH,
-        height: DEFAULT_SIDEBAR_HEIGHT,
-        collapsed: false,
-        stacked: false,
+        width: initialLayout.width,
+        height: initialLayout.height,
+        collapsed: initialLayout.collapsed,
+        stacked: isStacked,
     });
 
     useEffect(() => {
@@ -329,9 +482,14 @@ export default function TagManager({ t, theme }: TagManagerProps) {
      * position must never break the tag manager.
      */
     const persistSidebarSize = useCallback(() => {
+        const geometry = sidebarSizeRef.current;
+        // R2: remember our own write for the rest of the session, so reopening the
+        // manager seeds its first frame from this value rather than from the older
+        // one the app captured at boot.
+        sessionWrittenSize = geometry;
         invoke('save_setting', {
             key: TAG_MANAGER_SIZE_KEY,
-            value: JSON.stringify(sidebarSizeRef.current),
+            value: JSON.stringify(geometry),
         }).catch(console.error);
     }, []);
 
@@ -351,38 +509,59 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         applyCollapseToggle(current, geometryRef.current);
 
     /**
-     * R2: restore the geometry on open.
+     * R2: adopt a geometry that only becomes known after the first frame.
      *
-     * Runs once per mount. The value is parsed by `parseTagManagerSidebarSize`, which
-     * is total: unset, truncated, hand-edited or wrong-typed storage all degrade to
-     * the defaults instead of producing `NaN` sizes or throwing.
+     * The normal path needs nothing here: the caller hands over the remembered
+     * value before the first render, so the layout already shows it and this effect
+     * only re-applies an identical value (React bails out of that). It earns its
+     * keep in two cases:
+     *
+     *  - the settings blob was still in flight when the manager opened, so the prop
+     *    arrives late — the layout then adopts it instead of staying on the defaults;
+     *  - no prop is available at all (`persistedSize === undefined`, e.g. a caller
+     *    that does not thread it through), which keeps the previous self-fetch as a
+     *    fallback rather than losing the feature.
+     *
+     * The parser is total: unset, truncated, hand-edited or wrong-typed storage all
+     * degrade to the defaults instead of producing `NaN` sizes or throwing. A
+     * geometry the user has already adjusted is never overwritten by either path.
      */
     useEffect(() => {
+        if (hasUserAdjustedGeometryRef.current) return;
+
+        const adopt = (raw: unknown) => {
+            const restored = parseTagManagerSidebarSize(raw);
+            sidebarSizeRef.current = restored;
+            // The layout in effect at mount decides which of the two remembered
+            // geometries applies. `isStacked` is resolved before the first paint, so
+            // it is already correct here; read the *stacked* fields on a narrow
+            // window rather than always taking the wide ones, otherwise a user who
+            // only ever opened the manager stacked would have their remembered
+            // height replaced by the wide-layout default.
+            const applied = resolveTagManagerLayout(restored, geometryRef.current.stacked);
+            setSidebarWidth(applied.width);
+            setSidebarHeight(applied.height);
+            setIsCollapsed(applied.collapsed);
+        };
+
+        if (persistedSize !== undefined) {
+            // Same precedence as the first frame, so this settles on the value the
+            // layout is already showing instead of reverting a same-session write.
+            adopt(sessionWrittenSize ?? persistedSize);
+            return;
+        }
+
         let cancelled = false;
         invoke<Record<string, string>>('get_settings')
             .then((settings) => {
-                if (cancelled) return;
-                const restored = parseTagManagerSidebarSize(settings?.[TAG_MANAGER_SIZE_KEY]);
-                sidebarSizeRef.current = restored;
-                // The layout in effect at mount decides which of the two remembered
-                // geometries applies. `isStacked` is resolved by its own effect on the
-                // very first commit, so it is already correct here; read the *stacked*
-                // fields on a narrow window rather than always taking the wide ones,
-                // otherwise a user who only ever opened the manager stacked would have
-                // their remembered height replaced by the wide-layout default.
-                if (geometryRef.current.stacked) {
-                    setSidebarWidth(restored.stackedWidth);
-                    setSidebarHeight(restored.stackedHeight);
-                    setIsCollapsed(restored.stackedCollapsed);
-                } else {
-                    setSidebarWidth(restored.width);
-                    setSidebarHeight(restored.height);
-                    setIsCollapsed(restored.collapsed);
-                }
+                // A prop that arrived while this fetch was in flight is the fresher
+                // source, and the user may have dragged in the meantime.
+                if (cancelled || hasUserAdjustedGeometryRef.current) return;
+                adopt(settings?.[TAG_MANAGER_SIZE_KEY]);
             })
             .catch(console.error);
         return () => { cancelled = true; };
-    }, []);
+    }, [persistedSize]);
 
     /**
      * R2: geometry is remembered per layout, so switching between the wide and
@@ -438,7 +617,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
     useEffect(() => { fetchTags(); }, []);
 
     useEffect(() => {
-        const mediaQuery = window.matchMedia("(max-width: 340px)");
+        const mediaQuery = window.matchMedia(STACKED_VIEWPORT_QUERY);
         const updateLayoutMode = () => {
             setIsStacked(mediaQuery.matches);
         };
@@ -455,6 +634,8 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         const handleMouseMove = (event: MouseEvent) => {
             const bounds = containerRef.current?.getBoundingClientRect();
             if (!bounds) return;
+            // R2: from here on the drag position wins over any remembered value.
+            hasUserAdjustedGeometryRef.current = true;
             if (isStacked) {
                 const maxHeight = Math.max(140, bounds.height - 180);
                 const nextHeight = Math.min(Math.max(event.clientY - bounds.top, 120), maxHeight);
@@ -740,6 +921,9 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                             // time and persisting would store the pre-click value.
                             const updated = toggleCollapse(sidebarSizeRef.current);
                             sidebarSizeRef.current = updated;
+                            // R2: the click is a deliberate geometry change, so a
+                            // remembered value arriving later must not undo it.
+                            hasUserAdjustedGeometryRef.current = true;
                             // Read the values back from the layout that was actually
                             // updated instead of assuming which one it was.
                             const stackedNow = geometryRef.current.stacked;
@@ -800,6 +984,19 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                             key={tag.name}
                             className={`tag-item ${selectedTag === tag.name ? 'active' : ''}`}
                             onClick={() => loadTagItems(tag.name)}
+                            /**
+                             * B9: right-click is the only way in to rename/delete now, so it
+                             * must not fall through to the WebView's own context menu either.
+                             * While the row is being renamed inline the menu is suppressed —
+                             * the inline input is the active surface and a stray right-click
+                             * should not open a second entry point for the same group.
+                             */
+                            onContextMenu={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                if (editingTag === tag.name) return;
+                                setTagMenu({ x: e.clientX, y: e.clientY, tagName: tag.name, affected: tag.count });
+                            }}
                             title={tag.name}
                         >
                             <div className="tag-color-wrapper" onClick={(e) => e.stopPropagation()}>
@@ -841,27 +1038,16 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                 />
                             ) : (
                                 <>
+                                    {/*
+                                     * B9: the rename/delete icons used to sit right here and
+                                     * popped in on hover. They shared the row with the tag name,
+                                     * which is where the pointer lands when the intent is
+                                     * "select this group" — so they were moved into the
+                                     * right-click menu (`tagMenu` above). The row now carries
+                                     * only the color dot, the name and the count, and a left
+                                     * click anywhere on it selects the group.
+                                     */}
                                     <span className="tag-name">{tag.name}</span>
-                                    <div className="tag-hover-actions">
-                                        <span title={t('rename')} onClick={(e) => {
-                                            e.stopPropagation();
-                                            setEditingTag(tag.name);
-                                            setNewTagName(tag.name);
-                                        }} style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            cursor: 'pointer'
-                                        }}>
-                                            <Edit2 size={12} />
-                                        </span>
-                                        <span title={t('delete')} onClick={(e) => {
-                                            e.stopPropagation();
-                                            e.preventDefault();
-                                            setDeleteConfirmation({ show: true, tagName: tag.name, affected: tag.count });
-                                        }} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
-                                            <Trash2 size={12} />
-                                        </span>
-                                    </div>
                                     <span className="tag-badge">{tag.count}</span>
                                 </>
                             )}
@@ -1085,7 +1271,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                         grid layout. */}
                                     {item.note ? (
                                         <div className="card-note" title={item.note}>
-                                            <StickyNote size={9} />
+                                            <Sparkles size={9} />
                                             <span className="card-note-text">{item.note}</span>
                                         </div>
                                     ) : null}
@@ -1116,6 +1302,29 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
             {/* Modals for Create (Rename is handled inline now) */}
             {/* Kept minimal if needed for future extensions, but currently inline handles rename */}
+
+            {/* B9: 标签组的右键菜单。两个动作都复用既有链路——
+                「重命名」进入行内编辑态（`editingTag`），「删除」打开下面的二次确认框，
+                在这里直接删掉一个组是绝对不允许的。 */}
+            {tagMenu && (
+                <TagGroupContextMenu
+                    x={tagMenu.x}
+                    y={tagMenu.y}
+                    tagName={tagMenu.tagName}
+                    affectedCount={tagMenu.affected}
+                    t={t}
+                    onRename={() => {
+                        setEditingTag(tagMenu.tagName);
+                        setNewTagName(tagMenu.tagName);
+                    }}
+                    onDelete={() => setDeleteConfirmation({
+                        show: true,
+                        tagName: tagMenu.tagName,
+                        affected: tagMenu.affected,
+                    })}
+                    onClose={() => setTagMenu(null)}
+                />
+            )}
 
             {/* Tag Delete Confirmation Modal */}
             {deleteConfirmation.show && (
@@ -1405,8 +1614,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
                 .sidebar-collapsed .tag-item { justify-content: center; padding: 10px 0; gap: 0; }
                 .sidebar-collapsed .tag-name,
-                .sidebar-collapsed .tag-badge,
-                .sidebar-collapsed .tag-hover-actions { display: none; }
+                .sidebar-collapsed .tag-badge { display: none; }
                 .sidebar-collapsed .tag-color-wrapper { width: 100%; justify-content: center; }
                 .tag-color-wrapper { display: flex; align-items: center; justify-content: center; }
                 .tag-color-dot { 
@@ -1445,17 +1653,10 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                     box-shadow: 0 0 0 3px var(--accent-light);
                 }
 
-                /* Actions group: Hidden by default, Flex on hover */
-                .tag-hover-actions { 
-                    display: none; 
-                    gap: 4px; 
-                    align-items: center; 
-                    margin-left: auto;
-                    flex-shrink: 0;
-                }
-                .tag-item:hover .tag-hover-actions { display: flex; }
-                .tag-item:hover .tag-badge { display: none; }
-                
+                /* B9: the hover action group is gone — rename/delete now live in the
+                   right-click menu, so the row no longer swaps its count badge for two
+                   icons as the pointer passes over it. */
+
                 .tag-badge { 
                     font-size: 11px; 
                     font-weight: 600; 
@@ -1471,10 +1672,6 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                     color: white;
                 }
                 
-                .tag-hover-actions > *:hover { color: var(--accent-color); }
-                .tag-item.active .tag-hover-actions > * { opacity: 0.8; }
-                .tag-item.active .tag-hover-actions > *:hover { opacity: 1; color: var(--accent-color); }
-
                 /* Content Area */
                 .tag-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
                 .content-toolbar {
@@ -1916,33 +2113,10 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                     font-weight: 700;
                 }
 
-                .theme-mica .tag-hover-actions,
-                .theme-acrylic .tag-hover-actions {
-                    gap: 6px;
-                    color: var(--text-secondary);
-                }
-
-                .theme-mica .tag-hover-actions > span,
-                .theme-acrylic .tag-hover-actions > span {
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 999px;
-                }
-
-                .theme-mica .tag-hover-actions > span:hover,
-                .theme-acrylic .tag-hover-actions > span:hover {
-                    background: rgba(var(--accent-color-rgb), 0.12);
-                    color: var(--accent-color);
-                }
-
-                .theme-mica .tag-item.active .tag-hover-actions > span:hover,
-                .theme-acrylic .tag-item.active .tag-hover-actions > span:hover {
-                    background: rgba(var(--accent-color-rgb), 0.14);
-                    color: var(--accent-color);
-                }
+                /* B9: the mica/acrylic overrides for the removed hover action group went
+                   with the markup. The context menu is styled from root-level tokens in
+                   tag-group-menu.css, because a portal to body is not a descendant of these
+                   theme classes and would never match selectors written here. */
 
                 .theme-mica .tag-badge,
                 .theme-acrylic .tag-badge {

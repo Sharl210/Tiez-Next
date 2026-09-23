@@ -296,45 +296,10 @@
   box-shadow: var(--input-focus-shadow) !important;
 }
 
-.themed-tag-manager .tag-hover-actions {
-  display: flex !important;
-  align-items: center !important;
-  gap: 4px !important;
-  position: absolute !important;
-  top: 50% !important;
-  right: 40px !important;
-  transform: translateY(-50%) !important;
-  color: var(--text-secondary) !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-  transition: opacity 0.16s ease !important;
-  z-index: 1 !important;
-}
-
-.themed-tag-manager .tag-item:hover .tag-hover-actions,
-.themed-tag-manager .tag-item.active .tag-hover-actions {
-  opacity: 1 !important;
-  pointer-events: auto !important;
-}
-
-.themed-tag-manager .tag-item:hover .tag-name,
-.themed-tag-manager .tag-item.active .tag-name {
-  padding-right: 52px !important;
-}
-
-.themed-tag-manager .tag-hover-actions > span {
-  width: 20px !important;
-  height: 20px !important;
-  display: inline-flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  border-radius: 6px !important;
-}
-
-.themed-tag-manager .tag-hover-actions > span:hover {
-  background: rgba(var(--accent-color-rgb), 0.12) !important;
-  color: var(--accent-color) !important;
-}
+/* B9: the inline hover action group (rename / delete icons) was removed from the row —
+   those two actions now live in the tag group's right-click menu. Its rules are deleted
+   rather than left in place: the `padding-right: 52px` reservation in particular kept
+   shortening the tag name on hover, reserving space for icons that no longer exist. */
 
 .themed-tag-manager .tag-badge {
   margin-left: auto !important;
@@ -377,7 +342,6 @@
 
 .themed-tag-manager.sidebar-collapsed .tag-name,
 .themed-tag-manager.sidebar-collapsed .tag-badge,
-.themed-tag-manager.sidebar-collapsed .tag-hover-actions,
 .themed-tag-manager.sidebar-collapsed .sidebar-status {
   display: none !important;
 }

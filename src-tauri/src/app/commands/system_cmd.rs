@@ -34,54 +34,88 @@ pub fn open_data_folder(state: State<'_, AppDataDir>) -> AppResult<()> {
     Ok(())
 }
 
-/// 供"迁移中心"展示的一条历史数据目录信息（前端友好格式）。
+/// 供"迁移中心"展示的一条**可迁移来源**目录信息（前端友好格式）。
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LegacyDirView {
     pub path: String,
     pub identifier: String,
+    /// 这条数据原本属于哪个应用：`legacy_tiez`（旧版 TieZ）或
+    /// `previous_tiez_next`（历史版本的 Tiez-Next）。界面按此如实分类展示。
+    ///
+    /// 是稳定的机器可读码，不是文案——界面负责按语言映射（`legacy_origin_*`）。
+    pub origin: String,
     pub bytes: u64,
     pub files: u64,
     pub has_database: bool,
+    /// 是否允许"备份后删除"。本应用自己标识符的目录恒为 `false`。
+    pub can_delete: bool,
 }
 
-/// 迁移中心：列出旧标识符遗留的数据目录及其占用。
+/// 应用数据目录的**原生位置**（Tauri 由 `identifier` 推导）。
 ///
-/// 只读操作，不修改任何数据。用户据此决定是否清理。
+/// 【为什么命令层要自己算一遍】用户改了数据目录（`datapath.txt`）或使用便携版后，
+/// `AppDataDir` 指向的是那个自定义目录，而原生位置里可能留着**旧版本 Tiez-Next 的
+/// 数据**——它不在自定义目录同级，只扫 `AppDataDir` 会漏掉这条迁移来源。
+///
+/// 这里不新增全局状态位，而是按需推导：`app_data_dir()` 只做路径拼接，不读写磁盘，
+/// 重复调用没有副作用。
+fn native_data_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok()
+}
+
+/// 迁移中心：列出可迁移来源目录（旧版 TieZ + 历史版本的 Tiez-Next）及其占用。
+///
+/// 只读操作，不修改任何数据。用户据此决定是否迁移或清理。
 #[tauri::command]
-pub fn list_legacy_data_dirs(state: State<'_, AppDataDir>) -> AppResult<Vec<LegacyDirView>> {
+pub fn list_legacy_data_dirs(
+    app: AppHandle,
+    state: State<'_, AppDataDir>,
+) -> AppResult<Vec<LegacyDirView>> {
     let current = state.0.lock().unwrap().clone();
-    Ok(crate::migration_identifier::list_legacy_dirs(&current)
+    let extra: Vec<std::path::PathBuf> = native_data_dir(&app).into_iter().collect();
+    Ok(crate::migration_identifier::list_legacy_dirs(&current, &extra)
         .into_iter()
         .map(|i| LegacyDirView {
             path: i.path.to_string_lossy().to_string(),
             identifier: i.identifier,
+            origin: i.origin.code().to_string(),
             bytes: i.bytes,
             files: i.files,
             has_database: i.has_database,
+            can_delete: i.can_delete,
         })
         .collect())
 }
 
 /// 迁移中心：备份后删除一个遗留数据目录。
 ///
-/// 安全边界：仅允许删除白名单内的历史标识符目录；先完整备份并校验，通过后才删除源目录；
-/// 备份失败则不删除任何数据。返回备份目录路径供界面告知用户。
+/// 安全边界：仅允许删除**旧版 TieZ**（`com.tiez.app` / `com.tiez`）的目录；先完整备份
+/// 并校验，通过后才删除源目录；备份失败则不删除任何数据。返回备份目录路径供界面告知。
+///
+/// 本应用自己标识符（`com.tieznext`）的目录一律拒绝：那是用户留着的旧版 Tiez-Next
+/// 数据，不是被取代的旧应用，清理按钮不该销毁它。
 #[tauri::command]
-pub fn remove_legacy_data_dir(state: State<'_, AppDataDir>, path: String) -> AppResult<String> {
+pub fn remove_legacy_data_dir(
+    app: AppHandle,
+    state: State<'_, AppDataDir>,
+    path: String,
+) -> AppResult<String> {
     let current = state.0.lock().unwrap().clone();
     let target = std::path::PathBuf::from(&path);
+    let extra: Vec<std::path::PathBuf> = native_data_dir(&app).into_iter().collect();
 
     // 额外守卫（只对**非白名单**路径生效）：新版那边还没有任何数据时，不允许删掉
     // 用户手选的旧目录——否则用户等于把剪贴板历史从应用会读的位置彻底抹掉。
     // 白名单内的历史标识符目录保持既有行为不变，避免影响原本就存在的清理流程。
-    let is_whitelisted = crate::migration_identifier::legacy_dirs_for(&current)
+    let is_whitelisted = crate::migration_identifier::migratable_source_dirs(&current, &extra)
         .iter()
         .any(|p| p == &target);
     if !is_whitelisted {
         can_remove_source_safely(&current).map_err(AppError::Validation)?;
     }
 
-    crate::migration_identifier::backup_and_remove_legacy_dir(&current, &target)
+    crate::migration_identifier::backup_and_remove_legacy_dir(&current, &extra, &target)
         .map(|p| p.to_string_lossy().to_string())
         .map_err(AppError::Validation)
 }

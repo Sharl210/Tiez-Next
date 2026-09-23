@@ -17,6 +17,16 @@ export interface ClipboardItemProps {
   tagInput: string;
   /** Tags used elsewhere in history; shown as quick-pick when editing tags */
   tagSuggestions?: string[];
+  /**
+   * v0.5 需求⑨: every known tag name, available **regardless of the tag editor's state**.
+   *
+   * `tagSuggestions` above is deliberately empty unless the inline tag editor is open
+   * (the parent passes `EMPTY_TAG_SUGGESTIONS` otherwise, to keep the virtualised rows
+   * cheap). The "move to tag / copy to tag" dialog can be opened on its own, so it needs a
+   * full candidate list at all times — hence a separate prop instead of reusing that one
+   * and silently showing an empty candidate list.
+   */
+  allTagNames?: string[];
   theme: string;
   language: Locale;
   t: (key: string) => string;

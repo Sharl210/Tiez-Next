@@ -30,10 +30,12 @@ import {
     FileQuestion,
     GripVertical,
     Pencil,
-    StickyNote
+    StickyNote,
+    FolderInput
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
+import { TagAssignMenu } from "./TagAssignMenu";
 import { bodyEditDowngradesFormat, getEntryNote, isNoteEditable, MAX_ENTRY_NOTE_CHARS } from "../types";
 import {
     formatSensitivePreview,
@@ -700,6 +702,7 @@ const ClipboardItem = ({
     isEditingTags,
     tagInput,
     tagSuggestions = [],
+    allTagNames,
     theme,
     language,
     t,
@@ -748,6 +751,13 @@ const ClipboardItem = ({
     className,
     disableLayout
 }: ClipboardItemProps & { compactMode?: boolean, className?: string }) => {
+    /**
+     * v0.5 需求⑨：「移动到标签 / 复制到标签」的入口开关。
+     *
+     * 状态与整块交互都放在独立的 `TagAssignMenu` 组件里，这里只留一个布尔量；
+     * 这样并行修改同一文件的其他改动不会与本功能互相踩到。
+     */
+    const [isTagAssignOpen, setIsTagAssignOpen] = useState(false);
     const itemRef = useRef<HTMLDivElement | null>(null);
     const tagInputRef = useRef<HTMLInputElement>(null);
     const [localTagInput, setLocalTagInput] = useState(tagInput);
@@ -1604,7 +1614,7 @@ const ClipboardItem = ({
                     opacity: 0.9
                 }}
             >
-                <StickyNote
+                <Sparkles
                     size={10}
                     style={{ flexShrink: 0, marginTop: isCompactNote ? 0 : '2px' }}
                 />
@@ -1928,9 +1938,9 @@ const ClipboardItem = ({
                 if (target.closest('a')) {
                     return;
                 }
-                // e.preventDefault() stops macOS from transferring key-window focus to TieZ
+                // e.preventDefault() stops macOS from transferring key-window focus to Tiez-Next
                 // when the user clicks on a clipboard item, including pinned mode.
-                // Without this, the first click activates TieZ and the original input
+                // Without this, the first click activates Tiez-Next and the original input
                 // target loses focus before we dispatch the paste keystroke.
                 e.preventDefault();
                 void hideCompactPreview();
@@ -2098,6 +2108,19 @@ const ClipboardItem = ({
                             title="Tags"
                         >
                             <Tag size={12} />
+                        </button>
+                        {/* v0.5 需求⑨：移动到标签 / 复制到标签。入口与"标签编辑"分开，
+                            因为它改的是标签的归属，而不是标签的增删。 */}
+                        <button
+                            className={`btn-icon ${isTagAssignOpen ? "active" : ""}`}
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                void hideCompactPreview();
+                                setIsTagAssignOpen(true);
+                            }}
+                            title={t('tag_transfer_action') || '移动到标签 / 复制到标签'}
+                        >
+                            <FolderInput size={12} />
                         </button>
                         {(item.content_type === 'text' || item.content_type === 'rich_text') && aiEnabled && (
                             <button
@@ -2406,6 +2429,19 @@ const ClipboardItem = ({
             {renderBodyEditor()}
             {/* R11: binary rows get the note-only editor instead of the body one. */}
             {renderNoteEditor()}
+            {/* v0.5 需求⑨：移动 / 复制到标签。组件自己 portal 到 <body>，因此不受
+                虚拟列表的 transform 与溢出裁剪影响（与上面两个编辑器同款做法）。 */}
+            {isTagAssignOpen && (
+                <TagAssignMenu
+                    entryId={item.id}
+                    tags={item.tags || []}
+                    allTags={allTagNames ?? tagSuggestions}
+                    tagColors={tagColors}
+                    theme={theme}
+                    t={t}
+                    onClose={() => setIsTagAssignOpen(false)}
+                />
+            )}
         </motion.div >
     );
 };

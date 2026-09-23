@@ -101,7 +101,10 @@ pub fn update_tags(
 ///
 /// 判定本身在 [`clipboard_mutation::apply_entry_tags`] 里，与 MCP 走的是同一份
 /// 代码——这里只是把结论映射成队列项，因此界面路径与 AI 路径不可能判定不一致。
-fn encryption_action_for(transition: SensitiveTransition) -> Option<EncryptionAction> {
+///
+/// `pub(crate)`：`history_cmd` 的移动/复制命令也要用同一份映射。复制一遍映射表
+/// 等于给"两条路径判定不一致"留了一个入口。
+pub(crate) fn encryption_action_for(transition: SensitiveTransition) -> Option<EncryptionAction> {
     match transition {
         SensitiveTransition::Encrypt => Some(EncryptionAction::Encrypt),
         SensitiveTransition::Decrypt => Some(EncryptionAction::Decrypt),

@@ -1,12 +1,18 @@
 import { describe, it, expect } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   parseTagManagerSidebarSize,
   applyCollapseToggle,
+  resolveTagManagerLayout,
+  resolveInitialTagManagerLayout,
+  isStackedViewport,
   COLLAPSE_THRESHOLD_PX,
   EXPANDED_SIDEBAR_WIDTH,
   shouldShowTag,
   isSensitiveFeatureEnabled,
 } from "./TagManager";
+import TagManager from "./TagManager";
 
 /**
  * R2: the geometry parser is the one piece of the sidebar-persistence feature that
@@ -17,8 +23,10 @@ import {
  *  - the wide and stacked layouts each keep their own numbers;
  *  - `collapsed` is only ever true when the stored value is literally `true`.
  *
- * The component module is imported for its exported helper only; nothing in this
- * file mounts the component, so no Tauri host or DOM is required.
+ * The component module is imported for its exported helpers, and for the
+ * first-frame tests below it is rendered once to static markup (no DOM, no Tauri
+ * host required: the remembered geometry arrives as a prop, which is the whole
+ * point of the fix).
  */
 const DEFAULTS = {
   width: 130,
@@ -294,5 +302,164 @@ describe("isSensitiveFeatureEnabled（R3 开关读取）", () => {
     for (const value of ["FALSE", "0", "no", ""]) {
       expect(isSensitiveFeatureEnabled({ "app.privacy_protection": value })).toBe(true);
     }
+  });
+});
+
+/**
+ * R2（本轮修复）：首帧即记忆比例。
+ *
+ * 修复前的实现从默认比例起渲染，等 `get_settings` 异步返回后才换成记忆比例，
+ * 于是用户看到"先默认、再跳一下"。这些用例锁住的是构造上的性质：**不执行任何
+ * effect**（静态渲染不跑 effect），首帧的输出就已经是记忆比例。
+ *
+ * 反向对照结论（详见交付报告）：同样的断言在旧实现上失败，旧实现首帧输出
+ * `--tm-sidebar-width:130px`（默认），新实现输出记忆值。
+ */
+const renderFirstFrame = (props: Record<string, unknown>): string =>
+  renderToStaticMarkup(
+    createElement(TagManager, { t: (key: string) => key, theme: "light", ...props }) as never
+  );
+
+const sidebarWidthFrom = (html: string): string | undefined =>
+  html.match(/--tm-sidebar-width:\s*([^;"]+)/)?.[1]?.trim();
+
+const sidebarHeightFrom = (html: string): string | undefined =>
+  html.match(/--tm-sidebar-height:\s*([^;"]+)/)?.[1]?.trim();
+
+describe("首帧即记忆比例（不依赖异步读取）", () => {
+  it("传入记忆值时，首帧宽度/高度就是记忆值（静态渲染不执行任何 effect）", () => {
+    const remembered = { width: 317, height: 260, collapsed: false };
+    const html = renderFirstFrame({ persistedSize: JSON.stringify(remembered) });
+
+    // renderToStaticMarkup 不运行 useEffect：此前读到记忆比例只能靠 effect，
+    // 因此这条断言等价于"打开瞬间就是记忆比例"。
+    expect(sidebarWidthFrom(html)).toBe("317px");
+    expect(sidebarHeightFrom(html)).toBe("260px");
+    expect(sidebarWidthFrom(html)).not.toBe("130px");
+  });
+
+  it("记忆值为折叠态时，首帧就是折叠态（48px 轨道，不是默认展开宽度）", () => {
+    const html = renderFirstFrame({
+      persistedSize: { width: 200, height: 180, collapsed: true },
+    });
+
+    expect(sidebarWidthFrom(html)).toBe("48px");
+    expect(html).toContain("sidebar-collapsed");
+  });
+
+  it("传入的是 JSON 字符串（真实设置存储形态）时同样生效", () => {
+    const html = renderFirstFrame({
+      persistedSize: '{"width":288,"height":190,"collapsed":false}',
+    });
+    expect(sidebarWidthFrom(html)).toBe("288px");
+    expect(sidebarHeightFrom(html)).toBe("190px");
+  });
+
+  it("没有记忆值（首次运行）时首帧是默认比例，不抛异常", () => {
+    const html = renderFirstFrame({});
+    expect(sidebarWidthFrom(html)).toBe("130px");
+    expect(sidebarHeightFrom(html)).toBe("180px");
+  });
+
+  it("记忆值损坏时首帧回退默认比例，而不是 NaN 或崩溃", () => {
+    for (const broken of ['{"width":', "{ not json", { width: "200" }, 0, []]) {
+      const html = renderFirstFrame({ persistedSize: broken });
+      expect(sidebarWidthFrom(html)).toBe("130px");
+      expect(sidebarHeightFrom(html)).toBe("180px");
+    }
+  });
+
+  it("首帧不等待任何异步结果：整段标记里不出现未解析的占位值", () => {
+    const html = renderFirstFrame({ persistedSize: { width: 301, height: 200 } });
+    expect(html).not.toContain("NaN");
+    expect(html).not.toContain("undefinedpx");
+  });
+});
+
+describe("resolveTagManagerLayout（首帧选哪套几何）", () => {
+  const stored = {
+    width: 300,
+    height: 210,
+    collapsed: false,
+    stackedWidth: 120,
+    stackedHeight: 340,
+    stackedCollapsed: true,
+  };
+
+  it("宽布局取宽布局的记忆值", () => {
+    expect(resolveTagManagerLayout(stored, false)).toEqual({
+      width: 300,
+      height: 210,
+      collapsed: false,
+    });
+  });
+
+  it("窄/竖排布局取竖排自己的记忆值（两套几何不互相污染）", () => {
+    expect(resolveTagManagerLayout(stored, true)).toEqual({
+      width: 120,
+      height: 340,
+      collapsed: true,
+    });
+  });
+
+  it("缺失或损坏输入回退默认比例", () => {
+    for (const broken of [undefined, null, "", "坏数据", 42]) {
+      expect(resolveTagManagerLayout(broken, false)).toEqual({
+        width: 130,
+        height: 180,
+        collapsed: false,
+      });
+    }
+  });
+
+  it("未单独记忆竖排时继承宽布局数值（beta 升级路径）", () => {
+    expect(resolveTagManagerLayout({ width: 300, height: 210 }, true)).toEqual({
+      width: 300,
+      height: 210,
+      collapsed: false,
+    });
+  });
+
+  it("与 isStackedViewport 的阈值一致，避免首帧与 effect 判定分叉", () => {
+    expect(isStackedViewport(340)).toBe(true);
+    expect(isStackedViewport(341)).toBe(false);
+    expect(isStackedViewport(Number.NaN)).toBe(false);
+  });
+});
+
+describe("resolveInitialTagManagerLayout（本会话写入优先于启动时快照）", () => {
+  it("本会话写过就用本会话的值（否则同会话重开会闪回旧比例）", () => {
+    const bootValue = { width: 130, height: 180 };
+    const sessionValue = { width: 318, height: 240 };
+
+    expect(resolveInitialTagManagerLayout(bootValue, sessionValue, false)).toEqual({
+      width: 318,
+      height: 240,
+      collapsed: false,
+    });
+  });
+
+  it("本会话没写过就用启动快照", () => {
+    expect(resolveInitialTagManagerLayout({ width: 200, height: 190 }, undefined, false)).toEqual({
+      width: 200,
+      height: 190,
+      collapsed: false,
+    });
+  });
+
+  it("两者都没有时回退默认比例", () => {
+    expect(resolveInitialTagManagerLayout(undefined, undefined, false)).toEqual({
+      width: 130,
+      height: 180,
+      collapsed: false,
+    });
+  });
+
+  it("本会话的值损坏时回退默认，而不是采用启动快照的部分字段", () => {
+    expect(resolveInitialTagManagerLayout({ width: 200 }, "坏数据", false)).toEqual({
+      width: 130,
+      height: 180,
+      collapsed: false,
+    });
   });
 });
