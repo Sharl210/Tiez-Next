@@ -47,6 +47,27 @@ impl Default for PathMappings {
     }
 }
 
+/// 一个字符串是否是"整条就是一个文件路径值"（而非包含路径的普通文本）。
+///
+/// 与 `looks_like_absolute_file_path` 的区别：这里**不允许**内部换行/标签，
+/// 且去掉引号后仍须是绝对路径。调用方据此决定"能不能整条替换剪贴板正文"——
+/// 这是防止把用户复制的脚本/JSON/日志当成路径改写掉的关键判据。
+pub fn looks_like_path_value(v: &str) -> bool {
+    let t = v.trim().trim_matches('"');
+    if t.is_empty() || t.len() > 4096 {
+        return false;
+    }
+    if t.contains('<') || t.contains('\n') || t.contains('\r') {
+        return false;
+    }
+    let bytes = t.as_bytes();
+    let win = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    win || t.starts_with('/') || t.starts_with("\\\\")
+}
+
 /// 判断一个字符串像不像"数据目录里的文件路径"。
 ///
 /// 只做**保守**的判定：不含 `data:` 前缀（那是内联 data URL）、不含换行/HTML 标签，
@@ -84,22 +105,51 @@ pub fn relative_within(base: &Path, path: &Path) -> Option<String> {
     safe_relative_path(&s)
 }
 
-/// 一个"在数据目录之外、但必须随包带走"的文件。
+/// 一个"必须随包带走"的背景图文件。
+///
+/// 它覆盖三种来源，统一都落到包内 `background/` 前缀下——单一落点是"往返闭合"的前提：
+/// 导出端与导入端对"背景图在包里长什么样"只有一种约定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraFile {
-    /// 原始绝对路径（用于导入时还原设置项里的值）。
+    /// 源文件绝对路径（用于读取字节；也用于导入时展示原位置）。
     pub original: PathBuf,
-    /// 包内条目名（`background/<sha256>.<ext>`）。
+    /// 包内条目名，形如 `background/<名字>`。
     pub entry: String,
     /// 还原时使用的文件名。
     pub file_name: String,
+    /// 该条目是否**已经**由 `background/` 目录递归写入过。
+    ///
+    /// 为真时只登记进 `background_map.json`、不重复写 zip 条目（避免同一份字节进包两次）。
+    pub already_packed: bool,
 }
 
-/// 为"数据目录之外的文件"规划一个包内条目名。
+/// 为一张背景图规划包内条目。
 ///
 /// 条目名用**内容哈希**而不是原文件名：既避免路径里的非法字符，也让同一张图重复
 /// 导出时自然去重。扩展名保留，方便用户从包里直接辨认。
-pub fn extra_file_plan(original: &Path, bytes: &[u8]) -> ExtraFile {
+///
+/// 若该文件恰好位于 `data_dir/background/` 之内，说明它会被目录递归原样写进
+/// `background/<相对路径>`——此时返回 `already_packed = true`，只登记映射、不重复写，
+/// 条目名与递归产生的那一条保持一致（这是"往返闭合"的关键：导入端与导出端对
+/// 同一个文件必须给出同一个条目名，否则会以为背景丢了）。
+pub fn extra_file_plan(original: &Path, bytes: &[u8], data_dir: Option<&Path>) -> ExtraFile {
+    let file_name = original
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "background.img".to_string());
+
+    // 已在 data_dir/background/ 内 -> 递归会原样写入，条目名用相对路径。
+    if let Some(data_dir) = data_dir {
+        if let Some(rel) = relative_within(&data_dir.join("background"), original) {
+            return ExtraFile {
+                original: original.to_path_buf(),
+                entry: format!("background/{}", rel),
+                file_name,
+                already_packed: true,
+            };
+        }
+    }
+
     let ext = original
         .extension()
         .and_then(|e| e.to_str())
@@ -108,14 +158,11 @@ pub fn extra_file_plan(original: &Path, bytes: &[u8]) -> ExtraFile {
         .to_ascii_lowercase();
     let digest = sha256_bytes(bytes);
     let hex = digest.trim_start_matches("sha256:");
-    let file_name = original
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("background.{}", ext));
     ExtraFile {
         original: original.to_path_buf(),
         entry: format!("background/{}.{}", hex, ext),
         file_name,
+        already_packed: false,
     }
 }
 
@@ -341,8 +388,8 @@ mod tests {
 
     #[test]
     fn extra_file_entry_is_content_addressed() {
-        let a = extra_file_plan(Path::new("/home/u/Desktop/My BG.JPEG"), b"abc");
-        let b = extra_file_plan(Path::new("/tmp/other/Other.JPEG"), b"abc");
+        let a = extra_file_plan(Path::new("/home/u/Desktop/My BG.JPEG"), b"abc", None);
+        let b = extra_file_plan(Path::new("/tmp/other/Other.JPEG"), b"abc", None);
         // 相同内容 + 相同扩展名 -> 相同条目（路径不同也能自然去重）
         assert_eq!(a.entry, b.entry);
         assert!(a.entry.starts_with("background/"));
@@ -351,9 +398,9 @@ mod tests {
         // 原始文件名按用户看到的样子保留，便于从包里辨认
         assert_eq!(a.file_name, "My BG.JPEG");
         // 不同内容 -> 不同条目
-        assert_ne!(a.entry, extra_file_plan(Path::new("/t/x.jpg"), b"zzz").entry);
+        assert_ne!(a.entry, extra_file_plan(Path::new("/t/x.jpg"), b"zzz", None).entry);
         // 无扩展名时退化为 .bin，且不 panic
-        let noext = extra_file_plan(Path::new("/t/noext"), b"abc");
+        let noext = extra_file_plan(Path::new("/t/noext"), b"abc", None);
         assert!(noext.entry.ends_with(".bin"), "实际={}", noext.entry);
     }
 }

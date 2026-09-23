@@ -1,26 +1,12 @@
 use crate::app_state::{AppDataDir, EncryptionQueueState, SessionHistory};
-use crate::database::{self, has_sensitive_tag, DbState};
+use crate::database::{self, DbState};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
-use crate::infrastructure::repository::tag_repo::TagRepository;
+use crate::services::clipboard_mutation::{
+    self, new_entry_preview, SensitiveTransition,
+};
 use crate::services::encryption_queue::{EncryptionAction, EncryptionJob};
-use serde_json;
 use tauri::{AppHandle, Emitter, Manager, State};
-
-fn truncate_chars_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let cut = text
-        .char_indices()
-        .nth(max_chars)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len());
-    let mut out = String::with_capacity(cut + suffix.len());
-    out.push_str(&text[..cut]);
-    out.push_str(suffix);
-    out
-}
 
 #[tauri::command]
 pub fn toggle_clipboard_pin(
@@ -102,38 +88,25 @@ pub fn update_tags(
         return Err(AppError::Validation("Item not found".to_string()));
     }
 
-    let old_sensitive = {
-        let conn = state.conn.lock().unwrap();
-        let tags_json: Option<String> = conn
-            .query_row(
-                "SELECT tags FROM clipboard_history WHERE id = ?",
-                [id],
-                |row| row.get(0),
-            )
-            .ok();
-        let prev_tags: Vec<String> = tags_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-            .unwrap_or_default();
-        has_sensitive_tag(&prev_tags)
-    };
-
-    let new_sensitive = has_sensitive_tag(&tags);
-    state
-        .tag_repo
-        .update_entry_tags(id, tags)
-        .map_err(AppError::from)?;
-    if old_sensitive != new_sensitive {
+    let transition = clipboard_mutation::apply_entry_tags(&state.conn, &state.tag_repo, id, tags)?;
+    if let Some(action) = encryption_action_for(transition) {
         let queue = app_handle.state::<EncryptionQueueState>();
-        let action = if new_sensitive {
-            EncryptionAction::Encrypt
-        } else {
-            EncryptionAction::Decrypt
-        };
         queue.0.enqueue(EncryptionJob { id, action });
     }
     crate::services::cloud_sync::request_cloud_sync(app_handle);
     Ok(id)
+}
+
+/// 把共享的敏感性翻转结果翻译成加密队列动作。
+///
+/// 判定本身在 [`clipboard_mutation::apply_entry_tags`] 里，与 MCP 走的是同一份
+/// 代码——这里只是把结论映射成队列项，因此界面路径与 AI 路径不可能判定不一致。
+fn encryption_action_for(transition: SensitiveTransition) -> Option<EncryptionAction> {
+    match transition {
+        SensitiveTransition::Encrypt => Some(EncryptionAction::Encrypt),
+        SensitiveTransition::Decrypt => Some(EncryptionAction::Decrypt),
+        SensitiveTransition::None => None,
+    }
 }
 
 #[tauri::command]
@@ -144,7 +117,7 @@ pub async fn add_manual_item(
     content_type: String,
     tags: Vec<String>,
 ) -> AppResult<i64> {
-    let preview = truncate_chars_with_suffix(&content, 200, "...");
+    let preview = new_entry_preview(&content);
 
     let entry = database::ClipboardEntry {
         id: 0,
@@ -180,7 +153,7 @@ pub async fn update_item_content(
     id: i64,
     new_content: String,
 ) -> AppResult<()> {
-    let preview = truncate_chars_with_suffix(&new_content, 500, "...");
+    let preview = clipboard_mutation::body_preview(&new_content);
 
     // Persist first, then mirror into the session list. The reverse order left the
     // in-memory copy updated even when the repository refused the edit (binary

@@ -88,17 +88,56 @@ pub fn create_backup(req: &BackupRequest) -> Result<BackupReport, BackupError> {
     }
     std::fs::create_dir_all(&work_dir)?;
 
-    let result = build_package(req, &work_dir);
+    // 【为什么不直接写 output_path】写目标文件用 File::create 会**立即截断**同名文件。
+    // 若用户选的路径正好已存在一份有效备份（默认文件名只精确到秒，重复导出极易撞名），
+    // 导出一旦失败，"失败即清场"就会把那份**用户已有的备份也删掉**。
+    // 因此先写到同目录的 `.tmp` 文件，成功后才 `rename` 覆盖到目标——失败时只删自己的
+    // 临时文件，用户的既有文件一个字节都不动。
+    let staging_out = temp_output_path(&req.output_path);
+    let mut staged_req = req.clone();
+    staged_req.output_path = staging_out.clone();
+
+    let result = build_package(&staged_req, &work_dir);
 
     match result {
-        Ok(report) => Ok(report),
+        Ok(mut report) => {
+            // 原子落位：rename 在同一文件系统内是原子的，因此目标路径上要么是旧文件、
+            // 要么是完整的新文件，不会出现半截 zip。
+            if let Err(e) = std::fs::rename(&staging_out, &req.output_path) {
+                let _ = std::fs::remove_file(&staging_out);
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return Err(BackupError::Land(format!(
+                    "备份已生成但无法写入目标路径 {}（{}）。你原有的文件未被改动。",
+                    req.output_path.display(),
+                    e
+                )));
+            }
+            let digest = sha256_file(&req.output_path)?;
+            report.output_path = req.output_path.to_string_lossy().to_string();
+            report.sha256 = digest;
+            Ok(report)
+        }
         Err(e) => {
-            // 失败即清场：临时目录与半成品 zip 都不留下。
+            // 失败即清场：只清自己的临时文件与工作目录，**绝不碰**目标路径上的既有文件。
             let _ = std::fs::remove_dir_all(&work_dir);
-            let _ = std::fs::remove_file(&req.output_path);
+            let _ = std::fs::remove_file(&staging_out);
             Err(e)
         }
     }
+}
+
+/// 导出时的临时输出路径：与目标文件同目录（保证 rename 同文件系统）。
+fn temp_output_path(output: &Path) -> PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "backup.zip".to_string());
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{}.writing-{}-{}", name, std::process::id(), seq))
 }
 
 fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, BackupError> {
@@ -137,6 +176,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
             tags: count_rows(&snap, "saved_tags")?,
             attachments: count_files(&data_dir.join("attachments"))?,
             emoji_favorites: count_files(&data_dir.join("emoji_favorites"))?,
+            background: count_files(&data_dir.join("background"))?,
             settings: count_rows(&snap, "settings")?,
         };
     }
@@ -180,7 +220,24 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
     entries_written += n;
     bytes_written += b;
 
-    // 3.4 数据目录之外的背景图（本版新增的附加条目，旧读取端会跳过）
+    // 3.35 背景图目录（`data_dir/background/`）递归打包
+    //
+    // 【为什么必须有这一步】导入会把背景图还原到 `data_dir/background/`，并把设置项
+    // 指向那里。若导出端不打包这个目录，就会出现"导出 → 导入 → **再导出**"的**不闭合**：
+    // 第二次导出既不会把它当"数据目录之外的额外文件"（它在数据目录内），又因为缺这次
+    // 递归而不进包 —— 包内没有任何背景图，而再导入时 staging 里 copy_tree 复制来的旧
+    // 背景文件还在，界面照旧显示背景（**假成功**），换台机器才暴露丢失，且两侧都不报警。
+    let (n, b) = write_dir_recursive(
+        &mut zip,
+        deflated,
+        &data_dir.join("background"),
+        ENTRY_BACKGROUND_PREFIX,
+        &mut checksums,
+    )?;
+    entries_written += n;
+    bytes_written += b;
+
+    // 3.4 背景图的映射与"不在数据目录内"的额外文件（本版新增的附加条目，旧读取端会跳过）
     if !extra_files.is_empty() {
         let mut map_entries: Vec<BackgroundMapEntry> = Vec::new();
         for extra in &extra_files {
@@ -195,17 +252,22 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
                     continue;
                 }
             };
-            zip.start_file(extra.entry.clone(), deflated)
-                .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
-            zip.write_all(&bytes)
-                .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
-            checksums.insert(extra.entry.clone(), super::format::sha256_bytes(&bytes));
-            entries_written += 1;
-            bytes_written += bytes.len() as u64;
+            let digest = super::format::sha256_bytes(&bytes);
+            // 已在 `background/` 目录递归里写过的不重复写，只登记映射
+            // （条目名由 `extra_file_plan` 保证与递归结果一致）。
+            if !extra.already_packed {
+                zip.start_file(extra.entry.clone(), deflated)
+                    .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
+                zip.write_all(&bytes)
+                    .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
+                checksums.insert(extra.entry.clone(), digest.clone());
+                entries_written += 1;
+                bytes_written += bytes.len() as u64;
+            }
             map_entries.push(BackgroundMapEntry {
                 original_path: extra.original.to_string_lossy().to_string(),
                 entry: extra.entry.clone(),
-                sha256: super::format::sha256_bytes(&bytes),
+                sha256: digest,
                 file_name: extra.file_name.clone(),
             });
         }
@@ -308,10 +370,11 @@ fn plan_extra_files(
         return Ok(Vec::new());
     }
     let path = PathBuf::from(trimmed);
-    // 数据目录内的背景图已经随目录打包，不需要额外处理。
-    if path.starts_with(data_dir) {
-        return Ok(Vec::new());
-    }
+
+    // 无论在数据目录内还是外，都要**登记映射**——否则导入端不知道设置项该指向哪。
+    // 落在 `background/` 内的文件由目录递归打包（already_packed=true，不重复写）；
+    // 落在数据目录其它位置（例如用户手工放进 attachments/ 的背景图）按同样规则处理，
+    // 由目录递归覆盖；只有**数据目录之外**的文件才需要额外写入 zip 条目。
     if !path.is_file() {
         notes.push(format!(
             "自定义背景图文件不存在或不可读，未打包（导入后需重新设置背景）：{}",
@@ -321,7 +384,7 @@ fn plan_extra_files(
     }
     let bytes = std::fs::read(&path)
         .map_err(|e| BackupError::Land(format!("读取背景图失败：{}", e)))?;
-    Ok(vec![extra_file_plan(&path, &bytes)])
+    Ok(vec![extra_file_plan(&path, &bytes, Some(data_dir))])
 }
 
 fn write_dir_recursive<W: Write + Seek>(

@@ -126,6 +126,14 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     setup_taskbar_listener(app);
 
+    // 12. MCP 服务接线
+    //
+    // 接线只做两件事：把宿主的副作用实现（发事件 / 云同步 / 加解密入队）与审计
+    // 日志装进 MCP 模块，然后按用户配置决定是否自动启动。**默认不启动**：写权限
+    // 与监听都必须是用户显式打开的。
+    crate::services::mcp::install_host(&app_handle);
+    crate::services::mcp::autostart_if_configured(&app_handle);
+
     Ok(())
 }
 

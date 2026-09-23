@@ -9,6 +9,14 @@ pub enum AppError {
     Internal(String),
     Validation(String),
     Encryption(String),
+    /// 已经构造好的**结构化载荷**（JSON），直接原样交给前端。
+    ///
+    /// 【为什么需要它】其余变体的 `Display` 会加上中文前缀（如 `验证错误: `），那是给
+    /// 日志和人看的。但前端要靠这个载荷里的 `code` 字段做多语言映射——一旦被前缀污染
+    /// 就不再是合法 JSON，前端只能退化为把整串原文（含中文前缀）显示给用户，于是
+    /// 英文/繁体用户看到中文，所有多语言词条**全部失效**。
+    /// 凡需要携带机器可读原因码的命令，一律走这个变体：`Display` 就是裸 JSON 本身。
+    Raw(String),
 }
 
 impl std::error::Error for AppError {}
@@ -22,6 +30,8 @@ impl fmt::Display for AppError {
             AppError::Internal(e) => write!(f, "内部系统错误: {}", e),
             AppError::Validation(e) => write!(f, "验证错误: {}", e),
             AppError::Encryption(e) => write!(f, "加密错误: {}", e),
+            // 不加任何前缀：这一串本身就是要原样传给前端的结构化载荷。
+            AppError::Raw(payload) => write!(f, "{}", payload),
         }
     }
 }

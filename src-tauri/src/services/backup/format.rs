@@ -85,6 +85,12 @@ pub enum BackupError {
     Land(String),
     /// 纯 I/O 失败。
     Io(String),
+    /// 导出路径未指定。
+    NoOutputPath,
+    /// 导出目标目录不存在。
+    OutputDirMissing(String),
+    /// 备份包路径不存在。
+    ArchiveMissing(String),
 }
 
 impl BackupError {
@@ -98,6 +104,9 @@ impl BackupError {
             BackupError::CountMismatch { .. } => "count_mismatch",
             BackupError::Land(_) => "land_failed",
             BackupError::Io(_) => "io",
+            BackupError::NoOutputPath => "no_output_path",
+            BackupError::OutputDirMissing(_) => "output_dir_missing",
+            BackupError::ArchiveMissing(_) => "archive_missing",
         }
     }
 }
@@ -134,6 +143,11 @@ impl std::fmt::Display for BackupError {
             ),
             BackupError::Land(detail) => write!(f, "写入数据时失败，已回滚到导入前的状态：{}", detail),
             BackupError::Io(detail) => write!(f, "文件系统错误：{}", detail),
+            BackupError::NoOutputPath => write!(f, "未指定导出路径。"),
+            BackupError::OutputDirMissing(dir) => {
+                write!(f, "导出目录不存在：{}", dir)
+            }
+            BackupError::ArchiveMissing(path) => write!(f, "备份包不存在：{}", path),
         }
     }
 }
@@ -174,6 +188,13 @@ pub struct ManifestCounts {
     /// `emoji_favorites/` 下的文件数。
     #[serde(default)]
     pub emoji_favorites: u64,
+    /// `background/` 下的文件数（自定义背景图）。
+    ///
+    /// 本版新增的计数：旧读取端不认识这个字段会忽略它（`#[serde(default)]`），
+    /// 因此**不需要**升 `format_version`。导入端只在它 >0 时做严格对账，
+    /// 于是更早写入端（不写该字段=0）的包仍能被接受。
+    #[serde(default)]
+    pub background: u64,
     /// `settings` 行数。
     #[serde(default)]
     pub settings: u64,

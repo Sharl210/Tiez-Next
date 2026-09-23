@@ -29,7 +29,8 @@ export const useAppState = (): AppState => {
     ai: true,
     file_transfer: true,
     default_apps: true,
-    data: true
+    data: true,
+    mcp: true
   });
   const [history, setHistory] = useState<ClipboardEntry[]>([]);
   const [search, setSearch] = useState("");

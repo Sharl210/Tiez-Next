@@ -159,14 +159,33 @@ const appVersionSafe = async (): Promise<string> => {
  */
 const parseBackendError = (e: unknown): { code: string | null; detail: string } => {
     const raw = e instanceof Error ? e.message : String(e);
-    try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
-            return { code: parsed.code, detail: String(parsed.detail ?? parsed.code) };
+    const tryParse = (text: string) => {
+        try {
+            const parsed = JSON.parse(text);
+            if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
+                return { code: parsed.code as string, detail: String(parsed.detail ?? parsed.code) };
+            }
+        } catch {
+            /* 不是合法 JSON */
         }
-    } catch {
-        /* 不是 JSON：按原文处理 */
+        return null;
+    };
+
+    // 先按"裸 JSON"解析（后端用 ~AppError.Raw~ 时就是这个形状）。
+    const direct = tryParse(raw);
+    if (direct) return direct;
+
+    // 兜底：从第一个 `{` 起再试一次。
+    //
+    // 后端有些错误变体的 Display 会加类别前缀（如 `验证错误: {...}`），一旦如此，
+    // 上面的 JSON.parse 必然失败，界面就只能把带前缀的原文（含中文）丢给用户，
+    // 多语言映射全部失效。这里主动裁掉前缀再解析，保证英文/繁用户仍看到本语言文案。
+    const brace = raw.indexOf("{");
+    if (brace > 0) {
+        const sliced = tryParse(raw.slice(brace));
+        if (sliced) return sliced;
     }
+
     return { code: null, detail: raw };
 };
 
@@ -408,13 +427,27 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
      *    "可回退到哪里"。
      */
     const handleImport = async () => {
-        const selected = await open({
-            multiple: false,
-            directory: false,
-            filters: [{ name: "zip", extensions: ["zip"] }],
-            title: t("backup_import"),
-        });
-        if (!selected) return;
+        // 【为什么 busy 必须在这里就置位】`open()` 与 `confirm()` 都是 await 的系统对话框，
+        // 期间用户完全可以再点一次"导入"——若 `disabled` 直到那时才生效，就会开出两个
+        // 文件选择器、跑起两次并发导入。后端已加进程级互斥兜底，但界面这一层也要在
+        // **第一个 await 之前**就上锁，否则用户看到的是两个并行流程。
+        if (backupBusy !== null) return;
+        setBackupBusy("import");
+
+        let selected: string | string[] | null = null;
+        try {
+            selected = await open({
+                multiple: false,
+                directory: false,
+                filters: [{ name: "zip", extensions: ["zip"] }],
+                title: t("backup_import"),
+            });
+        } finally {
+            if (!selected) {
+                setBackupBusy(null);
+                return;
+            }
+        }
 
         // ---- 只读预览：把"将发生什么"提前摆给用户看 ----
         let info: InspectReport;
@@ -427,6 +460,7 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                 title: t("error"),
                 kind: "error",
             });
+            setBackupBusy(null);
             return;
         }
 
@@ -436,6 +470,9 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                 .replace("{entries}", String(info.counts.entries))
                 .replace("{tags}", String(info.counts.tags))
                 .replace("{attachments}", String(info.counts.attachments))
+                // 表情收藏是"磁盘目录 + 设置项 JSON"双份存储，用户点确认前必须能核对
+                // 它在不在包里——只听"附件 9 个"不足以判断。
+                .replace("{emoji}", String(info.counts.emojiFavorites))
                 .replace("{settings}", String(info.counts.settings))
                 .replace("{exported_at}", info.exportedAt || "—")
                 .replace("{version}", info.appVersion || "—"),
@@ -446,9 +483,11 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                 cancelLabel: t("cancel"),
             }
         );
-        if (!ok) return;
+        if (!ok) {
+            setBackupBusy(null);
+            return;
+        }
 
-        setBackupBusy("import");
         setLastRestore(null);
         try {
             const report = await invoke<RestoreReport>("import_backup", {
@@ -681,6 +720,26 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                     <div>{t('backup_import_done_no_backup')
                                         .replace('{files}', String(lastRestore.restoredFiles))
                                         .replace('{size}', formatBytes(lastRestore.restoredBytes))}</div>
+                                )}
+                                {/* 需求明确要求"导入后必须重置"（WAL/SHM、迁移、云同步游标），
+                                    这些是用户可核查的事实，因此必须回执，而不是只写在后端日志里。 */}
+                                {lastRestore.resetsApplied?.length > 0 && (
+                                    <div style={{ marginTop: '4px' }}>
+                                        <div>{t('backup_import_resets')}</div>
+                                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
+                                            {lastRestore.resetsApplied.map((r) => (
+                                                <li key={r}>{r}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+                                {typeof lastRestore.verifiedEntries === 'number' && (
+                                    <div>
+                                        {t('backup_import_verified').replace(
+                                            '{verified}',
+                                            String(lastRestore.verifiedEntries)
+                                        )}
+                                    </div>
                                 )}
                                 {lastRestore.warnings.map((w) => (
                                     <div key={w} style={{ opacity: 0.85 }}>

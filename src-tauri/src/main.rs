@@ -174,7 +174,13 @@ fn main() {
             infrastructure::windows_api::apps::get_executable_icon,
             infrastructure::windows_api::apps::get_file_icon,
             infrastructure::windows_api::apps::scan_installed_apps,
-            infrastructure::windows_api::apps::get_associated_apps
+            infrastructure::windows_api::apps::get_associated_apps,
+            services::mcp::get_mcp_status,
+            services::mcp::set_mcp_server_enabled,
+            services::mcp::set_mcp_allow_write,
+            services::mcp::set_mcp_port,
+            services::mcp::set_mcp_autostart,
+            services::mcp::regenerate_mcp_token
         ])
         .on_window_event(|window, event| {
             setup::handle_window_event(window, event);

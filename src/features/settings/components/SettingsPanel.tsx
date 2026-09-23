@@ -18,6 +18,7 @@ import AppearanceSettingsGroup from "./groups/AppearanceSettingsGroup";
 import SyncSettingsGroup from "./groups/SyncSettingsGroup";
 import CloudSyncSettingsGroup, { type CloudSyncStatusPayload } from "./groups/CloudSyncSettingsGroup";
 import DefaultAppsSettingsGroup from "./groups/DefaultAppsSettingsGroup";
+import McpSettingsGroup from "./groups/McpSettingsGroup";
 import DataSettingsGroup from "./groups/DataSettingsGroup";
 import FileTransferSettingsGroup from "./groups/FileTransferSettingsGroup";
 import AiSettingsGroup from "./groups/AiSettingsGroup";
@@ -772,6 +773,13 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 collapsed={collapsedGroups['data']}
                 onToggle={() => toggleGroup('data')}
                 dataPath={dataPath}
+            />
+
+            {/* MCP Service Settings */}
+            <McpSettingsGroup
+                t={t}
+                collapsed={collapsedGroups['mcp']}
+                onToggle={() => toggleGroup('mcp')}
             />
 
             <div className="settings-group">
