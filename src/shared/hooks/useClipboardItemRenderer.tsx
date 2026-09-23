@@ -6,7 +6,7 @@ import type { Dispatch, SetStateAction, MouseEvent, ReactNode } from "react";
 import type { DragControls } from "framer-motion";
 import ClipboardItem from "../../features/clipboard/components/ClipboardItem";
 import type { QuickPasteHint } from "../../features/clipboard/types";
-import { isBodyEditable } from "../../features/clipboard/types";
+import { getEntryNote, isBodyEditable, isNoteEditable } from "../../features/clipboard/types";
 import type { ClipboardEntry } from "../types";
 import type { Locale } from "../types";
 
@@ -108,10 +108,26 @@ export const useClipboardItemRenderer = ({
   const [bodyEditSaving, setBodyEditSaving] = useState(false);
   const [bodyEditError, setBodyEditError] = useState<string | null>(null);
 
+  /**
+   * R11: note-editing state, for the content types whose body cannot be edited as text
+   * (`image` / `file` / `video`). Kept separate from the body-editor state on purpose:
+   * the two dialogs never coexist (a row is either text-like or binary), and sharing one
+   * state pair would let a stale error from one editor surface in the other.
+   */
+  const [editingNoteId, setEditingNoteId] = useState<number | null>(null);
+  const [noteEditSaving, setNoteEditSaving] = useState(false);
+  const [noteEditError, setNoteEditError] = useState<string | null>(null);
+
   const closeBodyEditor = useCallback(() => {
     setEditingBodyId(null);
     setBodyEditSaving(false);
     setBodyEditError(null);
+  }, []);
+
+  const closeNoteEditor = useCallback(() => {
+    setEditingNoteId(null);
+    setNoteEditSaving(false);
+    setNoteEditError(null);
   }, []);
 
   const saveBodyEdit = useCallback(async (id: number, newContent: string) => {
@@ -125,6 +141,29 @@ export const useClipboardItemRenderer = ({
       setBodyEditError(`保存失败：${err?.toString() || err}`);
     } finally {
       setBodyEditSaving(false);
+    }
+  }, []);
+
+  /**
+   * R11: `update_entry_note` writes the note column only, so it is valid for every
+   * content type — including the binary ones whose body edits the back end refuses.
+   * On failure the dialog stays open with the draft intact (the state is only cleared on
+   * success), which is what makes a failed save recoverable without retyping.
+   *
+   * No refresh wiring is needed here: the command emits `clipboard-changed`, which App
+   * already listens for (`useClipboardEvents` → `fetchHistory(true)`).
+   */
+  const saveNoteEdit = useCallback(async (id: number, note: string) => {
+    setNoteEditSaving(true);
+    setNoteEditError(null);
+    try {
+      await invoke("update_entry_note", { id, note });
+      setEditingNoteId(null);
+    } catch (err) {
+      // TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳
+      setNoteEditError(`保存备注失败：${err?.toString() || err}`);
+    } finally {
+      setNoteEditSaving(false);
     }
   }, []);
 
@@ -165,6 +204,22 @@ export const useClipboardItemRenderer = ({
             ? (newContent) => { void saveBodyEdit(item.id, newContent); }
             : undefined}
           onBodyEditCancel={closeBodyEditor}
+          // R11: `image` / `file` / `video` store a path or a data URL, so the body
+          // editor is not offered at all — they get the note-only editor instead (the
+          // note is entry metadata and the back end accepts it for every type).
+          onEditNote={isNoteEditable(item.content_type) ? (e) => {
+            e.stopPropagation();
+            setNoteEditError(null);
+            setEditingNoteId(item.id);
+          } : undefined}
+          isEditingNote={editingNoteId === item.id}
+          noteInitialDraft={editingNoteId === item.id ? getEntryNote(item) : undefined}
+          noteEditSaving={noteEditSaving}
+          noteEditError={editingNoteId === item.id ? noteEditError : null}
+          onNoteEditSave={isNoteEditable(item.content_type)
+            ? (note) => { void saveNoteEdit(item.id, note); }
+            : undefined}
+          onNoteEditCancel={closeNoteEditor}
           tagSuggestions={isEditingTags ? allTags : EMPTY_TAG_SUGGESTIONS}
           tagColors={tagColors}
           theme={theme}
@@ -285,7 +340,12 @@ export const useClipboardItemRenderer = ({
       bodyEditSaving,
       bodyEditError,
       closeBodyEditor,
-      saveBodyEdit
+      saveBodyEdit,
+      editingNoteId,
+      noteEditSaving,
+      noteEditError,
+      closeNoteEditor,
+      saveNoteEdit
     ]
   );
 

@@ -62,6 +62,25 @@ export interface ClipboardItemProps {
   onBodyEditSave?: (newContent: string) => void;
   /** R10: close the body editor without saving. */
   onBodyEditCancel?: () => void;
+  /**
+   * R11: open the note-only editor. Supplied for `image` / `file` / `video`, whose body
+   * is a path or a `data:` URL and therefore cannot be edited as text. Text-like types
+   * keep `onEdit` (body) and never get this, so a binary row can never show a body
+   * field it is not allowed to write.
+   */
+  onEditNote?: (e: MouseEvent) => void;
+  /** R11: this entry's note editor is open. */
+  isEditingNote?: boolean;
+  /** R11: note the editor starts from; only read when the dialog opens. */
+  noteInitialDraft?: string;
+  /** R11: a note save is in flight (dialog disables its buttons). */
+  noteEditSaving?: boolean;
+  /** R11: error text from the last failed note save, shown inside the dialog. */
+  noteEditError?: string | null;
+  /** R11: commit the edited note. The renderer hook owns the backend call. */
+  onNoteEditSave?: (note: string) => void;
+  /** R11: close the note editor without saving. */
+  onNoteEditCancel?: () => void;
   dragControls?: DragControls;
   id?: string;
   disableLayout?: boolean;
@@ -84,6 +103,21 @@ export const getEntryNote = (item: ClipboardEntry): string => {
 export const EDITABLE_BODY_TYPES: readonly string[] = ["text", "code", "url", "rich_text"];
 
 /**
+ * R11: content types whose `content` column holds a path or a `data:` URL instead of
+ * editable text. Mirror of `is_binary_content_type` in
+ * `src-tauri/src/infrastructure/repository/clipboard_repo.rs`; the back end uses the same
+ * list to refuse body edits, and this list decides which rows get the note-only editor.
+ */
+export const BINARY_CONTENT_TYPES: readonly string[] = ["image", "file", "video"];
+
+/**
+ * R11: upper bound for a per-entry note, mirroring `MAX_ENTRY_NOTE_CHARS` in the
+ * repository layer (the tag manager carries the same mirror). The back end trims and
+ * clamps rather than rejecting, so this is a UI affordance, not the authority.
+ */
+export const MAX_ENTRY_NOTE_CHARS = 2000;
+
+/**
  * R10: whether this entry's body can be edited as text.
  *
  * `image` / `file` / `video` store a filesystem path or a `data:` URL. Rewriting it
@@ -92,6 +126,17 @@ export const EDITABLE_BODY_TYPES: readonly string[] = ["text", "code", "url", "r
  */
 export const isBodyEditable = (contentType: string): boolean =>
   EDITABLE_BODY_TYPES.includes(contentType);
+
+/**
+ * R11: whether this entry gets the note-only editor on the main page.
+ *
+ * The predicate is deliberately "binary" rather than `!isBodyEditable`: an unforeseen
+ * future content type must keep the current behaviour (no edit entry at all) instead of
+ * silently acquiring an editor whose write path has not been reviewed. `note` is entry
+ * metadata, so `update_entry_note` accepts it for these rows — unlike body edits.
+ */
+export const isNoteEditable = (contentType: string): boolean =>
+  BINARY_CONTENT_TYPES.includes(contentType);
 
 /**
  * R10: `rich_text` is editable, but saving downgrades it to plain text and drops

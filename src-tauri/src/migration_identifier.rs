@@ -24,6 +24,16 @@
 //!
 //! 第 1 与第 5 条共同保证：**本模块在最坏情况下只会"没迁成"，不会造成数据丢失**。
 //!
+//! ## 两条入口：自动候选 vs 用户手动指定
+//!
+//! - [`migrate_legacy_identifier_data`]：扫描白名单历史标识符目录（`com.tiez` /
+//!   `com.tiez.app`）。**本函数不再由启动流程调用**——用户明确要求迁移必须由自己
+//!   手动触发，应用启动不得自作主张搬数据。
+//! - [`migrate_from_source_dir`]：迁移用户在界面上**手动选定的任意旧数据目录**。
+//!   与前者共用同一套安全契约与交付实现（本模块只有 [`migrate_from`] 一条实现路径，
+//!   两条入口不会漂移）。源路径由参数给出，因此必须做更严格的防御性检查：
+//!   源不能等于目标、不能是目标已包含的目录、不能是既有目标的祖先。
+//!
 //! ## 依赖约束
 //!
 //! 本模块**只依赖 `std`**，不引用 crate 内任何其他模块。这样它可以脱离 Tauri 与
@@ -55,12 +65,17 @@ pub enum MigrationOutcome {
         target: PathBuf,
         files: u64,
         bytes: u64,
+        /// 目标里"从未使用过的空库"被改名让位后的路径（若有）。
+        ///
+        /// 只在目标原先只有空库、本次接管了它时出现；界面据此说明"新版原先的空数据
+        /// 已留档"。恒为改名而非删除。
+        yielded_db: Option<PathBuf>,
     },
     /// 迁移失败。源目录与既有目标目录均未被破坏。
     Failed { source: PathBuf, error: String },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// 新目录下已有数据库——用户已在用新版本，不能覆盖。
     TargetAlreadyHasData,
@@ -70,6 +85,27 @@ pub enum SkipReason {
     SamePath,
     /// 旧目录存在但不是目录。
     NotADirectory,
+    /// 源目录为空：没有可迁移的内容，不迁移也不删除。
+    EmptySource,
+    /// 源目录就是目标目录的祖先（迁移会把目标卷进源内，造成自复制）。
+    SourceIsAncestorOfTarget,
+    /// 源目录位于目标目录内部（迁移目标是自己的子目录，同样会造成自复制）。
+    SourceInsideTarget,
+}
+
+impl SkipReason {
+    /// 稳定的机器可读原因码，供界面按语言映射文案。
+    pub fn code(&self) -> &'static str {
+        match self {
+            SkipReason::TargetAlreadyHasData => "target_already_has_data",
+            SkipReason::NoLegacyDir => "no_legacy_dir",
+            SkipReason::SamePath => "same_path",
+            SkipReason::NotADirectory => "not_a_directory",
+            SkipReason::EmptySource => "empty_source",
+            SkipReason::SourceIsAncestorOfTarget => "source_is_ancestor_of_target",
+            SkipReason::SourceInsideTarget => "source_inside_target",
+        }
+    }
 }
 
 /// 由新数据目录推导同名父目录下的历史目录候选。
@@ -97,18 +133,16 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
     let mut last_failure: Option<MigrationOutcome> = None;
 
     for legacy in legacy_dirs_for(new_dir) {
-        match migrate_from(&legacy, new_dir) {
+        match migrate_from(&legacy, new_dir, false) {
             Outcome::Preserve => {}
             Outcome::Skipped(r) => return MigrationOutcome::Skipped(r),
-            Outcome::Migrated {
-                files,
-                bytes,
-            } => {
+            Outcome::Migrated { files, bytes, .. } => {
                 return MigrationOutcome::Migrated {
                     source: legacy,
                     target: new_dir.to_path_buf(),
                     files,
                     bytes,
+                    yielded_db: None,
                 }
             }
             Outcome::Failed(error) => {
@@ -124,6 +158,111 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
         Some(f) => f,
         None => MigrationOutcome::Skipped(SkipReason::NoLegacyDir),
     }
+}
+
+/// 用户手动指定源目录的迁移入口。
+///
+/// 与 [`migrate_legacy_identifier_data`] 的唯一区别是**源路径来自用户**（界面上手选的
+/// 任意旧数据目录），因此候选不再受白名单限制；其余安全契约（源只读、暂存→校验→
+/// 提升、失败只清暂存、成功后不删源）完全一致——两条入口共用 [`migrate_from`] 这一条
+/// 实现路径。
+///
+/// 【`allow_takeover`：为什么手动迁移需要它】新版应用**一启动就会在数据目录里创建
+/// 空白 `clipboard.db`**。若沿用"目标有库就跳过"的保守语义，用户的手动迁移会被自己
+/// 刚装好的空库永远挡住，功能形同虚设。因此手动入口额外接受一个由**调用方**（命令层）
+/// 判定的开关：
+///
+/// - `allow_takeover = true`：调用方已确认目标那个库是"从未使用过的空库"（判定需要读
+///   SQLite，由依赖 rusqlite 的命令层完成，以保持本模块只依赖 `std`）。此时本函数会
+///   把该空库改名留档后接管目标目录——**改名，不是删除**，且仅当它确实空无一记录时才
+///   会被允许走到这里。
+/// - `allow_takeover = false`：只要目标根层存在 `clipboard.db` 就跳过，绝不覆盖。
+///
+/// 本函数**不返回致命错误**：失败只回报 [`MigrationOutcome::Failed`]，调用方据此提示
+/// 用户"源目录完好、未做任何改动"。
+pub fn migrate_from_source_dir(
+    source: &Path,
+    target: &Path,
+    allow_takeover: bool,
+) -> MigrationOutcome {
+    migrate_from_inner(source, target, allow_takeover)
+}
+
+/// 迁移的完整入口（带"目标空库是否允许接管"开关）。
+///
+/// - `allow_pristine_target = true`：允许接管目标目录里那个**从未使用过的空库**
+///   （改名留档后让位）。**只有用户手动发起的迁移可以走这条**——因为用户此刻就在
+///   界面上，会看到"已接管空的新版数据目录"的提示，动作是可解释、可回退的。
+/// - `allow_pristine_target = false`：只要目标根层存在数据库就跳过。启动期候选扫描
+///   （[`migrate_legacy_identifier_data`]）走的是这条更保守的语义，保持其原有行为与
+///   测试基线不变。
+///
+/// 真正的迁移实现在 [`migrate_from`]；本函数只是把内部三态 [`Outcome`] 转成公开的
+/// [`MigrationOutcome`]。保留为独立公开入口，便于命令层按策略调用与测试。
+pub fn migrate_from_source_dir_with_policy(
+    source: &Path,
+    target: &Path,
+    allow_pristine_target: bool,
+) -> MigrationOutcome {
+    migrate_from_inner(source, target, allow_pristine_target)
+}
+
+fn migrate_from_inner(
+    source: &Path,
+    target: &Path,
+    allow_pristine_target: bool,
+) -> MigrationOutcome {
+    match migrate_from(source, target, allow_pristine_target) {
+        Outcome::Preserve => MigrationOutcome::Skipped(SkipReason::EmptySource),
+        Outcome::Skipped(r) => MigrationOutcome::Skipped(r),
+        Outcome::Migrated {
+            files,
+            bytes,
+            yielded_db,
+        } => MigrationOutcome::Migrated {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            files,
+            bytes,
+            yielded_db,
+        },
+        Outcome::Failed(error) => MigrationOutcome::Failed {
+            source: source.to_path_buf(),
+            error,
+        },
+    }
+}
+
+/// 源目录根层是否含主数据库。
+///
+/// 只读取根层（不递归），用于在迁移**之前**提示用户"所选目录看起来不是本应用的数据
+/// 目录"。这是一个提示，不是拒绝条件：真实迁移仍以内容一致性校验为准。
+pub fn source_has_database(source: &Path) -> bool {
+    source.is_dir() && source.join(DB_FILE).is_file()
+}
+
+/// 迁移在源目录上的**只读检查**：把源目录里会被迁移的文件逐个打开读取一遍。
+///
+/// 存在的理由：安全契约的第一条是"源目录全程只读"，而唯一可靠的证明方式是**实际
+/// 读取源目录并比对迁移前后的指纹**。本函数提供程序化的读取证据（返回文件数与字节
+/// 数），配合测试里的"调用前后源目录逐项扫描完全一致"断言，构成可重复的自证。
+///
+/// 只做 `File::open` + 读取，不写、不改名、不删除源内的任何东西。
+pub fn check_source_is_readable(source: &Path) -> io::Result<(u64, u64)> {
+    let entries = scan_tree(source)?;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    for (rel, size) in &entries {
+        if rel.ends_with('/') {
+            continue;
+        }
+        let path = source.join(rel);
+        let mut file = fs::File::open(&path)?;
+        let read = io::copy(&mut file, &mut io::sink())?;
+        files += 1;
+        bytes += read.min(*size);
+    }
+    Ok((files, bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -268,11 +407,95 @@ enum Outcome {
     /// 该候选不存在或无需处理，继续试下一个。
     Preserve,
     Skipped(SkipReason),
-    Migrated { files: u64, bytes: u64 },
+    Migrated {
+        files: u64,
+        bytes: u64,
+        /// 目标里那个"从未使用过的空库"被改名让位后的路径（若有）。
+        yielded_db: Option<PathBuf>,
+    },
     Failed(String),
 }
 
-fn migrate_from(source: &Path, target: &Path) -> Outcome {
+/// 把目标目录里**从未使用过的空库**改名让位，好让真正的旧数据进来。
+///
+/// 【为什么需要它】新版应用一启动就会创建空白 `clipboard.db`（WAL 模式，还会带
+/// `-wal` / `-shm`）。用户随后去点「迁移数据」时，目标里已经躺着一个空库；直接
+/// 覆盖它虽然内容上无损（一条记录都没有），但改名留档比删除更符合本模块"什么都
+/// 不销毁"的一贯风格——用户事后仍能在目标目录里看到那个被让位的文件。
+///
+/// **只在调用方已确认那个库从未被使用过（0 条记录）时才会被调用**，因此绝不会丢弃
+/// 任何用户记录。判定需要读 SQLite，由依赖 rusqlite 的命令层完成（见
+/// `system_cmd::target_db_is_pristine`），本模块据此保持只依赖 `std`。
+///
+/// 返回被改名的文件列表；调用方在交付失败时据此还原。
+fn yield_target_db(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut yielded = Vec::new();
+
+    // 幂等细节：若目标里那个"空库"（连同 WAL 侧车）与源里的同名文件**内容完全一致**
+    // （典型场景是用户迁移成功后重启，应用又创建/打开了一模一样的库），就没有必要改名
+    // 留档——否则用户反复验证时会看到一堆 `.unused-<时间戳>` 文件堆积。此时源文件覆盖
+    // 它即可：两者本来就一模一样，覆盖不等于改变任何用户数据。
+    // 注意这仍然只发生在目标那个库已被命令层判定为"0 条记录"的前提下。
+    let same_as_source = |name: &str| -> bool {
+        let a = target.join(name);
+        let b = source.join(name);
+        if !a.is_file() || !b.is_file() {
+            return false;
+        }
+        match (fs::read(&a), fs::read(&b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    };
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // WAL 模式下 -wal / -shm 是数据库状态的一部分，必须一起让位，否则新库会读到
+    // 上一份空库留下的 WAL 内容。
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{}", DB_FILE, suffix);
+        let from = target.join(&name);
+        if !from.is_file() {
+            continue;
+        }
+        // 与源同名文件内容一致 → 无需留档，交给交付步骤按原样覆盖。
+        if same_as_source(&name) {
+            let _ = fs::remove_file(&from);
+            continue;
+        }
+        let to = target.join(format!("{}.unused-{}", name, stamp));
+        fs::rename(&from, &to).map_err(|e| {
+            format!(
+                "无法让位目标里未使用过的空库 {}：{}（源目录未改动）",
+                from.display(),
+                e
+            )
+        })?;
+        yielded.push(to);
+    }
+    Ok(yielded)
+}
+
+/// 还原被 [`yield_target_db`] 改名让位的空库（仅用于交付失败回滚）。
+fn restore_yielded_target_db(yielded: &[PathBuf], target: &Path) {
+    for to in yielded {
+        // 文件名形如 `clipboard.db.unused-<ts>`，去掉后缀即可还原。
+        let Some(name) = to.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let Some(original) = name.split(".unused-").next() else {
+            continue;
+        };
+        let from = target.join(original);
+        if !from.exists() {
+            let _ = fs::rename(to, &from);
+        }
+    }
+}
+
+fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Outcome {
     // ---- 前置检查：任何一项不满足都保持原状 ----
     if !source.exists() {
         return Outcome::Preserve;
@@ -283,8 +506,20 @@ fn migrate_from(source: &Path, target: &Path) -> Outcome {
     if source == target {
         return Outcome::Skipped(SkipReason::SamePath);
     }
+    // 源是目标的祖先 / 源在目标内部：两者都会让"复制源到目标"变成自复制（目标可能
+    // 位于源之内），必须先拒绝。用户手动选路径时可能误选成数据目录的上级目录。
+    if target.starts_with(source) {
+        return Outcome::Skipped(SkipReason::SourceIsAncestorOfTarget);
+    }
+    if source.starts_with(target) {
+        return Outcome::Skipped(SkipReason::SourceInsideTarget);
+    }
     // 目标已有数据库 -> 用户已经在用新版本，绝不覆盖。
-    if target.join(DB_FILE).exists() {
+    //
+    // 例外：`allow_pristine_target` 为真时允许接管。该标志**只由命令层在确认目标那个
+    // 库一条记录都没有之后才置位**（见 `migrate_from_source_dir` 的文档）；本模块不
+    // 自行放宽这条判据，因为读 SQLite 需要 rusqlite，会破坏本模块只依赖 `std` 的契约。
+    if target.join(DB_FILE).exists() && !allow_pristine_target {
         return Outcome::Skipped(SkipReason::TargetAlreadyHasData);
     }
 
@@ -301,6 +536,8 @@ fn migrate_from(source: &Path, target: &Path) -> Outcome {
     // ---- 记录"迁移前目标里就已存在"的条目 ----
     // 这些条目不属于本次交付范围：既不覆盖它们，交付后也不拿它们的
     // 大小去和源比对（用户可能已在其中写入了更新的内容）。
+    // 注：目标里那个"空库"（及 -wal/-shm）也在其中，因此这两类状态文件既不会被
+    // 源里的同名文件覆盖、也不参与大小比对——只有下一步真正让位后才会被替换。
     let preexisting: std::collections::HashSet<String> = if target.exists() {
         match scan_tree(target) {
             Ok(v) => v.into_iter().map(|(k, _)| k).collect(),
@@ -341,8 +578,23 @@ fn migrate_from(source: &Path, target: &Path) -> Outcome {
     }
 
     // ---- 第三步：交付（提升暂存目录到目标）----
+    // 交付前先把"从未使用过的空库"改名让位（若适用）；让位失败则本步直接放弃，
+    // 源目录与目标原状保持不变。
+    let yielded = if allow_pristine_target {
+        match yield_target_db(source, target) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Outcome::Failed(e);
+            }
+        }
+    } else {
+        Vec::new()
+    };
     if let Err(e) = promote(&staging, target) {
         let _ = fs::remove_dir_all(&staging);
+        // 交付没成：把刚才让位的空库还原回去，目标恢复原状（源本就未被改动）。
+        restore_yielded_target_db(&yielded, target);
         return Outcome::Failed(format!("提升到目标目录失败: {}", e));
     }
 
@@ -351,7 +603,7 @@ fn migrate_from(source: &Path, target: &Path) -> Outcome {
     //   * 本次新交付的项：必须存在且大小与源一致；
     //   * 迁移前目标里就已存在的项：只要求仍然存在，不比对大小
     //     （用户可能已在其中写入了比源更新的内容，覆盖它才是错的）。
-    match verify_delivered(target, &source_entries, &preexisting) {
+    match verify_delivered(target, &source_entries, &preexisting, &yielded) {
         Ok(()) => {}
         Err(e) => {
             // 复核失败时不回删目标——目标里的数据是从源复制来的，删掉目标同样
@@ -367,6 +619,7 @@ fn migrate_from(source: &Path, target: &Path) -> Outcome {
     Outcome::Migrated {
         files: source_entries.len() as u64,
         bytes,
+        yielded_db: yielded.first().cloned(),
     }
 }
 
@@ -490,10 +743,16 @@ fn verify_delivered(
     target: &Path,
     expected: &[(String, u64)],
     preexisting: &std::collections::HashSet<String>,
+    yielded: &[PathBuf],
 ) -> Result<(), String> {
     let actual: Vec<(String, u64)> = scan_tree(target).map_err(|e| e.to_string())?;
     let map: std::collections::HashMap<&str, u64> =
         actual.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+
+    // 交付后只做检查，不删除目标里的任何文件。被改名让位的空库（
+    // `clipboard.db.unused-<ts>` 等）属于本次操作的产物，不在源目录条目清单里，
+    // 因此天然不会被下面的比对命中，无需特殊处理。
+    let _ = yielded;
 
     let mut missing = Vec::new();
     let mut mismatched = Vec::new();
@@ -508,6 +767,7 @@ fn verify_delivered(
             }
         }
     }
+
     if missing.is_empty() && mismatched.is_empty() {
         return Ok(());
     }
@@ -541,6 +801,18 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 造一个带真实 SQLite 文件头的空库文件（**只依赖 std**）。
+    ///
+    /// 本模块按设计不依赖 rusqlite，因此这里写的是 SQLite 的固定 100 字节文件头：
+    /// 迁移逻辑只按"文件是否存在 / 内容是否一致"判定，不需要能真正打开它。
+    fn make_empty_db_file(path: &Path) {
+        let mut header = Vec::with_capacity(4096);
+        header.extend_from_slice(b"SQLite format 3\0");
+        header.extend_from_slice(&[0u8; 92]); // 头部其余字段
+        header.resize(4096, 0u8); // 一个空页
+        fs::write(path, &header).unwrap();
     }
 
     /// 造一个典型的旧数据目录：数据库 + WAL + 日志 + 附件 + 表情收藏 + 重定向文件。
@@ -683,7 +955,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::Migrated { source, .. } => {
-                assert_eq!(source.file_name().unwrap(), "com.tiez")
+                assert_eq!(source.file_name().unwrap(), std::ffi::OsStr::new("com.tiez"))
             }
             other => panic!("应迁移成功，实际 {:?}", other),
         }
@@ -877,5 +1149,394 @@ mod tests {
         assert!(a.iter().all(|(k, _)| !k.contains('\\')));
         // 目录项以 / 结尾
         assert!(a.iter().any(|(k, _)| k == "attachments/"));
+    }
+
+    // ---- 用户手动指定源目录（迁移中心）----
+
+    /// 手动入口必须能迁任意路径的目录，并且**源目录逐项不变**（只读契约的核心）。
+    #[test]
+    fn manual_migration_accepts_arbitrary_source_and_keeps_it_byte_identical() {
+        let root = tmp("manual");
+        let target = root.join("com.tieznext");
+        // 任意路径：既不是白名单标识符，也不在目标同级
+        let source = root.join("my-old-tiez-data");
+        seed_legacy(&source);
+        let before = scan_tree(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        match &outcome {
+            MigrationOutcome::Migrated { files, bytes, .. } => {
+                assert_eq!(*files, before.len() as u64);
+                assert!(*bytes > 0);
+            }
+            other => panic!("应迁移成功，实际 {:?}", other),
+        }
+        assert_eq!(scan_tree(&target).unwrap(), before, "目标必须与源逐项一致");
+        // 核心断言：源目录逐项（含目录结构与大小）完全未变
+        assert_eq!(scan_tree(&source).unwrap(), before, "源目录必须逐字节未变");
+        assert!(!staging_dir(&target).exists(), "不得残留暂存目录");
+    }
+
+    /// 重复迁移同一源目录：第一次成功，之后每次都安全跳过；源与目标都不受影响。
+    #[test]
+    fn manual_migration_is_idempotent_across_repeats() {
+        let root = tmp("manual-idem");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        let source_before = scan_tree(&source).unwrap();
+
+        assert!(matches!(
+            migrate_from_source_dir(&source, &target, false),
+            MigrationOutcome::Migrated { .. }
+        ));
+        let target_after_first = scan_tree(&target).unwrap();
+
+        // 连跑多次：每一次都必须安全跳过，且不改变任何一侧
+        for round in 0..3 {
+            let outcome = migrate_from_source_dir(&source, &target, false);
+            assert!(
+                matches!(
+                    outcome,
+                    MigrationOutcome::Skipped(SkipReason::TargetAlreadyHasData)
+                ),
+                "第 {} 次重复迁移应跳过，实际 {:?}",
+                round + 2,
+                outcome
+            );
+            assert_eq!(
+                scan_tree(&target).unwrap(),
+                target_after_first,
+                "第 {} 次重复迁移后目标必须一字未改",
+                round + 2
+            );
+            assert_eq!(
+                scan_tree(&source).unwrap(),
+                source_before,
+                "第 {} 次重复迁移后源必须一字未改",
+                round + 2
+            );
+        }
+    }
+
+    /// 目标已有数据库但**缺附件**：手动迁移必须拒绝，且目标已有数据一字不改。
+    ///
+    /// 这是本设计下最关键的一条否决断言——它正是"合并模式"会产生坏结果的场景
+    /// （附件被硬链接式搬走后源目录就不再完整，用户后续再迁移会数据错位）。
+    #[test]
+    fn manual_migration_refuses_when_target_has_db_and_target_stays_untouched() {
+        let root = tmp("manual-refuse");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        // 目标已有自己的数据库（模拟新版已经启动并建库），但没有 attachments
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(DB_FILE), b"new-version-own-db").unwrap();
+        let target_before = scan_tree(&target).unwrap();
+        let source_before = scan_tree(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Skipped(SkipReason::TargetAlreadyHasData)
+        ));
+        assert_eq!(scan_tree(&target).unwrap(), target_before, "目标不得被改动");
+        assert_eq!(scan_tree(&source).unwrap(), source_before, "源不得被改动");
+    }
+
+    /// 源是目标的祖先目录时必须拒绝：否则复制会把目标自身卷进源里（自复制）。
+    #[test]
+    fn manual_migration_refuses_ancestor_source() {
+        let root = tmp("ancestor");
+        let target = root.join("com.tieznext");
+        seed_legacy(&root); // 源就是 root，target 在 root 之下
+
+        let outcome = migrate_from_source_dir(&root, &target, false);
+
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Skipped(SkipReason::SourceIsAncestorOfTarget)
+        ));
+        assert!(!target.exists(), "拒绝后不得创建目标");
+        assert!(root.join(DB_FILE).exists(), "源必须完好");
+    }
+
+    /// 源位于目标内部时必须拒绝（同样会自复制）。
+    #[test]
+    fn manual_migration_refuses_source_inside_target() {
+        let root = tmp("inside");
+        let target = root.join("com.tieznext");
+        let source = target.join("nested-old-data");
+        seed_legacy(&source);
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Skipped(SkipReason::SourceInsideTarget)
+        ));
+        assert!(source.join(DB_FILE).exists(), "源必须完好");
+    }
+
+    /// 空源目录：跳过，不迁移也不删除。
+    #[test]
+    fn manual_migration_skips_empty_source_without_deleting_it() {
+        let root = tmp("manual-empty");
+        let target = root.join("com.tieznext");
+        let source = root.join("empty-old-data");
+        fs::create_dir_all(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Skipped(SkipReason::EmptySource)
+        ));
+        assert!(source.exists(), "空源目录也不得被删除");
+        assert!(!target.exists());
+    }
+
+    /// 指定路径本身是个文件：不迁移、不破坏，且该文件仍然存在。
+    #[test]
+    fn manual_migration_rejects_file_path_without_touching_it() {
+        let root = tmp("manual-file");
+        let target = root.join("com.tieznext");
+        let source = root.join("not-a-dir.txt");
+        fs::write(&source, b"user file").unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
+        assert!(source.exists(), "用户选错的文件不得被删除");
+        assert_eq!(fs::read(&source).unwrap(), b"user file");
+        assert!(!target.exists());
+    }
+
+    /// 交付必然失败时（目标父路径是文件），源目录仍逐项不变。
+    #[test]
+    fn manual_migration_failure_keeps_source_intact() {
+        let root = tmp("manual-fail");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        let before = scan_tree(&source).unwrap();
+
+        let blocked = root.join("blocked");
+        fs::write(&blocked, b"i am a file").unwrap();
+        let target = blocked.join("com.tieznext");
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
+        assert_eq!(scan_tree(&source).unwrap(), before, "失败时源必须一字未改");
+    }
+
+    /// `allow_takeover = true` 时：目标里那个"空库"被改名留档，源数据接管目标。
+    ///
+    /// 这是本设计的关键行为——应用一启动就会建空库，不做这个区分的话手动迁移会被
+    /// 用户自己刚装好的空库永远挡住。真实调用里 `allow_takeover` 由命令层在确认
+    /// 目标库 0 条记录之后才置位（见 `system_cmd::target_db_is_pristine`）。
+    #[test]
+    fn manual_migration_takes_over_target_db_when_allowed() {
+        let root = tmp("takeover");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        let source_before = scan_tree(&source).unwrap();
+
+        // 目标 = 新版首次启动后的样子：只有空库 + WAL 侧车
+        fs::create_dir_all(&target).unwrap();
+        make_empty_db_file(&target.join(DB_FILE));
+        fs::write(target.join("clipboard.db-wal"), b"stale wal").unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, true);
+
+        assert!(
+            matches!(outcome, MigrationOutcome::Migrated { .. }),
+            "允许接管时应迁移成功，实际 {:?}",
+            outcome
+        );
+        // 目标数据库换成源里的那份
+        assert_eq!(
+            fs::read(target.join(DB_FILE)).unwrap(),
+            fs::read(source.join(DB_FILE)).unwrap()
+        );
+        assert!(target.join("attachments/a.png").exists());
+        // 原先的空库被**改名留档**，而不是删除
+        let leftovers: Vec<String> = fs::read_dir(&target)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".unused-"))
+            .collect();
+        assert!(
+            leftovers
+                .iter()
+                .any(|n| n.starts_with("clipboard.db.unused-")),
+            "空库应被改名留档，实际残留: {:?}",
+            leftovers
+        );
+        // 源目录逐项未变
+        assert_eq!(scan_tree(&source).unwrap(), source_before);
+    }
+
+    /// `allow_takeover = false`（保守语义）时：目标存在数据库就跳过，两侧都不动。
+    #[test]
+    fn manual_migration_skips_existing_target_db_by_default() {
+        let root = tmp("no-takeover");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        fs::create_dir_all(&target).unwrap();
+        make_empty_db_file(&target.join(DB_FILE));
+        let target_before = scan_tree(&target).unwrap();
+        let source_before = scan_tree(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, false);
+
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Skipped(SkipReason::TargetAlreadyHasData)
+        ));
+        assert_eq!(scan_tree(&target).unwrap(), target_before, "目标不得被改动");
+        assert_eq!(scan_tree(&source).unwrap(), source_before, "源不得被改动");
+    }
+
+    /// 反复接管必须幂等：目标里那个库已经与源一模一样时，不再堆积 `.unused-` 留档。
+    #[test]
+    fn repeated_takeover_does_not_pile_up_archives() {
+        let root = tmp("takeover-twice");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        let source_before = scan_tree(&source).unwrap();
+
+        fs::create_dir_all(&target).unwrap();
+        make_empty_db_file(&target.join(DB_FILE));
+        assert!(matches!(
+            migrate_from_source_dir(&source, &target, true),
+            MigrationOutcome::Migrated { .. }
+        ));
+
+        let count_archives = |dir: &Path| -> usize {
+            fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".unused-"))
+                .count()
+        };
+        let after_first = count_archives(&target);
+
+        // 再跑两次：目标库此时与源一致，应直接覆盖而不再留档
+        for _ in 0..2 {
+            assert!(matches!(
+                migrate_from_source_dir(&source, &target, true),
+                MigrationOutcome::Migrated { .. }
+            ));
+        }
+
+        assert_eq!(
+            count_archives(&target),
+            after_first,
+            "重复迁移不得持续堆积 .unused- 留档文件"
+        );
+        // 内容仍然正确、源仍然一字未改
+        assert_eq!(
+            fs::read(target.join(DB_FILE)).unwrap(),
+            fs::read(source.join(DB_FILE)).unwrap()
+        );
+        assert_eq!(scan_tree(&source).unwrap(), source_before);
+    }
+
+    /// **最高风险路径回归**：目标里的数据库无论大小、无论是否像是"空库"，
+    /// 只要 `allow_takeover = false`，就绝不能被丢弃或改名。
+    ///
+    /// 这条断言直接守护最坏结果——把用户真实数据当成空壳让位。`allow_takeover` 由命令层
+    /// 依据一次只读查询决定；本模块必须保证"调用方说不行就一定不行"。
+    #[test]
+    fn takeover_never_discards_a_target_database_unless_explicitly_allowed() {
+        let root = tmp("never-discard");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+
+        // 目标库做得"看起来很空"：有真实 SQLite 头、0 条记录也是 4096 字节
+        for (label, takeover) in [("保守（allow=false）", false), ("允许接管", true)] {
+            let target = root.join(format!("tgt-{}", takeover));
+            fs::create_dir_all(&target).unwrap();
+            make_empty_db_file(&target.join(DB_FILE));
+            let target_db_before = fs::read(target.join(DB_FILE)).unwrap();
+
+            let _ = migrate_from_source_dir(&source, &target, takeover);
+
+            if takeover {
+                // 允许接管：旧文件被改名留档（内容仍可找回），而非消失
+                let archived: Vec<PathBuf> = fs::read_dir(&target)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.to_string_lossy().contains(".unused-"))
+                    .collect();
+                assert!(
+                    !archived.is_empty(),
+                    "{}：接管时目标原库必须被改名留档",
+                    label
+                );
+                assert!(
+                    archived
+                        .iter()
+                        .any(|p| fs::read(p).unwrap() == target_db_before),
+                    "{}：留档文件必须与目标原库逐字节一致（内容未丢失）",
+                    label
+                );
+            } else {
+                // 保守：目标库一字未动，且没有被改名
+                assert_eq!(
+                    fs::read(target.join(DB_FILE)).unwrap(),
+                    target_db_before,
+                    "{}：目标库必须一字未改",
+                    label
+                );
+                let any_archive = fs::read_dir(&target)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".unused-"));
+                assert!(!any_archive, "{}：不得产生任何留档或改名", label);
+            }
+        }
+    }
+
+    /// 只读检查必须能读完源目录全部文件，且读完不改动源。
+    #[test]
+    fn read_only_check_reads_every_file_and_changes_nothing() {
+        let root = tmp("readonly");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        let before = scan_tree(&source).unwrap();
+
+        let (files, bytes) = check_source_is_readable(&source).unwrap();
+
+        assert_eq!(files, 7, "seed_legacy 造 7 个文件");
+        assert!(bytes > 0);
+        assert_eq!(scan_tree(&source).unwrap(), before, "只读检查不得改动源");
+        assert!(source_has_database(&source));
+    }
+
+    /// 跳过原因必须带稳定机器码，供界面按语言映射文案。
+    #[test]
+    fn skip_reason_codes_are_stable() {
+        assert_eq!(
+            SkipReason::TargetAlreadyHasData.code(),
+            "target_already_has_data"
+        );
+        assert_eq!(SkipReason::NoLegacyDir.code(), "no_legacy_dir");
+        assert_eq!(SkipReason::SamePath.code(), "same_path");
+        assert_eq!(SkipReason::NotADirectory.code(), "not_a_directory");
+        assert_eq!(SkipReason::EmptySource.code(), "empty_source");
+        assert_eq!(
+            SkipReason::SourceIsAncestorOfTarget.code(),
+            "source_is_ancestor_of_target"
+        );
+        assert_eq!(SkipReason::SourceInsideTarget.code(), "source_inside_target");
     }
 }

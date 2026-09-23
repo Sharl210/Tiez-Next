@@ -136,8 +136,18 @@ fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error:
     crate::migration::perform_migration_v028(&default_app_dir);
 
     // 标识符变更（com.tiez / com.tiez.app -> com.tieznext）的数据目录迁移。
-    // 安全契约：源目录只读、先暂存校验后交付、失败只清暂存、绝不覆盖既有数据。
-    migrate_identifier_data(&default_app_dir);
+    //
+    // 【为什么这里不再自动迁移】用户明确要求：迁移必须由用户自己在新版应用里手动
+    // 选择旧数据目录后触发，以便"确保不伤害原版，并且还可以多次手动验证"。启动期
+    // 自动搬数据与这个要求直接冲突——用户还没机会确认，数据就已经被复制过去了。
+    //
+    // 因此启动流程在此**不做任何迁移动作**，只保留迁移中心展示所需的只读盘点
+    // （`list_legacy_data_dirs`）。真实迁移由设置页「迁移中心」的
+    // `migrate_from_data_dir` 命令发起，与原来的自动迁移共用同一套安全契约
+    // （见 `system_cmd::apply_identifier_migration`）。
+    //
+    // 注：上面 `perform_migration_v028` 是 v0.2.8 时代「贴汁 → TieZ」的另一次改名
+    // 迁移，与本次标识符迁移是两件独立的事，不在本次范围内，保持原样。
 
     // Cleanup temp files
     std::thread::spawn(|| {
@@ -183,51 +193,123 @@ fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error:
     Ok(app_dir)
 }
 
-/// 标识符变更的数据目录迁移（`com.tiez` / `com.tiez.app` → `com.tieznext`）。
+/// 标识符变更迁移的结果（结构化，供「迁移中心」界面直接展示）。
 ///
-/// 本函数**永不阻断启动**：迁移失败或跳过都只是记录日志后继续。数据安全由
-/// [`crate::migration_identifier`] 的安全契约保证——源目录全程只读、失败只清暂存、
-/// 绝不覆盖既有数据，因此最坏情况仅是"没迁成"，用户原数据仍然完整。
+/// 字段与 [`crate::migration_identifier::MigrationOutcome`] 一一对应，只是转成
+/// 前端易读的字符串/数字，并补上稳定的原因码（便于界面按语言映射文案）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifierMigrationReport {
+    /// `migrated` | `skipped` | `failed`
+    pub status: String,
+    /// 实际被读取的源目录（用户手选或白名单候选）。
+    pub source: String,
+    /// 目标数据目录。
+    pub target: String,
+    /// 本次迁移的文件数（含目录条目，与后端一致性校验口径一致）。
+    pub files: u64,
+    /// 本次迁移的字节数。
+    pub bytes: u64,
+    /// 跳过时的机器可读原因码（见 `SkipReason::code`）。
+    pub skip_reason: Option<String>,
+    /// 失败原因（源目录此时仍然完好）。
+    pub error: Option<String>,
+    /// 数据库内绝对路径是否已改写成功（仅 `migrated` 时有意义）。
+    pub paths_rewritten: bool,
+    /// 改写数据库路径时的错误（若有）。数据已迁移成功，仅引用未更新。
+    pub rewrite_error: Option<String>,
+    /// 源目录是否全程未被改动。安全契约规定恒为 `true`；界面据此显式告知用户。
+    pub source_untouched: bool,
+    /// 迁移后目标是否已有可用数据库——为真时**必须重启**才能加载新数据。
+    ///
+    /// 应用启动时就把数据库连接建好了，迁移是运行中发生的，进程内的连接仍指向迁移前
+    /// 的那份数据。因此迁移成功后必须提示用户重启，否则界面看不到刚迁入的记录。
+    pub restart_required: bool,
+    /// 目标里那个"从未使用过的空库"被改名让位后的路径（若有）。
+    ///
+    /// 只在本次接管了空的新版数据目录时出现；界面据此说明"新版原先的空数据已留档"。
+    pub superseded_db: Option<String>,
+}
+
+/// 标识符变更迁移的**共享核心**：白名单候选与用户手选路径都走这里。
+///
+/// 数据安全由 [`crate::migration_identifier`] 的安全契约保证——源目录全程只读、
+/// 失败只清暂存、绝不覆盖既有数据，因此最坏情况仅是"没迁成"，用户原数据仍然完整。
 ///
 /// 迁移成功后还需重写数据库内记录着的**绝对路径**（附件、表情收藏、自定义背景），
-/// 否则新目录里的数据库仍指向旧目录下的文件，表现为图片/表情丢失。
-fn migrate_identifier_data(new_dir: &std::path::Path) {
-    use crate::migration_identifier::{migrate_legacy_identifier_data, MigrationOutcome};
+/// 否则新目录里的数据库仍指向旧目录下的文件，表现为图片/表情丢失。路径改写走
+/// `rewrite_data_paths_in_db`——它**只改写数据库里的字符串，不移动也不删除源文件**。
+pub fn apply_identifier_migration(
+    source: &std::path::Path,
+    new_dir: &std::path::Path,
+    outcome: crate::migration_identifier::MigrationOutcome,
+) -> IdentifierMigrationReport {
+    use crate::migration_identifier::MigrationOutcome;
 
-    let outcome = migrate_legacy_identifier_data(new_dir);
+    let mut report = IdentifierMigrationReport {
+        status: "skipped".to_string(),
+        source: source.to_string_lossy().to_string(),
+        target: new_dir.to_string_lossy().to_string(),
+        files: 0,
+        bytes: 0,
+        skip_reason: None,
+        error: None,
+        paths_rewritten: false,
+        rewrite_error: None,
+        source_untouched: true,
+        restart_required: false,
+        superseded_db: None,
+    };
 
     match &outcome {
         MigrationOutcome::Migrated {
             source,
             files,
             bytes,
+            yielded_db,
             ..
         } => {
+            report.status = "migrated".to_string();
+            report.source = source.to_string_lossy().to_string();
+            report.files = *files;
+            report.bytes = *bytes;
+            report.restart_required = new_dir.join("clipboard.db").exists();
+            report.superseded_db =
+                yielded_db.as_ref().map(|p| p.to_string_lossy().to_string());
             info!(
-                ">>> [MIGRATION] 已从 {:?} 迁移 {} 个文件（{} 字节）到 {:?}；源目录保留未删除。",
+                ">>> [MIGRATION] 已从 {:?} 迁移 {} 项（{} 字节）到 {:?}；源目录保留未删除。",
                 source, files, bytes, new_dir
             );
 
             // 数据库内的绝对路径仍需改写，否则引用仍指向旧目录。
             let db_path = new_dir.join("clipboard.db");
             if db_path.exists() {
-                if let Err(e) = crate::app::commands::system_cmd::rewrite_data_paths_in_db(
+                match crate::app::commands::system_cmd::rewrite_data_paths_in_db(
                     &db_path, source, new_dir,
                 ) {
-                    // 改写失败不影响数据本身已迁移成功；源目录仍在，可人工恢复。
-                    error!(
-                        "[MIGRATION] 数据库内路径改写失败（数据已迁移，源仍保留）: {}",
-                        e
-                    );
-                } else {
-                    info!(">>> [MIGRATION] 数据库内绝对路径已改写完成。");
+                    Ok(()) => {
+                        report.paths_rewritten = true;
+                        info!(">>> [MIGRATION] 数据库内绝对路径已改写完成。");
+                    }
+                    Err(e) => {
+                        // 改写失败不影响数据本身已迁移成功；源目录仍在，可人工恢复。
+                        report.rewrite_error = Some(e.to_string());
+                        error!(
+                            "[MIGRATION] 数据库内路径改写失败（数据已迁移，源仍保留）: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
         MigrationOutcome::Skipped(reason) => {
+            report.skip_reason = Some(reason.code().to_string());
             info!(">>> [MIGRATION] 无需迁移标识符数据：{:?}", reason);
         }
         MigrationOutcome::Failed { source, error } => {
+            report.status = "failed".to_string();
+            report.source = source.to_string_lossy().to_string();
+            report.error = Some(error.clone());
             // 明确告知用户数据未丢失，避免误以为数据被删。
             error!(
                 "[MIGRATION] 迁移未完成（源数据完好、未被修改或删除）: 源={:?} 原因={}",
@@ -235,6 +317,9 @@ fn migrate_identifier_data(new_dir: &std::path::Path) {
             );
         }
     }
+
+    // SkipReason 的 code() 已在上面的 match 中消费；此处不再额外断言。
+    report
 }
 
 fn apply_startup_resets(repo: &impl SettingsRepository) {

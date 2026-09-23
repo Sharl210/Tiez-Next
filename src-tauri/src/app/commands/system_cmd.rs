@@ -71,9 +71,204 @@ pub fn remove_legacy_data_dir(state: State<'_, AppDataDir>, path: String) -> App
     let current = state.0.lock().unwrap().clone();
     let target = std::path::PathBuf::from(&path);
 
+    // 额外守卫（只对**非白名单**路径生效）：新版那边还没有任何数据时，不允许删掉
+    // 用户手选的旧目录——否则用户等于把剪贴板历史从应用会读的位置彻底抹掉。
+    // 白名单内的历史标识符目录保持既有行为不变，避免影响原本就存在的清理流程。
+    let is_whitelisted = crate::migration_identifier::legacy_dirs_for(&current)
+        .iter()
+        .any(|p| p == &target);
+    if !is_whitelisted {
+        can_remove_source_safely(&current).map_err(AppError::Validation)?;
+    }
+
     crate::migration_identifier::backup_and_remove_legacy_dir(&current, &target)
         .map(|p| p.to_string_lossy().to_string())
         .map_err(AppError::Validation)
+}
+
+/// 判定某个数据目录里的数据库是不是**从未使用过的空库**（0 条剪贴板记录）。
+///
+/// 放在命令层而不是 `migration_identifier` 里，是因为它需要读 SQLite（rusqlite），
+/// 而后者按设计**只依赖 `std`**，以便脱离 Tauri 与平台专用代码独立编译验证。判据本身
+/// 很简单：能打开、有 `clipboard_history` 表、且条数为 0。
+///
+/// 实现上**先把库连同 WAL 侧车复制到临时目录再查**，而不是直接打开目标库：实测
+/// （`migration_identifier` 的回归测试抓出）即便以只读方式打开，SQLite 也会改写目标
+/// 的 `clipboard.db-shm`。那个副作用会干扰正在运行的应用，也让"这次检查没动过任何
+/// 东西"不再成立。
+///
+/// 保守性：库存在但复制失败、打不开或没有该表时一律返回 `false`（按"有数据"处理）。
+/// 宁可少迁，不可覆盖。
+fn target_db_is_pristine(target: &std::path::Path) -> bool {
+    let db = target.join("clipboard.db");
+    if !db.is_file() {
+        return true; // 连库都没有 = 完全没用过
+    }
+
+    let probe_dir = std::env::temp_dir().join(format!(
+        "tiez-db-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::create_dir_all(&probe_dir).is_err() {
+        return false;
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("clipboard.db{}", suffix);
+        let from = target.join(&name);
+        if from.is_file() && std::fs::copy(&from, probe_dir.join(&name)).is_err() {
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            return false;
+        }
+    }
+
+    let count: Option<i64> = rusqlite::Connection::open(probe_dir.join("clipboard.db"))
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0))
+                .ok()
+        });
+    let _ = std::fs::remove_dir_all(&probe_dir); // 探针目录始终清理；目标目录从未被写过
+
+    matches!(count, Some(0))
+}
+
+/// 删除旧目录前的守卫：**只有新版确实存有可用数据时，才允许删掉用户手选的旧目录**。
+///
+/// 【为什么需要它】"备份后删除旧目录"与"把旧数据迁进新版"是两件独立的事：只要新版
+/// 那边还没有任何数据，删掉旧目录就等于把用户的剪贴板历史从应用会读的位置抹掉
+/// （备份虽然还在，但已不在应用读取的位置）。因此在用户手选路径的删除上再加一道
+/// 拦截——新版没有数据就先别删。
+fn can_remove_source_safely(target: &std::path::Path) -> Result<(), String> {
+    let db = target.join("clipboard.db");
+    if !db.is_file() {
+        return Err(
+            "新版数据目录里还没有数据库——先执行一次「从此目录迁移」，确认新版能正常看到旧记录之后再来清理。"
+                .to_string(),
+        );
+    }
+    if target_db_is_pristine(target) {
+        return Err(
+            "新版数据目录里还没有任何剪贴板记录——先执行一次「从此目录迁移」并重启确认，再来清理旧目录。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// 迁移中心：从**用户手动指定**的源目录迁移数据到当前数据目录。
+///
+/// 这是用户明确要求的手动迁移入口：应用启动时不会自动搬任何数据，只有用户在新版
+/// 应用里亲自选好旧数据目录并确认后，才会执行（`src-tauri/src/app/setup.rs` 的
+/// `resolve_data_dir` 已去掉启动期自动迁移）。
+///
+/// ## 与 `migrate_legacy_identifier_data` 的差异
+///
+/// 源路径来自用户参数，因此不受白名单限制（用户可以选 D 盘、移动硬盘、任意备份目录）。
+/// 安全性由 `crate::migration_identifier::migrate_from_source_dir` 的同一套契约保证：
+///
+/// 1. **源目录全程只读**——只 `read_dir` / `File::open` / `fs::copy`，不删除、不改名、
+///    不写入源内任何文件。**本命令不会备份后删除源目录**，源目录永远留给用户自己处置。
+/// 2. **先暂存后交付**——完整复制到目标同级的 `.…migrating.<pid>` 暂存目录，逐项校验
+///    （相对路径 + 字节数）一致后才提升为正式目录。
+/// 3. **失败只清暂存**——任何一步失败都只删暂存目录，源与既有目标保持原状。
+/// 4. **幂等**：目标已有非空数据库一律跳过；只有目标那个库确实一条记录都没有时，
+///    才允许本次手动迁移接管它（见下文"幂等语义"）。
+///
+/// ## 幂等语义（重复调用同一源路径）
+///
+/// 选择「**目标已有非空数据库则整体跳过**」，而不是合并或报错：
+///
+/// - 新版应用一旦启动过一次，就会在数据目录里创建空白 `clipboard.db`。因此"目标
+///   已有数据库"是**常态**，不是异常——若判为错误，用户第一次启动后重试就只会看到
+///   报错，与"可反复手动验证"的要求直接冲突。跳过是唯一能让重复迁移既不报错、
+///   也不堆积数据的语义。
+/// - 但**空库要区分对待**：目标里那个库若一条记录都没有，说明用户从没在新版里存过
+///   东西，本次手动迁移允许接管它（空库改名留档后让位，判据见本文件
+///   `target_db_is_pristine`）。不这样做的话，手动迁移会被用户自己刚装好的空库
+///   永远挡住，功能形同虚设。
+/// - 不能合并：合并要复制的恰好是 `clipboard.db`、`attachments/`、`emoji_favorites/`，
+///   而目标已有自己的数据库与附件；覆盖它们就是破坏用户当前数据，与本应用"绝不覆盖
+///   既有数据"的一贯契约相悖。跳过虽"少迁"，但绝不会迁坏。
+/// - 报告里的 `skipReason` / `error` 是机器可读原因码，界面负责把它翻译成人话并告诉
+///   用户"接下来该做什么"（例如先切换数据目录或清理新版数据后再迁移）。
+///
+/// ## 迁移成功后
+///
+/// 改写目标数据库内的绝对路径（`rewrite_data_paths_in_db`：只改数据库里的字符串，
+/// 绝不移动或删除源目录中的文件），否则附件与表情收藏仍指向旧目录而失联。
+/// 数据库连接在启动时已建立，界面应提示用户重启以加载新数据。
+#[tauri::command]
+pub fn migrate_from_data_dir(
+    state: State<'_, AppDataDir>,
+    path: String,
+) -> AppResult<crate::app::IdentifierMigrationReport> {
+    // 取当前数据目录后立即释放锁：迁移可能耗时，不应长时间占着全局状态锁。
+    let current = {
+        let guard = state.0.lock().unwrap();
+        guard.clone()
+    };
+
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation("未指定源数据目录".to_string()));
+    }
+    let source = std::path::PathBuf::from(trimmed);
+
+    // 只读预检：把源目录会被迁移的文件逐个读一遍，作为"源可读"的证据写进日志。
+    // 任何写入源目录的动作都不在此处，也不在后续任何一步。
+    match crate::migration_identifier::check_source_is_readable(&source) {
+        Ok((files, bytes)) => {
+            crate::info!(
+                ">>> [MIGRATION] 只读预检通过：源 {:?} 共 {} 个文件 / {} 字节（未做任何写入）。",
+                source,
+                files,
+                bytes
+            );
+        }
+        Err(e) => {
+            crate::error!(
+                "[MIGRATION] 只读预检未通过（未做任何写入）：源={:?} 原因={}",
+                source,
+                e
+            );
+        }
+    }
+
+    // 只有确认目标那个库从未被使用过（0 条记录），才允许本次迁移接管它。
+    // 这是"应用一启动就建空库，不区分则手动迁移永远被挡"这个现实问题的唯一解，
+    // 且判定保守：读不到、认不出、有任何记录都按"在用"处理。
+    let takeover = target_db_is_pristine(&current);
+    if takeover && current.join("clipboard.db").is_file() {
+        crate::info!(
+            ">>> [MIGRATION] 新版数据目录 {} 里的数据库尚无任何记录，本次迁移将接管它（原空库改名留档）。",
+            current.display()
+        );
+    }
+
+    let outcome =
+        crate::migration_identifier::migrate_from_source_dir(&source, &current, takeover);
+    let report = crate::app::apply_identifier_migration(&source, &current, outcome);
+    match report.status.as_str() {
+        "migrated" => crate::info!(
+            ">>> [MIGRATION] 手动迁移完成：源 {:?} 已复制 {} 项 / {} 字节到 {:?}；源目录未被改动，可重复验证。",
+            report.source,
+            report.files,
+            report.bytes,
+            report.target
+        ),
+        "skipped" => crate::info!(
+            ">>> [MIGRATION] 手动迁移跳过（源与目标均未被改动）：源={:?} 原因码={:?}",
+            report.source,
+            report.skip_reason
+        ),
+        _ => {}
+    }
+
+    Ok(report)
 }
 
 #[tauri::command]

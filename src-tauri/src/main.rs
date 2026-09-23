@@ -113,6 +113,7 @@ fn main() {
             app::commands::open_data_folder,
             app::commands::list_legacy_data_dirs,
             app::commands::remove_legacy_data_dir,
+            app::commands::migrate_from_data_dir,
             app::commands::open_file_with_default_app,
             app::commands::open_file_location,
             app::commands::set_data_path,

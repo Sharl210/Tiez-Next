@@ -34,7 +34,7 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
-import { bodyEditDowngradesFormat, getEntryNote } from "../types";
+import { bodyEditDowngradesFormat, getEntryNote, isNoteEditable, MAX_ENTRY_NOTE_CHARS } from "../types";
 import {
     formatSensitivePreview,
     getConciseTime,
@@ -725,6 +725,13 @@ const ClipboardItem = ({
     bodyEditError,
     onBodyEditSave,
     onBodyEditCancel,
+    onEditNote,
+    isEditingNote = false,
+    noteInitialDraft,
+    noteEditSaving = false,
+    noteEditError,
+    onNoteEditSave,
+    onNoteEditCancel,
     aiEnabled,
     aiOptionsOpen,
     onAIOptionsToggle,
@@ -751,6 +758,12 @@ const ClipboardItem = ({
      */
     const [bodyDraft, setBodyDraft] = useState<string>(() => bodyInitialDraft ?? "");
     const bodyEditorOpen = isEditingBody && !!onBodyEditSave;
+    /**
+     * R11: draft of the note editor, seeded from `noteInitialDraft` when the dialog
+     * opens — same lifecycle as `bodyDraft`, so a discarded draft never comes back.
+     */
+    const [noteDraft, setNoteDraft] = useState<string>(() => noteInitialDraft ?? "");
+    const noteEditorOpen = isEditingNote && !!onNoteEditSave;
     const noteText = getEntryNote(item);
     const noteIsEmpty = noteText.trim().length === 0;
     const bodyEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1260,6 +1273,20 @@ const ClipboardItem = ({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [bodyEditorOpen, bodyInitialDraft]);
 
+    /**
+     * R11: seed the note draft when the note editor opens. `item.note` is the source of
+     * truth; the hook passes the same value in `noteInitialDraft` so the draft and the
+     * row cannot disagree at open time.
+     */
+    useEffect(() => {
+        if (!noteEditorOpen) return;
+        setNoteDraft(noteInitialDraft ?? getEntryNote(item));
+        // Same reason as the body editor: the dialog is portalled to <body> and would
+        // otherwise sit under the hover preview.
+        void hideCompactPreview();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [noteEditorOpen, noteInitialDraft]);
+
     useEffect(() => {
         if (!compactPreviewEnabled) {
             void hideCompactPreview();
@@ -1731,6 +1758,142 @@ const ClipboardItem = ({
         );
     };
 
+    /**
+     * R11: close the note editor on Escape, from anywhere.
+     *
+     * Deliberately the same mechanism as the body editor above, for the same reasons:
+     * the dialog is portalled and focus can land on <body>, so a handler on the overlay
+     * would miss the key; and the capture phase is required because the app's global
+     * navigation hook reads Escape as "hide the window". The two editors are mutually
+     * exclusive per row, and each binds only while its own dialog is open.
+     */
+    useEffect(() => {
+        if (!noteEditorOpen) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                e.preventDefault();
+                onNoteEditCancel?.();
+            }
+        };
+        window.addEventListener('keydown', onKey, true);
+        return () => window.removeEventListener('keydown', onKey, true);
+    }, [noteEditorOpen, onNoteEditCancel]);
+
+    /**
+     * R11: note-only editor for content types whose body is not editable text.
+     *
+     * It reuses the body editor's portal, overlay and Escape/backdrop machinery but
+     * renders **no body field at all** — showing a textarea the back end would refuse to
+     * write would invite the user to lose work. Only rendered when the renderer hook
+     * supplied `onNoteEditSave`, which it does only for `image` / `file` / `video`.
+     */
+    const renderNoteEditor = () => {
+        if (!noteEditorOpen || !onNoteEditSave) return null;
+        const noteCharCount = Array.from(noteDraft).length;
+
+        return createPortal(
+            <div
+                className={`modal-overlay theme-${theme}`}
+                onClick={() => onNoteEditCancel?.()}
+                onMouseDown={(e) => e.stopPropagation()}
+                onContextMenu={(e) => e.stopPropagation()}
+            >
+                <div
+                    className="confirm-dialog entry-note-editor-dialog"
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ maxWidth: '520px', width: '100%' }}
+                >
+                    {/* TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳 */}
+                    <h3 style={{ margin: '0 0 12px 0', fontSize: '15px', fontWeight: 600 }}>
+                        编辑备注
+                    </h3>
+                    <textarea
+                        className="entry-note-editor-textarea"
+                        autoFocus
+                        value={noteDraft}
+                        maxLength={MAX_ENTRY_NOTE_CHARS}
+                        placeholder="为这条记录添加备注（可留空）"
+                        onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
+                        onFocus={() => invoke('activate_window_focus').catch(console.error)}
+                        onChange={(e) => setNoteDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                            e.stopPropagation();
+                            if (e.key === 'Escape') {
+                                e.preventDefault();
+                                onNoteEditCancel?.();
+                                return;
+                            }
+                            // Ctrl/Cmd+Enter saves, matching the body editor and the tag
+                            // manager; plain Enter stays a newline.
+                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !noteEditSaving) {
+                                e.preventDefault();
+                                onNoteEditSave(noteDraft);
+                            }
+                        }}
+                        style={{
+                            width: '100%',
+                            minHeight: '96px',
+                            marginBottom: '8px',
+                            padding: '12px',
+                            border: 'var(--input-border)',
+                            borderRadius: 'var(--input-radius)',
+                            background: 'var(--bg-input)',
+                            boxShadow: 'var(--input-shadow)',
+                            color: 'var(--text-primary)',
+                            fontFamily: 'inherit',
+                            fontSize: '13px',
+                            lineHeight: 1.55,
+                            outline: 'none',
+                            resize: 'vertical',
+                            boxSizing: 'border-box'
+                        }}
+                    />
+                    <div
+                        className="entry-note-editor-meta"
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: '8px',
+                            marginBottom: '10px',
+                            fontSize: '11px',
+                            color: 'var(--text-secondary)'
+                        }}
+                    >
+                        <span>清空输入框即可删除备注</span>
+                        <span>{noteCharCount} / {MAX_ENTRY_NOTE_CHARS}</span>
+                    </div>
+                    {noteEditError && (
+                        <div
+                            className="entry-note-editor-error"
+                            style={{ marginBottom: '10px', fontSize: '12px', color: 'var(--accent-color)' }}
+                        >
+                            {noteEditError}
+                        </div>
+                    )}
+                    <div className="confirm-dialog-buttons">
+                        <button
+                            className="confirm-dialog-button"
+                            disabled={noteEditSaving}
+                            onClick={() => onNoteEditCancel?.()}
+                        >
+                            {t('cancel')}
+                        </button>
+                        <button
+                            className="confirm-dialog-button primary"
+                            disabled={noteEditSaving}
+                            onClick={() => onNoteEditSave(noteDraft)}
+                        >
+                            {t('save')}
+                        </button>
+                    </div>
+                </div>
+            </div>,
+            document.body
+        );
+    };
+
     return (
         <motion.div
             ref={itemRef}
@@ -1901,6 +2064,18 @@ const ClipboardItem = ({
                                 title={t('edit_item') || '编辑条目内容'}
                             >
                                 <Pencil size={12} />
+                            </button>
+                        )}
+                        {isNoteEditable(item.content_type) && onEditNote && (
+                            <button
+                                className={`btn-icon ${noteEditorOpen ? "active" : ""}`}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onEditNote(e);
+                                }}
+                                title="编辑备注"
+                            >
+                                <StickyNote size={12} />
                             </button>
                         )}
                         <button
@@ -2229,6 +2404,8 @@ const ClipboardItem = ({
             {/* R6: note is shown for every content type, above the tag chips. */}
             {!noteIsEmpty && renderNote()}
             {renderBodyEditor()}
+            {/* R11: binary rows get the note-only editor instead of the body one. */}
+            {renderNoteEditor()}
         </motion.div >
     );
 };
@@ -2257,6 +2434,16 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.bodyEditError === nextProps.bodyEditError &&
         !!prevProps.onEdit === !!nextProps.onEdit &&
         !!prevProps.onBodyEditSave === !!nextProps.onBodyEditSave &&
+        // R11: the same trap as R10. `onEditNote` / `noteInitialDraft` / `noteEditError` /
+        // `noteEditSaving` / `isEditingNote` all flip on the parent while `item` stays
+        // referentially identical, so omitting any of them freezes a stale row: the note
+        // dialog would never appear, never show a save error, or keep a discarded draft.
+        prevProps.isEditingNote === nextProps.isEditingNote &&
+        prevProps.noteInitialDraft === nextProps.noteInitialDraft &&
+        prevProps.noteEditSaving === nextProps.noteEditSaving &&
+        prevProps.noteEditError === nextProps.noteEditError &&
+        !!prevProps.onEditNote === !!nextProps.onEditNote &&
+        !!prevProps.onNoteEditSave === !!nextProps.onNoteEditSave &&
         prevProps.isRevealed === nextProps.isRevealed &&
         prevProps.isEditingTags === nextProps.isEditingTags &&
         prevProps.isAIProcessing === nextProps.isAIProcessing &&
