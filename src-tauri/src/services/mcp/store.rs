@@ -296,20 +296,45 @@ impl McpStore {
 // MCP 服务自身使用的配置键（与其它 settings 项同一张表，前缀区分归属）
 // ---------------------------------------------------------------------------
 
-/// 服务开关，默认 `false`（关闭）。
+/// 服务开关，默认 [`DEFAULT_ENABLED`]。
 pub const KEY_ENABLED: &str = "mcp.enabled";
-/// 写操作开关，默认 `false`（只读）。
+/// 写操作开关，默认 [`DEFAULT_ALLOW_WRITE`]。
 pub const KEY_ALLOW_WRITE: &str = "mcp.allow_write";
 /// 服务监听端口，默认 [`DEFAULT_PORT`]。
 pub const KEY_PORT: &str = "mcp.port";
-/// 启动时自动拉起服务，默认 `false`。
+/// 启动时自动拉起服务，默认 [`DEFAULT_AUTOSTART`]。
 pub const KEY_AUTOSTART: &str = "mcp.autostart";
-/// 鉴权 token。空值表示尚未生成，首次读取时生成。
+/// 鉴权 token。免鉴权模式下它依然存在，用户随时可以打开校验而不必重新生成。
 pub const KEY_TOKEN: &str = "mcp.token";
+/// 是否**强制**校验 token，默认 [`DEFAULT_REQUIRE_TOKEN`]。
+pub const KEY_REQUIRE_TOKEN: &str = "mcp.require_token";
+/// 是否允许局域网访问，默认 [`DEFAULT_ALLOW_LAN`]。
+pub const KEY_ALLOW_LAN: &str = "mcp.allow_lan";
 
-/// 默认端口。选固定端口是为了让用户能把 `http://127.0.0.1:39217/mcp` 写进
-/// MCP 客户端配置并长期有效；被占用时会自动向后试探（见 `bind_local_listener`）。
-pub const DEFAULT_PORT: u16 = 39217;
+// ---------------------------------------------------------------------------
+// 默认值：出厂姿态的唯一定义处
+// ---------------------------------------------------------------------------
+//
+// 默认姿态 = 开箱即用（服务开、可写、免鉴权、固定端口），但**只监听回环**。
+// 免鉴权只有在"外部机器根本连不上"时才成立，所以 `DEFAULT_ALLOW_LAN = false`
+// 是这一组默认值里唯一不能松的一项：用户要暴露到局域网，必须自己显式打开。
+//
+// 这些常量同时被 `mod.rs` 的读取函数与测试引用——改一个数字，对应的断言就会红。
+
+/// 服务默认开启。
+pub const DEFAULT_ENABLED: bool = true;
+/// 默认允许 AI 修改（全权限）。
+pub const DEFAULT_ALLOW_WRITE: bool = true;
+/// 默认随应用一起启动，否则"默认打开"只是设置里的一行字，服务并不会真的跑起来。
+pub const DEFAULT_AUTOSTART: bool = true;
+/// 默认不校验令牌（免鉴权）。
+pub const DEFAULT_REQUIRE_TOKEN: bool = false;
+/// 默认仅本机访问（绑回环）。
+pub const DEFAULT_ALLOW_LAN: bool = false;
+
+/// 默认端口。选固定端口是为了让用户能把 `http://127.0.0.1:23123/mcp` 写进
+/// MCP 客户端配置并长期有效；被占用时会自动向后试探（见 `bind_listener`）。
+pub const DEFAULT_PORT: u16 = 23123;
 
 #[cfg(test)]
 mod tests {
@@ -390,9 +415,43 @@ mod tests {
     #[test]
     fn settings_default_to_none_before_being_written() {
         let store = McpStore::in_memory();
-        // "读不到" 必须与 "读到 false" 区分开：前者由调用方兜底成关闭。
+        // 库里没写过这一项时读回 `None`：调用方据此套用默认值，而不是把"未设置"
+        // 当成"已设为 false"。
         assert!(store.setting(KEY_ENABLED).is_none());
         store.set_setting(KEY_ENABLED, "false").unwrap();
         assert_eq!(store.setting(KEY_ENABLED).as_deref(), Some("false"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 出厂默认姿态：逐项断言
+    // -----------------------------------------------------------------------
+    //
+    // 存在的唯一目的是**防回退**：这组数字是用户明确要求的开箱姿态，任何人把手
+    // 伸回"默认关 / 默认只读 / 默认强制令牌"的旧行为，这里立刻会红。
+    // 与之配对的是 `mod.rs` 里的 `defaults_survive_a_fresh_database`，那条走真
+    // 读函数（常量对但读取函数写死错值的情形也会被它抓住）。
+    #[test]
+    fn shipping_defaults_match_the_required_posture() {
+        assert!(DEFAULT_ENABLED, "默认必须开启服务");
+        assert!(DEFAULT_ALLOW_WRITE, "默认必须允许 AI 修改（全权限）");
+        assert!(DEFAULT_AUTOSTART, "默认必须随应用自动启动，否则“默认打开”落不了地");
+        assert!(!DEFAULT_REQUIRE_TOKEN, "默认必须免鉴权");
+        assert!(
+            !DEFAULT_ALLOW_LAN,
+            "默认必须只监听本机：免鉴权 + 局域网暴露是危险的组合"
+        );
+        assert_eq!(DEFAULT_PORT, 23123, "默认端口是用户指定的 23123");
+    }
+
+    #[test]
+    fn setting_keys_are_stable_strings() {
+        // 键名是前端与用户既有数据库之间的契约，改字符串等于丢弃用户已存的设置。
+        assert_eq!(KEY_ENABLED, "mcp.enabled");
+        assert_eq!(KEY_ALLOW_WRITE, "mcp.allow_write");
+        assert_eq!(KEY_PORT, "mcp.port");
+        assert_eq!(KEY_AUTOSTART, "mcp.autostart");
+        assert_eq!(KEY_TOKEN, "mcp.token");
+        assert_eq!(KEY_REQUIRE_TOKEN, "mcp.require_token");
+        assert_eq!(KEY_ALLOW_LAN, "mcp.allow_lan");
     }
 }

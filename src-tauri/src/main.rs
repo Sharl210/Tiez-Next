@@ -70,6 +70,8 @@ fn main() {
             app::commands::rename_tag_globally,
             app::commands::delete_tag_from_all,
             app::commands::create_new_tag,
+            app::commands::move_entry_to_tag,
+            app::commands::copy_entry_to_tag,
             app::commands::update_pinned_order,
             app::commands::get_db_count,
             app::commands::get_clipboard_content,
@@ -178,6 +180,8 @@ fn main() {
             services::mcp::get_mcp_status,
             services::mcp::set_mcp_server_enabled,
             services::mcp::set_mcp_allow_write,
+            services::mcp::set_mcp_require_token,
+            services::mcp::set_mcp_allow_lan,
             services::mcp::set_mcp_port,
             services::mcp::set_mcp_autostart,
             services::mcp::regenerate_mcp_token

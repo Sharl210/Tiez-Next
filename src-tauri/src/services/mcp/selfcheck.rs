@@ -49,13 +49,27 @@ struct Harness {
 }
 
 impl Harness {
+    /// 默认脚手架：**强制校验令牌**。
+    ///
+    /// selfcheck 关心的六条验收里有一条就是"无 token / 错 token 必须被拒"，因此
+    /// 这里默认走严格档；免鉴权档由 `new_open` 显式构造。
     fn new(allow_write: bool, token: &str) -> Self {
+        Self::new_with(allow_write, token, true)
+    }
+
+    /// 免鉴权档（出厂默认姿态）。
+    #[allow(dead_code)]
+    fn new_open(allow_write: bool, token: &str) -> Self {
+        Self::new_with(allow_write, token, false)
+    }
+
+    fn new_with(allow_write: bool, token: &str, require_token: bool) -> Self {
         let audit = Arc::new(RecordingAudit::default());
         let effects = Arc::new(NoopEffects::default());
         Self {
             state: ServerState {
                 store: McpStore::in_memory(),
-                token: AuthToken(Arc::new(token.to_string())),
+                token: AuthToken::new(Arc::new(token.to_string()), require_token),
                 settings: Arc::new(RuntimeSettings::new(allow_write)),
                 audit: audit.clone(),
                 effects: effects.clone(),
@@ -240,9 +254,31 @@ fn selfcheck_2_token_gate() {
     assert!(h.state.token.check(Some("right-token-plus")).is_err());
 
     // 未配置 token 时不得放行。
-    let unconfigured = AuthToken(Arc::new(String::new()));
+    let unconfigured = AuthToken::required(Arc::new(String::new()));
     assert!(unconfigured.check(Some("")).is_err());
     assert!(unconfigured.check(None).is_err());
+}
+
+#[test]
+fn selfcheck_2c_default_posture_is_open_but_the_gate_still_exists() {
+    // 出厂默认是免鉴权：无令牌请求必须通过。这是用户明确要求的开箱行为。
+    let open = Harness::new_open(false, "unused");
+    assert!(open.state.token.check(None).is_ok(), "默认姿态下无令牌必须通过");
+    assert!(open.state.token.check(Some("whatever")).is_ok());
+
+    // 但令牌能力没有被删掉：同一个 harness 打开开关就立刻收紧。
+    open.state.token.set_require_token(true);
+    assert!(open.state.token.check(None).is_err(), "开启后无令牌必须被拒");
+    assert!(open.state.token.check(Some("wrong")).is_err());
+    assert!(open.state.token.check(Some("unused")).is_ok());
+}
+
+#[test]
+fn selfcheck_2d_origin_is_checked_even_without_a_token() {
+    // 免鉴权只关掉令牌这一道门，不关 Origin 校验：DNS rebinding 防护是独立要求。
+    assert!(server::origin_allowed(None));
+    assert!(server::origin_allowed(Some("http://127.0.0.1:23123")));
+    assert!(!server::origin_allowed(Some("http://evil.example.com")));
 }
 
 #[test]
@@ -744,4 +780,276 @@ fn selfcheck_extra_helpers_are_not_dead_code() {
     let store = McpStore::in_memory();
     assert_eq!(store.repo.get_count().unwrap(), 0);
     assert_eq!(store.tag_repo.get_all_with_counts().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 7. 条目标签的移动与复制（v0.5 需求⑧⑨：人能操作的 MCP 也要支持）
+// ---------------------------------------------------------------------------
+
+/// 用原始 SQL 给一条条目挂上标签，绕过写入内核。
+///
+/// 目的是**独立于被测路径**构造初始状态。若用 `update_entry_tags` 来铺数据，
+/// "移动"的断言就变成拿共享内核去验证共享内核，测试会跟着同一个 bug 一起绿。
+fn seed_tags(store: &McpStore, id: i64, tags: &[&str]) {
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute("DELETE FROM entry_tags WHERE entry_id = ?", [id])
+            .unwrap();
+        for tag in tags {
+            conn.execute(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![id, tag],
+            )
+            .unwrap();
+        }
+        let json = serde_json::to_string(tags).unwrap();
+        conn.execute(
+            "UPDATE clipboard_history SET tags = ? WHERE id = ?",
+            rusqlite::params![json, id],
+        )
+        .unwrap();
+    }
+}
+
+/// 界面命令侧的移动/复制路径：与 `history_cmd::move_entry_to_tag` 的调用序列相同。
+///
+/// 刻意**重写一遍调用序列**而不是复用 MCP 的那段代码——否则就成了"自己和自己比"，
+/// 两条路径即使一起错也会判绿。序列：读旧集合 → 算新集合 → 共享内核落库 →
+/// 按敏感性翻转入队加解密 → 发变更事件。
+fn ui_transfer_path(
+    store: &McpStore,
+    effects: &NoopEffects,
+    id: i64,
+    from_tag: &str,
+    to_tag: &str,
+    kind: crate::services::clipboard_mutation::TagTransfer,
+) -> Result<(), String> {
+    use crate::services::clipboard_mutation::{apply_entry_tag_transfer, SensitiveTransition};
+    use crate::services::encryption_queue::EncryptionAction;
+
+    let transition = apply_entry_tag_transfer(&store.conn, &store.tag_repo, id, from_tag, to_tag, kind)?;
+    let action = match transition {
+        SensitiveTransition::Encrypt => Some(EncryptionAction::Encrypt),
+        SensitiveTransition::Decrypt => Some(EncryptionAction::Decrypt),
+        SensitiveTransition::None => None,
+    };
+    if let Some(action) = action {
+        effects.enqueue_encryption(id, matches!(action, EncryptionAction::Encrypt));
+    }
+    effects.emit_changed();
+    Ok(())
+}
+
+#[test]
+fn selfcheck_7_move_replaces_only_the_source_tag_and_leaves_the_others() {
+    let h = Harness::new(true, "t");
+    let id = seed_raw(&h.state.store, "要整理的条目", "text");
+    seed_tags(&h.state.store, id, &["工作", "待办", "重要"]);
+
+    let moved = h.ok(
+        "move_entry_to_tag",
+        json!({ "id": id, "fromTag": "工作", "toTag": "归档" }),
+    );
+
+    // 返回体自带前后集合，AI 不必再读一次。
+    assert_eq!(moved["mode"], "move");
+    assert_eq!(moved["tagsBefore"], json!(["工作", "待办", "重要"]));
+    let mut after: Vec<String> = moved["tagsAfter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    after.sort();
+    assert_eq!(
+        after,
+        // 码点序：归 < 待 < 重（Rust 的 `String` 排序是码点序，不是拼音序）。
+        vec!["归档".to_string(), "待办".to_string(), "重要".to_string()],
+        "只应替换源标签，其他标签必须原样留下"
+    );
+
+    // 库里的关联表与上面一致（`ORDER BY tag`）。
+    let mut raw = raw_entry_tags(&h.state.store, id);
+    raw.sort();
+    assert_eq!(
+        raw,
+        vec!["归档".to_string(), "待办".to_string(), "重要".to_string()]
+    );
+
+    // 冗余 JSON 列也必须同步，否则列表里的标签条带会和分组内容对不上。
+    let entry = h.state.store.entry(id).unwrap().unwrap();
+    let mut json_tags = entry.tags.clone();
+    json_tags.sort();
+    assert_eq!(json_tags, raw);
+}
+
+#[test]
+fn selfcheck_7b_copy_keeps_the_source_and_adds_the_target() {
+    let h = Harness::new(true, "t");
+    let id = seed_raw(&h.state.store, "要复制的条目", "text");
+    seed_tags(&h.state.store, id, &["工作"]);
+
+    let copied = h.ok(
+        "copy_entry_to_tag",
+        json!({ "id": id, "fromTag": "工作", "toTag": "归档" }),
+    );
+    assert_eq!(copied["mode"], "copy");
+    assert_eq!(copied["tagsBefore"], json!(["工作"]));
+
+    let mut after: Vec<String> = copied["tagsAfter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    after.sort();
+    assert_eq!(after, vec!["工作".to_string(), "归档".to_string()]);
+
+    // 再复制一次不得产生重复行。
+    h.ok(
+        "copy_entry_to_tag",
+        json!({ "id": id, "fromTag": "工作", "toTag": "归档" }),
+    );
+    let raw = raw_entry_tags(&h.state.store, id);
+    assert_eq!(raw.len(), 2, "重复复制不应堆积重复标签：{:?}", raw);
+}
+
+#[test]
+fn selfcheck_7c_move_and_copy_are_the_same_two_paths() {
+    // MCP 与界面命令各做一次同样的移动，落库结果必须逐字节一致。
+    let mcp = Harness::new(true, "t");
+    let mcp_id = seed_raw(&mcp.state.store, "same payload", "text");
+    seed_tags(&mcp.state.store, mcp_id, &["A", "C"]);
+
+    let ui_effects = Arc::new(NoopEffects::default());
+    let ui_store = McpStore::in_memory();
+    let ui_id = seed_raw(&ui_store, "same payload", "text");
+    seed_tags(&ui_store, ui_id, &["A", "C"]);
+
+    mcp.ok(
+        "move_entry_to_tag",
+        json!({ "id": mcp_id, "fromTag": "A", "toTag": "B" }),
+    );
+    ui_transfer_path(
+        &ui_store,
+        ui_effects.as_ref(),
+        ui_id,
+        "A",
+        "B",
+        crate::services::clipboard_mutation::TagTransfer::Move,
+    )
+    .expect("界面路径应成功");
+
+    assert_eq!(
+        raw_entry_state(&mcp.state.store, mcp_id),
+        raw_entry_state(&ui_store, ui_id),
+        "MCP 与界面命令的落库结果必须一致"
+    );
+    assert_eq!(
+        raw_entry_tags(&mcp.state.store, mcp_id),
+        raw_entry_tags(&ui_store, ui_id),
+        "关联表也必须一致——这正是绕过共享内核会漏掉的部分"
+    );
+    assert_eq!(
+        raw_entry_tags(&mcp.state.store, mcp_id),
+        vec!["B".to_string(), "C".to_string()]
+    );
+
+    // 两条路径都必须发一次变更事件。
+    assert_eq!(mcp.effects.changed.load(Ordering::SeqCst), 1);
+    assert_eq!(ui_effects.changed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn selfcheck_7d_moving_onto_a_sensitive_tag_encrypts_like_the_ui_command() {
+    // 副作用一致性的关键一条：把一条明文条目"移动"到敏感标签上，必须触发加密，
+    // 且两条路径的加解密请求完全相同。否则会出现"标着敏感、数据却是明文"。
+    let body = "moving-into-sensitive";
+
+    let mcp = Harness::new(true, "t");
+    let mcp_id = seed_raw(&mcp.state.store, body, "text");
+    seed_tags(&mcp.state.store, mcp_id, &["普通"]);
+
+    let ui_effects = Arc::new(NoopEffects::default());
+    let ui_store = McpStore::in_memory();
+    let ui_id = seed_raw(&ui_store, body, "text");
+    seed_tags(&ui_store, ui_id, &["普通"]);
+
+    let moved = mcp.ok(
+        "move_entry_to_tag",
+        json!({ "id": mcp_id, "fromTag": "普通", "toTag": "sensitive" }),
+    );
+    assert_eq!(moved["sensitivityChanged"], true);
+    ui_transfer_path(
+        &ui_store,
+        ui_effects.as_ref(),
+        ui_id,
+        "普通",
+        "sensitive",
+        crate::services::clipboard_mutation::TagTransfer::Move,
+    )
+    .unwrap();
+
+    let mcp_jobs = mcp.effects.encryptions.lock().unwrap().clone();
+    let ui_jobs = ui_effects.encryptions.lock().unwrap().clone();
+    assert_eq!(mcp_jobs, vec![(mcp_id, true)], "移动到敏感标签必须请求加密");
+    assert_eq!(
+        mcp_jobs.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+        ui_jobs.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+        "两条路径的加解密方向必须一致"
+    );
+
+    // 反向：把敏感标签移走，必须请求解密。
+    let away = mcp.ok(
+        "move_entry_to_tag",
+        json!({ "id": mcp_id, "fromTag": "sensitive", "toTag": "普通" }),
+    );
+    assert_eq!(away["sensitivityChanged"], true);
+    assert_eq!(
+        mcp.effects.encryptions.lock().unwrap().clone(),
+        vec![(mcp_id, true), (mcp_id, false)],
+        "移出敏感标签必须请求解密"
+    );
+
+    // 复制（而非移动）到敏感标签同样要加密——否则"复制到敏感标签"就成了绕过加密的后门。
+    let h2 = Harness::new(true, "t");
+    let id2 = seed_raw(&h2.state.store, "copy-into-sensitive", "text");
+    seed_tags(&h2.state.store, id2, &["普通"]);
+    let copied = h2.ok(
+        "copy_entry_to_tag",
+        json!({ "id": id2, "fromTag": "普通", "toTag": "密码" }),
+    );
+    assert_eq!(copied["sensitivityChanged"], true);
+    assert_eq!(h2.effects.encryptions.lock().unwrap().clone(), vec![(id2, true)]);
+}
+
+#[test]
+fn selfcheck_7e_missing_entry_is_reported_by_transfer_tools() {
+    let h = Harness::new(true, "t");
+    for tool in ["move_entry_to_tag", "copy_entry_to_tag"] {
+        let response = h.call(tool, json!({ "id": 999, "fromTag": "a", "toTag": "b" }));
+        let result = response.result.expect("应产生 result");
+        assert_eq!(result["isError"], true, "{} 对不存在条目必须报错", tool);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("不存在"));
+    }
+}
+
+#[test]
+fn selfcheck_7f_transfer_tools_are_declared_write_and_readonly_is_enforced() {
+    // 工具必须是 Write 分类（否则只读模式下会被放行），并且只读模式下确实被拒。
+    for name in ["move_entry_to_tag", "copy_entry_to_tag"] {
+        let spec = tools::find(name).unwrap_or_else(|| panic!("清单里缺少 {}", name));
+        assert_eq!(spec.access, tools::Access::Write, "{} 必须是写工具", name);
+        assert!(!spec.destructive, "{} 不是破坏性操作，不该要求 confirm", name);
+    }
+
+    let h = Harness::new(false, "t");
+    for name in ["move_entry_to_tag", "copy_entry_to_tag"] {
+        let response = h.call(name, json!({ "id": 1, "fromTag": "a", "toTag": "b" }));
+        let error = response.error.expect("只读模式必须拒绝");
+        assert!(error.message.contains("禁用") || error.message.contains("只读"));
+    }
 }

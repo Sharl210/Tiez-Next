@@ -4,8 +4,10 @@
 //!
 //! MCP 规范提供 stdio 与 Streamable HTTP 两种传输。本项目**只能用进程内 HTTP**：
 //! `main.rs` 装了 `tauri-plugin-single-instance`，stdio 会被单实例插件与宿主进程
-//! 的父子关系搅在一起，客户端拿不到稳定通道。因此这里实现 Streamable HTTP，
-//! 且**只绑 127.0.0.1**。
+//! 的父子关系搅在一起，客户端拿不到稳定通道。因此这里实现 Streamable HTTP。
+//!
+//! 监听地址由 `mcp.allow_lan` 决定：默认 `false` 只绑 `127.0.0.1`；显式打开后
+//! 绑 `0.0.0.0`，同网段其它机器即可访问（见 [`bind_listener`]）。
 //!
 //! # 规范落点
 //!
@@ -55,22 +57,74 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 服务名，会出现在 `serverInfo.name` 里。
 pub const SERVER_NAME: &str = "tiez-next";
 
-/// 静态鉴权令牌。空字符串表示"鉴权未配置"，此时服务拒绝一切访问而不是放行。
+/// 静态鉴权令牌，附带一个**运行时**的"是否强制校验"开关。
+///
+/// `require_token = false`（出厂默认）表示免鉴权模式：任何请求都通过。
+///
+/// # 为什么免鉴权是默认值，而不是把令牌功能删掉
+///
+/// 出厂默认是"只监听回环 + 免鉴权"，也就是本机上任何进程都能连——这是用户明确
+/// 要求的开箱体验。把令牌保留成可选项（而不是删代码）的理由是：用户一旦打开
+/// `mcp.allow_lan`，就**必须**有办法立刻把校验加回来，否则局域网暴露没有任何
+/// 补救手段。因此令牌的生成、展示、重生成能力全部保留。
+///
+/// 开关用原子量而不是普通字段：用户打开强制校验时应当**立刻**生效，不必先把
+/// 服务停掉再启动——正在被外部机器连着的服务恰恰是最需要马上收紧的时刻。
 #[derive(Clone)]
-pub struct AuthToken(pub Arc<String>);
+pub struct AuthToken {
+    secret: Arc<String>,
+    require_token: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl AuthToken {
+    /// 按开关构造。`require_token = false` 得到免鉴权实例。
+    pub fn new(secret: Arc<String>, require_token: bool) -> Self {
+        Self {
+            secret,
+            require_token: Arc::new(std::sync::atomic::AtomicBool::new(require_token)),
+        }
+    }
+
+    /// 构造一个"必须校验"的令牌（最严格的用法，测试与内部工具使用）。
+    pub fn required(secret: Arc<String>) -> Self {
+        Self::new(secret, true)
+    }
+
+    /// 免鉴权实例（默认姿态与测试使用）。
+    pub fn disabled() -> Self {
+        Self::new(Arc::new(String::new()), false)
+    }
+
+    /// 当前是否强制校验。
+    pub fn requires_token(&self) -> bool {
+        self.require_token.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 运行时切换强制校验。
+    pub fn set_require_token(&self, value: bool) {
+        self.require_token
+            .store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 令牌明文。免鉴权模式下它依然存在，用户随时可以打开校验而不必重新生成。
+    pub fn secret(&self) -> &str {
+        self.secret.as_str()
+    }
+
     /// 校验请求携带的令牌。
     ///
-    /// 三种失败分开回报，便于用户一眼看出是"没配"还是"配错"：
-    /// 未配置、缺令牌、令牌不匹配。
+    /// 校验关闭时直接放行；开启时三种失败分开回报，便于用户一眼看出是"没配"
+    /// 还是"配错"：未配置、缺令牌、令牌不匹配。
     pub fn check(&self, provided: Option<&str>) -> Result<(), String> {
-        if self.0.is_empty() {
+        if !self.requires_token() {
+            return Ok(());
+        }
+        if self.secret.is_empty() {
             return Err("服务端未配置访问令牌，服务不可用".to_string());
         }
         match provided {
             None => Err("缺少访问令牌".to_string()),
-            Some(value) if !constant_time_eq(value.as_bytes(), self.0.as_bytes()) => {
+            Some(value) if !constant_time_eq(value.as_bytes(), self.secret.as_bytes()) => {
                 Err("访问令牌不正确".to_string())
             }
             Some(_) => Ok(()),
@@ -624,26 +678,56 @@ fn type_matches(expected: &str, given: &Value) -> bool {
     }
 }
 
-/// 绑定本地监听器。
+/// 按 `mcp.allow_lan` 决定监听地址。
 ///
-/// 端口策略：**固定端口 + 顺序回退**，理由在报告里展开；这里实现为"从首选端口
-/// 向后找到第一个可用端口，全都被占则回落到系统分配的临时端口（port 0）"。
-/// 无论走哪条分支，**始终绑定 127.0.0.1**，不会监听外部网卡。
-pub async fn bind_local_listener(preferred: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
-    let mut port = if preferred == 0 { super::store::DEFAULT_PORT } else { preferred };
+/// * `false`（出厂默认）→ `127.0.0.1`：只有本机能连。
+/// * `true` → `0.0.0.0`：**同网段任何机器都能连**，界面必须把这一点讲清楚。
+pub fn listen_ip(allow_lan: bool) -> Ipv4Addr {
+    if allow_lan {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::LOCALHOST
+    }
+}
+
+/// 绑定监听器。
+///
+/// 端口策略：**固定端口 + 顺序回退**——"从首选端口向后找到第一个可用端口，全都
+/// 被占则回落到系统分配的临时端口（port 0）"。绑定地址由 `allow_lan` 决定，
+/// 不硬编码：默认只绑回环，用户显式打开局域网后才绑 `0.0.0.0`。
+///
+/// 回退只在**同一地址族**内进行：`0.0.0.0` 段被占用与"本机端口被占用"是两件
+/// 事，混着试探会让用户看到与设置里填的地址不符的结果。
+pub async fn bind_listener(
+    preferred: u16,
+    allow_lan: bool,
+) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let ip = listen_ip(allow_lan);
+    let mut port = if preferred == 0 {
+        super::store::DEFAULT_PORT
+    } else {
+        preferred
+    };
     loop {
-        let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let addr = std::net::SocketAddr::from((ip, port));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => return Ok((listener, port)),
             Err(_) if port < 65535 => port += 1,
             Err(_) => {
-                let listener =
-                    tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16)).await?;
+                let listener = tokio::net::TcpListener::bind((ip, 0u16)).await?;
                 let actual = listener.local_addr()?.port();
                 return Ok((listener, actual));
             }
         }
     }
+}
+
+/// 只绑本机的绑定（`allow_lan = false` 的简写）。
+///
+/// 保留这个名字是因为"绑本机"是一个独立、常见且安全含义明确的动作；调用方读它
+/// 时不必先在心里把 `false` 翻译成"回环"。
+pub async fn bind_local_listener(preferred: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    bind_listener(preferred, false).await
 }
 
 /// 启动 axum 服务。
@@ -668,11 +752,24 @@ mod tests {
         }
     }
 
+    /// 默认测试状态：**强制校验令牌**。
+    ///
+    /// 刻意让绝大多数既有用例继续跑在"必须带令牌"的姿态下：这样鉴权一旦被人
+    /// 顺手关掉，受影响的用例会集中变红，而不是静默放行。
     fn test_state(allow_write: bool, token: &str) -> (ServerState, Arc<CollectingAudit>) {
+        test_state_with(allow_write, token, true)
+    }
+
+    /// 显式指定"是否强制校验令牌"的构造。
+    fn test_state_with(
+        allow_write: bool,
+        token: &str,
+        require_token: bool,
+    ) -> (ServerState, Arc<CollectingAudit>) {
         let audit = Arc::new(CollectingAudit(std::sync::Mutex::new(Vec::new())));
         let state = ServerState {
             store: McpStore::in_memory(),
-            token: AuthToken(Arc::new(token.to_string())),
+            token: AuthToken::new(Arc::new(token.to_string()), require_token),
             settings: Arc::new(RuntimeSettings::new(allow_write)),
             audit: audit.clone(),
             effects: Arc::new(NoopEffects::default()),
@@ -708,15 +805,56 @@ mod tests {
 
     #[test]
     fn token_gate_reports_each_failure_separately() {
-        let token = AuthToken(Arc::new("secret".to_string()));
+        let token = AuthToken::required(Arc::new("secret".to_string()));
         assert!(token.check(Some("secret")).is_ok());
         assert!(token.check(None).is_err());
         assert!(token.check(Some("wrong")).is_err());
-        let empty = AuthToken(Arc::new(String::new()));
+        let empty = AuthToken::required(Arc::new(String::new()));
         assert!(
             empty.check(Some("")).is_err(),
             "未配置令牌时必须拒绝而不是放行"
         );
+    }
+
+    // ---------------- 免鉴权（出厂默认姿态） ----------------
+
+    #[test]
+    fn token_gate_is_off_when_not_required() {
+        // 免鉴权 = 校验整体关闭：无令牌、错令牌、空令牌都必须通过。这不是"漏了
+        // 一个分支"，而是用户明确要求的默认行为。
+        let open = AuthToken::new(Arc::new("secret".to_string()), false);
+        assert!(!open.requires_token());
+        assert!(open.check(None).is_ok(), "免鉴权时无令牌必须通过");
+        assert!(open.check(Some("wrong")).is_ok(), "免鉴权时不比对令牌");
+        assert!(open.check(Some("")).is_ok());
+
+        // 出厂默认就是这一档。
+        assert!(!AuthToken::disabled().requires_token());
+    }
+
+    #[test]
+    fn token_gate_can_be_turned_on_at_runtime() {
+        // 打开的瞬间必须立刻生效：正在被外部机器连着的服务，收紧权限不能等重启。
+        let token = AuthToken::new(Arc::new("secret".to_string()), false);
+        assert!(token.check(None).is_ok());
+
+        token.set_require_token(true);
+        assert!(token.requires_token());
+        assert!(token.check(None).is_err(), "开启后无令牌必须被拒");
+        assert!(token.check(Some("wrong")).is_err());
+        assert!(token.check(Some("secret")).is_ok(), "正确令牌仍应通过");
+
+        // 关回去也要立刻生效。
+        token.set_require_token(false);
+        assert!(token.check(None).is_ok());
+    }
+
+    #[test]
+    fn secret_survives_the_switch() {
+        // 免鉴权不等于把令牌删掉：用户打开校验时应当拿到原本那把钥匙，
+        // 而不是面对一个空串（那会变成"谁都不许连"）。
+        let token = AuthToken::new(Arc::new("keep-me".to_string()), false);
+        assert_eq!(token.secret(), "keep-me");
     }
 
     #[test]
@@ -1008,7 +1146,7 @@ mod tests {
             .contains("不存在"));
     }
 
-    // ---------------- 端口绑定 ----------------
+    // ---------------- 端口绑定与监听地址 ----------------
 
     #[tokio::test]
     async fn binds_to_loopback_only_with_fallback() {
@@ -1021,6 +1159,79 @@ mod tests {
         let (second, port_b) = bind_local_listener(port_a).await.unwrap();
         assert_ne!(port_a, port_b);
         assert!(second.local_addr().unwrap().ip().is_loopback());
+    }
+
+    /// 真绑定一个 socket，断言不同设置下**实际**落在哪个地址上。
+    ///
+    /// 只看 `listen_ip()` 的返回值不够：绑定函数完全可能拿到正确的 IP 又把它丢掉。
+    /// 这里读的是 `local_addr()`，也就是内核实际接受的地址。
+    ///
+    /// 端口刻意用显式的高位端口，**不碰 `DEFAULT_PORT`**：`bind_listener(0, ..)`
+    /// 的语义是"占用默认端口"，本测试若把 23123 拿在手里不放，就会把
+    /// `binds_to_loopback_only_with_fallback` 挤到 23124 上去（测试并行运行，
+    /// 顺序不可控）。占用默认端口是那条测试的职责，不该由这里代劳。
+    #[tokio::test]
+    async fn binding_address_follows_the_lan_switch() {
+        // 默认：仅本机。
+        let (loopback, _port_local) = bind_listener(45_231, false).await.expect("应能绑定");
+        assert_eq!(
+            loopback.local_addr().unwrap().ip(),
+            std::net::Ipv4Addr::LOCALHOST,
+            "allow_lan=false 必须绑 127.0.0.1"
+        );
+        assert!(loopback.local_addr().unwrap().ip().is_loopback());
+
+        // 打开局域网：绑 0.0.0.0，同网段其它机器可连。
+        let (any, port_any) = bind_listener(45_233, true).await.expect("应能绑定 0.0.0.0");
+        assert_eq!(
+            any.local_addr().unwrap().ip(),
+            std::net::Ipv4Addr::UNSPECIFIED,
+            "allow_lan=true 必须绑 0.0.0.0"
+        );
+        assert!(
+            !any.local_addr().unwrap().ip().is_loopback(),
+            "0.0.0.0 不是回环地址"
+        );
+
+        // 回退逻辑在两种地址下都要工作：占用刚拿到的端口，再要一个应换到别处，
+        // 且**回退不得改变监听地址**。
+        let (fallback, port_fallback) = bind_listener(port_any, true).await.expect("应能回退");
+        assert_ne!(port_any, port_fallback, "端口被占用时应回退到下一个");
+        assert_eq!(
+            fallback.local_addr().unwrap().ip(),
+            std::net::Ipv4Addr::UNSPECIFIED,
+            "回退不得改变监听地址"
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_binding_is_reachable_on_the_external_interface() {
+        // 这条是"局域网真的能连"的证据：连的是本机在外部网卡上的地址，而不是
+        // 回环别名。若实现绑成 127.0.0.1，这里的连接会失败——那正是用户报
+        // "局域网连不上"时最容易忽略的一种"看起来设置开了其实没绑对"。
+        let Ok(external_ip) = local_ip_address::local_ip() else {
+            // 无外网卡的环境（例如纯容器）跳过：这是环境限制，不是实现缺陷。
+            return;
+        };
+        if external_ip.is_loopback() {
+            return;
+        }
+
+        // 同样不占用 `DEFAULT_PORT`，理由见 `binding_address_follows_the_lan_switch`。
+        let (listener, port) = bind_listener(45_235, true).await.expect("应能绑定 0.0.0.0");
+        let (state, _) = test_state_with(false, "unused", false);
+        let handle = tokio::spawn(serve(listener, state));
+
+        let url = format!("http://{}:{}/mcp", external_ip, port);
+        let response = reqwest::Client::new()
+            .post(&url)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+            .send()
+            .await;
+        handle.abort();
+
+        let response = response.expect("经由外部网卡地址应能连上服务");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
     #[test]
@@ -1129,9 +1340,126 @@ mod tests {
         handle.abort();
     }
 
+    /// 免鉴权模式下的真实 HTTP 往返。
+    ///
+    /// 这是"默认无鉴权"这件事在**传输层**的证据：完全没有 `x-mcp-token` 头的
+    /// 请求必须拿到 200 与合法结果。只断言 `AuthToken::check` 是不够的——门后的
+    /// handler 或中间件完全可能另有一道校验，而用户感知到的恰恰是 socket 层的结果。
+    #[tokio::test]
+    async fn anonymous_http_request_is_accepted_when_token_is_not_required() {
+        let (state, _) = test_state_with(true, "generated-but-unused", false);
+        // 用高位端口，不占用 `DEFAULT_PORT`（理由见 `binding_address_follows_the_lan_switch`）。
+        let (listener, port) = bind_listener(45_237, false).await.expect("应能绑定本机端口");
+        let handle = tokio::spawn(serve(listener, state));
+        let base = format!("http://127.0.0.1:{}/mcp", port);
+        let client = reqwest::Client::new();
+
+        // (1) 一个头都不带的 initialize → 200 且是合法结果。
+        let response = client
+            .post(&base)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "anonymous-probe", "version": "1.0.0"}
+                }
+            }))
+            .send()
+            .await
+            .expect("免鉴权时请求应到达服务");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "免鉴权时无令牌请求必须被接受"
+        );
+        let body: Value = response.json().await.expect("响应应是 JSON");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["result"]["protocolVersion"], PROTOCOL_VERSION);
+
+        // (2) 带上一个**错误的**令牌同样放行：免鉴权是不比对，不是"比对了但宽松"。
+        let with_wrong_token = client
+            .post(&base)
+            .header("x-mcp-token", "definitely-not-the-token")
+            .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .send()
+            .await
+            .expect("请求应到达服务");
+        assert_eq!(with_wrong_token.status(), reqwest::StatusCode::OK);
+
+        // (3) 关掉鉴权不代表关掉 Origin 校验：DNS rebinding 防护与令牌是两件事。
+        let bad_origin = client
+            .post(&base)
+            .header("Origin", "https://evil.example.com")
+            .json(&json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"}))
+            .send()
+            .await
+            .expect("请求应到达服务");
+        assert_eq!(
+            bad_origin.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "免鉴权不得连带放开 Origin 校验"
+        );
+
+        handle.abort();
+    }
+
+    /// 打开强制校验后，同一条无令牌请求必须被拒。
+    ///
+    /// 与上一条配对：证明"免鉴权"不是把校验代码删了，而是确实还存在、且能立刻
+    /// 生效。两扇门用同一个端口启动，差别只在 `require_token` 这一个布尔。
+    #[tokio::test]
+    async fn anonymous_http_request_is_rejected_when_token_is_required() {
+        let (state, _) = test_state_with(true, "real-token", true);
+        // 用高位端口，不占用 `DEFAULT_PORT`（理由见 `binding_address_follows_the_lan_switch`）。
+        let (listener, port) = bind_listener(45_239, false).await.expect("应能绑定本机端口");
+        let handle = tokio::spawn(serve(listener, state));
+        let base = format!("http://127.0.0.1:{}/mcp", port);
+        let client = reqwest::Client::new();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+
+        // (1) 无令牌 → 401。
+        let anonymous = client
+            .post(&base)
+            .json(&payload)
+            .send()
+            .await
+            .expect("请求应到达服务");
+        assert_eq!(
+            anonymous.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "开启校验后无令牌请求必须被拒"
+        );
+
+        // (2) 错令牌 → 401。
+        let wrong = client
+            .post(&base)
+            .header("x-mcp-token", "wrong")
+            .json(&payload)
+            .send()
+            .await
+            .expect("请求应到达服务");
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // (3) 正确令牌 → 200。
+        let correct = client
+            .post(&base)
+            .header("x-mcp-token", "real-token")
+            .json(&payload)
+            .send()
+            .await
+            .expect("请求应到达服务");
+        assert_eq!(correct.status(), reqwest::StatusCode::OK);
+
+        handle.abort();
+    }
+
     /// 供外部 `curl` 验证的监听窗口。
     ///
-    /// 默认不跑（`#[ignore]`）；显式执行时在 127.0.0.1:39217 上服务约 60 秒，
+    /// 默认不跑（`#[ignore]`）；显式执行时在 127.0.0.1:23123 上服务约 60 秒，
     /// 让另一个进程用真实 HTTP 客户端打进来，随后自行结束——**不留常驻监听**。
     #[tokio::test]
     #[ignore = "开一个 60 秒的本地监听窗口供外部 curl 验证，默认不跑"]
