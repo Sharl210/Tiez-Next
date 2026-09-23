@@ -260,6 +260,16 @@ pub fn get_all_tags_info(
     state.tag_repo.get_all_with_counts().map_err(AppError::from)
 }
 
+/// 标签及其排序用统计量（最近使用时间、总字节数等）。
+///
+/// 与 `get_all_tags_info` 并存：后者返回的 `name -> count` 形状仍被多处使用。
+#[tauri::command]
+pub fn get_tag_stats(
+    state: State<'_, DbState>,
+) -> AppResult<Vec<crate::infrastructure::repository::tag_repo::TagStats>> {
+    state.tag_repo.get_all_with_stats().map_err(AppError::from)
+}
+
 #[tauri::command]
 pub fn rename_tag_globally(
     state: State<'_, DbState>,

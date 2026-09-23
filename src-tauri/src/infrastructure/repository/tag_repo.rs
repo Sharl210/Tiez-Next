@@ -9,12 +9,34 @@ pub trait TagRepository {
     fn set_color(&self, name: &str, color: Option<String>) -> Result<(), String>;
     fn get_colors(&self) -> Result<HashMap<String, String>, String>;
     fn get_all_with_counts(&self) -> Result<HashMap<String, i32>, String>;
+    /// 标签及其可用于排序的统计量。
+    ///
+    /// 与 [`Self::get_all_with_counts`] 并存而不是替换它：那个返回的
+    /// `name -> count` 形状已被多处调用方依赖，改签名会牵动无关代码。
+    fn get_all_with_stats(&self) -> Result<Vec<TagStats>, String>;
     fn create(&self, name: &str) -> Result<(), String>;
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), String>;
     fn delete_globally(&self, name: &str, data_dir: Option<&std::path::Path>)
         -> Result<(), String>;
     fn get_entries_by_tag(&self, tag: &str) -> Result<Vec<ClipboardEntry>, String>;
     fn update_entry_tags(&self, id: i64, tags: Vec<String>) -> Result<(), String>;
+}
+
+/// 一个标签的统计量，供界面排序使用。
+///
+/// 这些字段全部能从既有数据推导，不需要新增数据库列：
+/// * `count` 来自 `entry_tags` 的行数；
+/// * `last_used_at` 来自该标签所关联条目的**最大时间戳**（毫秒）；
+/// * `total_bytes` 是该标签所关联条目的正文长度之和——用来区分"少量长文本"与
+///   "大量短文本"，单看条数看不出来。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagStats {
+    pub name: String,
+    pub count: i32,
+    /// 最近一次使用（该标签关联条目的最大 `timestamp`）。无关联条目时为 0。
+    pub last_used_at: i64,
+    /// 关联条目的正文长度之和。
+    pub total_bytes: i64,
 }
 
 pub struct SqliteTagRepository {
@@ -134,6 +156,60 @@ impl TagRepository for SqliteTagRepository {
         }
 
         Ok(tag_counts)
+    }
+
+    fn get_all_with_stats(&self) -> Result<Vec<TagStats>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        // 一次 join 取齐三个量。`LEFT JOIN` 让"有颜色但还没条目的标签"也出现，
+        // 否则它们在界面上会凭空消失（与 `get_all_with_counts` 的行为保持一致）。
+        let mut stats: HashMap<String, TagStats> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT et.tag, COUNT(h.id), COALESCE(MAX(h.timestamp), 0), \
+                            COALESCE(SUM(LENGTH(h.content)), 0) \
+                     FROM entry_tags et \
+                     LEFT JOIN clipboard_history h ON h.id = et.entry_id \
+                     GROUP BY et.tag",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.flatten() {
+                let (name, count, last_used_at, total_bytes) = row;
+                stats.insert(
+                    name.clone(),
+                    TagStats { name, count, last_used_at, total_bytes },
+                );
+            }
+        }
+
+        // 只有颜色、尚无条目的标签也要列出来。
+        let mut stmt_saved = conn
+            .prepare("SELECT name FROM saved_tags")
+            .map_err(|e| e.to_string())?;
+        let saved_rows = stmt_saved
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for name in saved_rows.flatten() {
+            stats.entry(name.clone()).or_insert(TagStats {
+                name,
+                count: 0,
+                last_used_at: 0,
+                total_bytes: 0,
+            });
+        }
+
+        Ok(stats.into_values().collect())
     }
 
     fn create(&self, name: &str) -> Result<(), String> {
@@ -377,6 +453,116 @@ mod tests {
         .unwrap();
         conn
     }
+
+// ------------------------------------------------------------------
+// 标签统计量：界面排序依赖这些数字，算错会让排序静默失真
+// ------------------------------------------------------------------
+
+/// 插入一行并指定时间戳与正文长度，用于验证统计量。
+fn seed_row_with(
+    conn_arc: &Arc<Mutex<Connection>>,
+    content: &str,
+    timestamp: i64,
+    tags: &[&str],
+) -> i64 {
+    let conn = conn_arc.lock().unwrap();
+    let tags_json = serde_json::to_string(&tags).unwrap();
+    conn.execute(
+        "INSERT INTO clipboard_history
+            (content_type, content, html_content, source_app, timestamp, preview,
+             is_pinned, content_hash, tags, use_count, is_external, pinned_order)
+         VALUES ('text', ?1, NULL, 'TestApp', ?2, ?1, 0, 0, ?3, 0, 0, 0)",
+        rusqlite::params![content, timestamp, tags_json],
+    )
+    .unwrap();
+    let id = conn.last_insert_rowid();
+    for tag in tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO entry_tags (entry_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![id, tag],
+        )
+        .unwrap();
+    }
+    id
+}
+
+fn stats_of(stats: &[TagStats], name: &str) -> TagStats {
+    stats
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("统计量里应包含标签 {name}"))
+        .clone()
+}
+
+/// 条目数、最近使用时间、总字节数三个量都要算对。
+#[test]
+fn stats_report_count_recent_use_and_total_bytes() {
+    let conn = Arc::new(Mutex::new(setup_test_db()));
+    let repo = SqliteTagRepository::new(conn.clone());
+
+    seed_row_with(&conn, "aaa", 100, &["工作"]);
+    seed_row_with(&conn, "bbbbb", 300, &["工作"]);
+    seed_row_with(&conn, "c", 200, &["生活"]);
+
+    let stats = repo.get_all_with_stats().unwrap();
+
+    let work = stats_of(&stats, "工作");
+    assert_eq!(work.count, 2, "工作 应有 2 条");
+    assert_eq!(work.last_used_at, 300, "工作 的最近使用应是最大的那个时间戳");
+    assert_eq!(work.total_bytes, 8, "工作 的正文长度之和应为 3 + 5");
+
+    let life = stats_of(&stats, "生活");
+    assert_eq!(life.count, 1);
+    assert_eq!(life.last_used_at, 200);
+    assert_eq!(life.total_bytes, 1);
+}
+
+/// 只有颜色、还没有任何条目的标签也必须出现——否则它在界面上会凭空消失，
+/// 用户就再也删不掉它了。
+#[test]
+fn stats_include_saved_tags_that_have_no_entries_yet() {
+    let conn = Arc::new(Mutex::new(setup_test_db()));
+    let repo = SqliteTagRepository::new(conn.clone());
+    conn.lock()
+        .unwrap()
+        .execute("INSERT INTO saved_tags (name, color) VALUES ('空标签', '#fff')", [])
+        .unwrap();
+    seed_row_with(&conn, "x", 100, &["有内容"]);
+
+    let stats = repo.get_all_with_stats().unwrap();
+
+    let empty = stats_of(&stats, "空标签");
+    assert_eq!(empty.count, 0);
+    assert_eq!(empty.last_used_at, 0, "没有条目时最近使用为 0");
+    assert_eq!(empty.total_bytes, 0);
+    assert!(stats.iter().any(|s| s.name == "有内容"));
+}
+
+/// 没有任何标签时返回空列表，而不是报错或造出假标签。
+#[test]
+fn stats_are_empty_on_a_fresh_database() {
+    let conn = Arc::new(Mutex::new(setup_test_db()));
+    let repo = SqliteTagRepository::new(conn.clone());
+    assert!(repo.get_all_with_stats().unwrap().is_empty());
+}
+
+/// 一个条目挂多个标签时，每个标签都要算到它——不能因为 join 而漏掉。
+#[test]
+fn stats_count_an_entry_for_every_tag_it_carries() {
+    let conn = Arc::new(Mutex::new(setup_test_db()));
+    let repo = SqliteTagRepository::new(conn.clone());
+    seed_row_with(&conn, "shared", 500, &["甲", "乙", "丙"]);
+
+    let stats = repo.get_all_with_stats().unwrap();
+
+    for name in ["甲", "乙", "丙"] {
+        let s = stats_of(&stats, name);
+        assert_eq!(s.count, 1, "{name} 应各计 1 条");
+        assert_eq!(s.last_used_at, 500);
+        assert_eq!(s.total_bytes, 6);
+    }
+    assert_eq!(stats.len(), 3, "不应产生重复标签");
+}
 
 // ------------------------------------------------------------------
 // R3: deleting a tag group must unlink entries, never delete them

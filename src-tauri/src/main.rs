@@ -67,6 +67,7 @@ fn main() {
             app::commands::clear_clipboard_history,
             app::commands::get_tag_items,
             app::commands::get_all_tags_info,
+            app::commands::get_tag_stats,
             app::commands::rename_tag_globally,
             app::commands::delete_tag_from_all,
             app::commands::create_new_tag,

@@ -430,6 +430,28 @@ pub async fn set_mcp_server_enabled(app: AppHandle, enabled: bool) -> Result<u16
     }
 }
 
+/// 把"写权限"的新值推给**正在运行**的服务实例。
+///
+/// 单独抽出来是为了可测：命令函数要 `AppHandle`，单测里构造不出来，于是这段真正
+/// 决定"改动是否立刻生效"的逻辑一直没有保护——把它退回旧行为（只写库、不到达运行
+/// 中的服务）时全套测试依然全绿。这个函数只依赖全局状态，可以直接断言。
+fn push_allow_write_to_running_service(allow: bool) {
+    if let Ok(guard) = ACTIVE_STATE.lock() {
+        if let Some(state) = guard.as_ref() {
+            state.settings.set_allow_write(allow);
+        }
+    }
+}
+
+/// 把"是否强制校验令牌"的新值推给正在运行的服务实例。理由同上。
+fn push_require_token_to_running_service(require: bool) {
+    if let Ok(guard) = ACTIVE_STATE.lock() {
+        if let Some(state) = guard.as_ref() {
+            state.token.set_require_token(require);
+        }
+    }
+}
+
 /// 切换写权限。只影响后续请求，不重启服务。
 ///
 /// 运行时开关与数据库同时更新：前者让已连上的客户端立刻受限，后者保证重启后
@@ -442,11 +464,7 @@ pub fn set_mcp_allow_write(app: AppHandle, allow: bool) -> Result<(), String> {
         .set(KEY_ALLOW_WRITE, if allow { "true" } else { "false" })
         .map_err(|e| e.to_string())?;
     // 默认全权限之后，"立刻收回写权限"必须是真能生效的动作，而不是等下次重启。
-    if let Ok(guard) = ACTIVE_STATE.lock() {
-        if let Some(state) = guard.as_ref() {
-            state.settings.set_allow_write(allow);
-        }
-    }
+    push_allow_write_to_running_service(allow);
     crate::info!(
         "[MCP-AUDIT] {} 写权限被设置为 {}",
         chrono::Local::now().to_rfc3339(),
@@ -466,11 +484,7 @@ pub fn set_mcp_require_token(app: AppHandle, require: bool) -> Result<(), String
         .settings_repo
         .set(KEY_REQUIRE_TOKEN, if require { "true" } else { "false" })
         .map_err(|e| e.to_string())?;
-    if let Ok(guard) = ACTIVE_STATE.lock() {
-        if let Some(state) = guard.as_ref() {
-            state.token.set_require_token(require);
-        }
-    }
+    push_require_token_to_running_service(require);
     crate::info!(
         "[MCP-AUDIT] {} 令牌校验被设置为 {}",
         chrono::Local::now().to_rfc3339(),
@@ -622,6 +636,82 @@ mod tests {
                 ),
             conn,
         }
+    }
+
+    /// 造一个可放进 `ACTIVE_STATE` 的运行中服务状态，用于验证"热更新会到达运行中的
+    /// 服务"。只关心开关字段，其余依赖用最小实现。
+    fn running_state_for_hot_reload(allow_write_seed: bool, require_token_seed: bool) -> ServerState {
+        let db = fresh_db_state();
+        let store = store::McpStore::new(db.conn.clone());
+        ServerState {
+            store,
+            token: server::AuthToken::new(Arc::new("test-secret".to_string()), require_token_seed),
+            settings: Arc::new(server::RuntimeSettings::new(allow_write_seed)),
+            audit: Arc::new(server::NoopAudit),
+            effects: Arc::new(tools::NoopEffects::default()),
+        }
+    }
+
+    /// 安装一个运行中状态，并在测试结束时清空，避免污染同进程的其它测试。
+    struct ActiveStateGuard;
+    impl ActiveStateGuard {
+        fn install(state: ServerState) -> Self {
+            *ACTIVE_STATE.lock().expect("全局状态锁可用") = Some(state);
+            Self
+        }
+    }
+    impl Drop for ActiveStateGuard {
+        fn drop(&mut self) {
+            *ACTIVE_STATE.lock().expect("全局状态锁可用") = None;
+        }
+    }
+
+    /// 关闭写权限必须**立刻**到达运行中的服务。
+    ///
+    /// 这条曾经无人保护：把热更新退回旧行为（只写库、不到达运行中的服务）时，全套
+    /// 测试依然全绿。默认全权限之后，"一键收回写权限"是用户唯一能立刻止血的动作，
+    /// 它悄悄失效是不能接受的，所以这里直接断言运行中实例的开关真的被翻过来了。
+    #[test]
+    fn disabling_write_reaches_the_running_service_immediately() {
+        let state = running_state_for_hot_reload(true, false);
+        let live = state.settings.clone();
+        let _guard = ActiveStateGuard::install(state);
+
+        assert!(live.allow_write(), "前置：运行中的服务初始允许写入");
+
+        push_allow_write_to_running_service(false);
+
+        assert!(
+            !live.allow_write(),
+            "关闭写权限后，运行中的服务实例必须立刻变为禁止写入，而不是等下次重启"
+        );
+    }
+
+    /// 打开令牌校验必须**立刻**到达运行中的服务。理由同上。
+    #[test]
+    fn enabling_token_check_reaches_the_running_service_immediately() {
+        let state = running_state_for_hot_reload(true, false);
+        let live = state.token.clone();
+        let _guard = ActiveStateGuard::install(state);
+
+        assert!(!live.requires_token(), "前置：运行中的服务初始免鉴权");
+
+        push_require_token_to_running_service(true);
+
+        assert!(
+            live.requires_token(),
+            "打开令牌校验后，运行中的服务实例必须立刻要求令牌"
+        );
+    }
+
+    /// 服务未运行时，热更新不应 panic，也不应留下任何状态。
+    #[test]
+    fn hot_reload_is_a_no_op_when_no_service_is_running() {
+        *ACTIVE_STATE.lock().expect("全局状态锁可用") = None;
+        // 不 panic 即通过；这两条路径在服务停止时会被用户正常触发。
+        push_allow_write_to_running_service(false);
+        push_require_token_to_running_service(true);
+        assert!(ACTIVE_STATE.lock().expect("锁可用").is_none());
     }
 
     #[test]

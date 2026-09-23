@@ -92,6 +92,39 @@ export const TagAssignMenu = ({
   const trimmedQuery = targetQuery.trim();
 
   /**
+   * 全库标签（自取）。
+   *
+   * 上层传进来的 `allTags` 在"标签管理未打开、也未在编辑标签"时是空数组——那正是
+   * 从主列表点开这个菜单的场景，于是目标候选为空，用户只能手打标签名，看不到已有标签。
+   *
+   * 这里在打开时自行向仓储层要一次全量标签，与传入值**取并集**：两条来源都不丢，
+   * 且不依赖上层是否恰好算过。`get_all_tags_info` 是既有命令，返回 name -> count。
+   */
+  const [fetchedTags, setFetchedTags] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<Record<string, number>>("get_all_tags_info")
+      .then((info) => {
+        if (cancelled || !info) return;
+        setFetchedTags(Object.keys(info));
+      })
+      .catch(() => {
+        // 取不到就退回传入值；这里不打扰用户——候选为空时他仍可手打新标签名。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 传入值与自取值的并集，去重后排序。 */
+  const knownTags = useMemo(() => {
+    const set = new Set<string>();
+    allTags.forEach((n) => set.add(n));
+    fetchedTags.forEach((n) => set.add(n));
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [allTags, fetchedTags]);
+
+  /**
    * 目标候选：全库标签去掉"当前条目已有"的（移动/复制到一个已存在的标签没有意义，
    * 移动模式下源标签也不能当目标——那就是原地不动）。
    */
@@ -100,17 +133,17 @@ export const TagAssignMenu = ({
     const excluded = new Set(sourceTags.map(lower));
     if (fromTag) excluded.add(lower(fromTag));
     const q = trimmedQuery.toLowerCase();
-    return allTags
+    return knownTags
       .filter((name) => !excluded.has(lower(name)))
       .filter((name) => !q || lower(name).includes(q))
       .slice(0, 40);
-  }, [allTags, sourceTags, fromTag, trimmedQuery]);
+  }, [knownTags, sourceTags, fromTag, trimmedQuery]);
 
   /** 输入框里的文字是否可以作为"新建标签"提交（不与已有候选重复）。 */
   const canCreateNew =
     trimmedQuery.length > 0 &&
     trimmedQuery.length <= MAX_TAG_LENGTH &&
-    !allTags.some((name) => name.toLowerCase() === trimmedQuery.toLowerCase());
+    !knownTags.some((name) => name.toLowerCase() === trimmedQuery.toLowerCase());
 
   const effectiveFrom = fromTag ?? null;
 

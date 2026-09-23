@@ -110,6 +110,18 @@ export function isSensitiveFeatureEnabled(
  * numbers and its own collapsed flag. `width` / `height` / `collapsed` keep the
  * beta branch's key names so a settings blob written by beta still loads.
  */
+/**
+ * 标签分组的排序方式。
+ *
+ * `default` 是原行为（按条目数从多到少）——用户要求"保留默认方式选项"，所以它必须
+ * 是一个显式可选项，而不是"没有选择"。
+ */
+export type TagGroupSort =
+    | 'name' | 'name_desc'
+    | 'recent' | 'recent_asc'
+    | 'count' | 'count_asc'
+    | 'size' | 'size_asc';
+
 interface TagManagerSidebarSize {
     width: number;
     height: number;
@@ -332,6 +344,8 @@ export function resolveInitialTagManagerLayout(
 export default function TagManager({ t, theme, persistedSize }: TagManagerProps) {
     const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
     const TAG_MANAGER_SIZE_KEY = "app.tag_manager_size";
+    /** 标签分组的排序方式：纯界面偏好，与 view_mode 同类，存在 localStorage。 */
+    const TAG_GROUP_SORT_KEY = "tiez_tag_group_sort";
     const [tags, setTags] = useState<TagInfo[]>([]);
     const [tagSearch, setTagSearch] = useState('');
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
@@ -370,6 +384,44 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      */
     const [isStacked, setIsStacked] = useState(readStackedAtFirstFrame);
     const [sortBy, setSortBy] = useState<'time' | 'count'>('time');
+
+    /**
+     * 标签**分组**的排序方式（与上面 `sortBy` 无关——那个排的是组内条目）。
+     *
+     * `default` 即当前行为：按条目数从多到少，也就是后端返回后原有的排序。
+     * 惰性初始化，保证首帧就是用户选过的顺序，不会先按默认渲染再跳变。
+     */
+    /**
+     * 每个标签的统计量（最近使用时间、总字节数），用于排序。
+     * 由 `get_tag_stats` 提供；拿不到时排序自动退化到只按名称/条目数。
+     */
+    const [tagStats, setTagStats] = useState<Record<string, { last_used_at: number; total_bytes: number }>>({});
+
+    const [tagSort, setTagSort] = useState<TagGroupSort>(() => {
+        try {
+            const saved = window.localStorage.getItem(TAG_GROUP_SORT_KEY);
+            const allowed: TagGroupSort[] = [
+                'name', 'name_desc', 'recent', 'recent_asc',
+                'count', 'count_asc', 'size', 'size_asc',
+            ];
+            if (allowed.includes(saved as TagGroupSort)) {
+                return saved as TagGroupSort;
+            }
+        } catch {
+            // 读不到就用默认；这只是界面偏好，不值得打扰用户。
+        }
+        // 默认按名称 A-Z：顺序可预期，找起来比"条目多的在前"更快。
+        return 'name';
+    });
+
+    const changeTagSort = useCallback((next: TagGroupSort) => {
+        setTagSort(next);
+        try {
+            window.localStorage.setItem(TAG_GROUP_SORT_KEY, next);
+        } catch {
+            // 存不下不影响本次会话内的排序生效。
+        }
+    }, []);
     const [isCreatingItem, setIsCreatingItem] = useState(false);
     /**
      * R4/R6: the edit dialog now serves every content type. `originalContent` /
@@ -704,6 +756,19 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .filter((tag) => shouldShowTag(tag, sensitiveFeatureEnabled));
             tagArray.sort((a, b) => b.count - a.count);
             setTags(tagArray);
+
+            // 统计量单独取一次：失败不影响标签列表本身，排序退化为名称/条目数。
+            invoke<Array<{ name: string; last_used_at: number; total_bytes: number }>>("get_tag_stats")
+                .then((rows) => {
+                    const map: Record<string, { last_used_at: number; total_bytes: number }> = {};
+                    (rows || []).forEach((r) => {
+                        map[r.name] = { last_used_at: r.last_used_at, total_bytes: r.total_bytes };
+                    });
+                    setTagStats(map);
+                })
+                .catch(() => {
+                    // 保持既有 map；排序函数对缺失项有兜底。
+                });
             setTagColors(colors || {});
 
             const activeTag = selectedTagRef.current;
@@ -875,8 +940,46 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     const filteredTags = useMemo(() => {
-        return tags.filter(t => t.name.toLowerCase().includes(tagSearch.toLowerCase()));
-    }, [tags, tagSearch]);
+        const matched = tags.filter(t => t.name.toLowerCase().includes(tagSearch.toLowerCase()));
+        // `default` 保持后端给的顺序（按条目数降序），不改动；其余选项在这里重排。
+        // 稳定排序：`name` 用 localeCompare 保证中文按拼音、英文按字母。
+        const byName = (a: TagInfo, b: TagInfo) => a.name.localeCompare(b.name);
+        const stat = (n: string) => tagStats[n] ?? { last_used_at: 0, total_bytes: 0 };
+        switch (tagSort) {
+            case 'name_desc':
+                return [...matched].sort((a, b) => byName(b, a));
+            case 'count':
+                return [...matched].sort((a, b) => b.count - a.count || byName(a, b));
+            case 'count_asc':
+                return [...matched].sort((a, b) => a.count - b.count || byName(a, b));
+            case 'recent':
+                // 从未使用过的标签（时间戳 0）排在最后，而不是混在中间。
+                return [...matched].sort(
+                    (a, b) => stat(b.name).last_used_at - stat(a.name).last_used_at || byName(a, b)
+                );
+            case 'recent_asc':
+                // 最早使用的在前；同样把"从未使用"（0）放最后，不让它冒充最早。
+                return [...matched].sort((a, b) => {
+                    const av = stat(a.name).last_used_at;
+                    const bv = stat(b.name).last_used_at;
+                    if (av === 0 && bv === 0) return byName(a, b);
+                    if (av === 0) return 1;
+                    if (bv === 0) return -1;
+                    return av - bv || byName(a, b);
+                });
+            case 'size':
+                return [...matched].sort(
+                    (a, b) => stat(b.name).total_bytes - stat(a.name).total_bytes || byName(a, b)
+                );
+            case 'size_asc':
+                return [...matched].sort(
+                    (a, b) => stat(a.name).total_bytes - stat(b.name).total_bytes || byName(a, b)
+                );
+            case 'name':
+            default:
+                return [...matched].sort(byName);
+        }
+    }, [tags, tagSearch, tagSort, tagStats]);
 
     const normalizedTagSearch = tagSearch.trim().toLowerCase();
     const canCreateTag = normalizedTagSearch.length > 0
@@ -910,6 +1013,26 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             <div className="tag-sidebar">
                 <div className="sidebar-header">
                     {!isCollapsed && <span className="header-label">{t('tags')}</span>}
+                    {/* 排序选择：位于标题右侧、收起按钮左侧。收起状态下标签文字消失，
+                        这个按钮也一并隐藏——窄到只剩一条竖栏时没有它的位置。 */}
+                    {!isCollapsed && (
+                        <select
+                            className="tag-sort-select"
+                            value={tagSort}
+                            title={t('tag_sort') || '排序方式'}
+                            aria-label={t('tag_sort') || '排序方式'}
+                            onChange={(e) => changeTagSort(e.target.value as TagGroupSort)}
+                        >
+                            <option value="name">{t('tag_sort_name') || 'A-Z'}</option>
+                            <option value="name_desc">{t('tag_sort_name_desc') || 'Z-A'}</option>
+                            <option value="recent">{t('tag_sort_recent') || '最近使用'}</option>
+                            <option value="recent_asc">{t('tag_sort_recent_asc') || '最早使用'}</option>
+                            <option value="count">{t('tag_sort_count') || '按条目数 多→少'}</option>
+                            <option value="count_asc">{t('tag_sort_count_asc') || '按条目数 少→多'}</option>
+                            <option value="size">{t('tag_sort_size') || '按体积 大→小'}</option>
+                            <option value="size_asc">{t('tag_sort_size_asc') || '按体积 小→大'}</option>
+                        </select>
+                    )}
                     <button
                         className="collapse-toggle"
                         title={isCollapsed ? (t('open') || '展开') : (t('collapse') || '收起')}
@@ -1548,6 +1671,25 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     transition: all 0.2s;
                 }
                 .collapse-toggle:hover { background: var(--border-light); color: var(--text-primary); }
+                /* 排序选择器：与 .collapse-toggle 同高，配色沿用侧栏既有令牌。
+                   刻意去掉原生外观，否则在深色主题下会是一块突兀的系统控件。 */
+                .tag-sort-select {
+                    background: var(--bg-main);
+                    color: inherit;
+                    border: none;
+                    border-radius: var(--radius-sm);
+                    height: 28px;
+                    padding: 0 4px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    opacity: 0.75;
+                    transition: opacity 0.2s, background 0.2s;
+                    max-width: 108px;
+                }
+                .tag-sort-select:hover { opacity: 1; background: var(--border-light); }
+                .tag-sort-select:focus-visible { outline: 1px solid var(--accent-color); }
+                .tag-sort-select option { background: var(--bg-main); color: var(--text-primary); }
 
                 /* Tag Search Box */
                 .tag-search-box {

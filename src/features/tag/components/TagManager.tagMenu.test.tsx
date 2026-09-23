@@ -168,8 +168,12 @@ describe("B9｜标签组行内不再直接显示重命名/删除按钮", () => {
 });
 
 describe("B9｜右键标签组弹出菜单", () => {
-  it("右键前没有菜单", () => {
+  it("右键前没有菜单，右键后同一个查询能查到菜单", async () => {
+    // 只断言"右键前为 null"是恒真的：一个从不渲染菜单的实现同样满足它。
+    // 因此必须在同一个测试里证明"这个查询确实能返回菜单"，两条合起来才有判别力。
     expect(menu()).toBeNull();
+    await rightClick(tagRow("工作"));
+    expect(menu()).not.toBeNull();
   });
 
   it("右键后出现菜单，含「重命名」「删除」两项", async () => {
@@ -186,7 +190,12 @@ describe("B9｜右键标签组弹出菜单", () => {
 
   it("菜单项是可聚焦的 button 且带 role=menuitem（不是裸 div）", async () => {
     await rightClick(tagRow("工作"));
-    for (const item of menuItems()) {
+    const items = menuItems();
+    // 空的 NodeList 会让下面的 for 循环一次都不执行，"全部通过"变成恒真。
+    // 先断言数量，再逐项检查属性。
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.length).toBe(2);
+    for (const item of items) {
       expect(item.tagName).toBe("BUTTON");
       expect(item.getAttribute("type")).toBe("button");
       expect(item.getAttribute("role")).toBe("menuitem");
@@ -242,6 +251,7 @@ describe("B9｜菜单关闭", () => {
 
   it("在菜单外部按下指针关闭菜单", async () => {
     await rightClick(tagRow("工作"));
+    expect(menu()).not.toBeNull(); // 前置：先证明菜单真的开了，否则"关闭后为 null"恒真
     await act(async () => {
       document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     });
@@ -258,6 +268,7 @@ describe("B9｜菜单关闭", () => {
 
   it("滚动时关闭菜单（锚点行会随列表滚走）", async () => {
     await rightClick(tagRow("工作"));
+    expect(menu()).not.toBeNull(); // 前置：菜单确实开过
     await act(async () => {
       window.dispatchEvent(new Event("scroll"));
     });
@@ -266,6 +277,7 @@ describe("B9｜菜单关闭", () => {
 
   it("窗口尺寸变化时关闭菜单", async () => {
     await rightClick(tagRow("工作"));
+    expect(menu()).not.toBeNull(); // 前置：菜单确实开过
     await act(async () => {
       window.dispatchEvent(new Event("resize"));
     });
