@@ -36,8 +36,16 @@ interface MigrationReport {
     status: "migrated" | "skipped" | "failed";
     source: string;
     target: string;
+    /** 源侧条目总数（含目录条目）——仅用于详情展示。 */
     files: number;
+    /** 源侧全部条目字节数之和——仅用于详情展示。 */
     bytes: number;
+    /** 本次真正新交付的文件数（不含目录条目、不含沿用的文件）。 */
+    deliveredFiles: number;
+    /** 本次真正新交付的字节数。 */
+    deliveredBytes: number;
+    /** 目标里原本就有、本次未覆盖而沿用的文件数。 */
+    keptExisting: number;
     skipReason: string | null;
     error: string | null;
     pathsRewritten: boolean;
@@ -124,9 +132,11 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
 
             if (report.status === "migrated") {
                 await message(
-                    `${t("legacy_migrate_done")
-                        .replace("{files}", String(report.files))
-                        .replace("{size}", formatBytes(report.bytes))}\n\n${t(
+                    `${report.deliveredFiles === 0 && report.keptExisting > 0
+                        ? t("legacy_migrate_result_already_present")
+                        : t("legacy_migrate_done")
+                              .replace("{files}", String(report.deliveredFiles))
+                              .replace("{size}", formatBytes(report.deliveredBytes))}\n\n${t(
                         "legacy_migrate_source_safe"
                     )}${report.restartRequired ? `\n\n${t("legacy_migrate_restart")}` : ""}`,
                     { title: t("notice"), kind: "info" }
@@ -417,10 +427,28 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                         : t('legacy_migrate_result_skipped')}
                                 </div>
                                 <div>
-                                    {t('legacy_migrate_result_files')
-                                        .replace('{files}', String(lastResult.files))
-                                        .replace('{size}', formatBytes(lastResult.bytes))}
+                                    {lastResult.status === "migrated" &&
+                                    lastResult.deliveredFiles === 0 &&
+                                    lastResult.keptExisting > 0
+                                        ? t('legacy_migrate_result_already_present')
+                                        : t('legacy_migrate_result_files')
+                                              .replace(
+                                                  '{files}',
+                                                  String(lastResult.deliveredFiles)
+                                              )
+                                              .replace(
+                                                  '{size}',
+                                                  formatBytes(lastResult.deliveredBytes)
+                                              )}
                                 </div>
+                                {lastResult.status === "migrated" && lastResult.keptExisting > 0 && (
+                                    <div>
+                                        {t('legacy_migrate_result_kept').replace(
+                                            '{files}',
+                                            String(lastResult.keptExisting)
+                                        )}
+                                    </div>
+                                )}
                                 <div>
                                     {t('legacy_migrate_result_source').replace('{path}', lastResult.source)}
                                 </div>
@@ -464,7 +492,14 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                     </div>
                                 )}
                                 {lastResult.status === "failed" && lastResult.error && (
-                                    <div style={{ marginTop: '4px' }}>{lastResult.error}</div>
+                                    <>
+                                        <div style={{ marginTop: '4px' }}>{lastResult.error}</div>
+                                        {/* Windows 上文件被应用占用时改名/覆盖会失败；失败是安全的
+                                            （源与目标都保留），但用户需要知道下一步该做什么。 */}
+                                        <div style={{ marginTop: '4px', opacity: 0.85 }}>
+                                            {t('legacy_migrate_failed_hint')}
+                                        </div>
+                                    </>
                                 )}
                                 {lastResult.restartRequired && lastResult.status === "migrated" && (
                                     <button

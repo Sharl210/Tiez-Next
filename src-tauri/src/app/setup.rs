@@ -206,10 +206,19 @@ pub struct IdentifierMigrationReport {
     pub source: String,
     /// 目标数据目录。
     pub target: String,
-    /// 本次迁移的文件数（含目录条目，与后端一致性校验口径一致）。
+    /// 源侧条目总数（含目录条目，与后端一致性校验口径一致）。
+    ///
+    /// 注意：这个数会让人**高估**实际交付量（含目录条目、也含目标里原本就有而未被
+    /// 覆盖的文件）。界面展示"复制了多少"应优先用 `deliveredFiles`/`deliveredBytes`。
     pub files: u64,
-    /// 本次迁移的字节数。
+    /// 源侧全部条目的字节数之和（与 `files` 同口径）。
     pub bytes: u64,
+    /// 本次**新交付**的文件数（不含目录条目，也不含目标里已存在而沿用的文件）。
+    pub delivered_files: u64,
+    /// 本次**新交付**的字节数。
+    pub delivered_bytes: u64,
+    /// 目标里原本就存在、本次未覆盖而沿用的文件数。
+    pub kept_existing: u64,
     /// 跳过时的机器可读原因码（见 `SkipReason::code`）。
     pub skip_reason: Option<String>,
     /// 失败原因（源目录此时仍然完好）。
@@ -224,6 +233,12 @@ pub struct IdentifierMigrationReport {
     ///
     /// 应用启动时就把数据库连接建好了，迁移是运行中发生的，进程内的连接仍指向迁移前
     /// 的那份数据。因此迁移成功后必须提示用户重启，否则界面看不到刚迁入的记录。
+    ///
+    /// 【Windows 上的额外理由】本命令会在运行中让位/替换目标目录里的
+    /// `clipboard.db`（改名或覆盖）。Windows 不允许改名或覆盖仍被打开的文件——若应用
+    /// 正持有该库，这一步可能失败。失败方向是安全的（只清暂存、源与目标都保留，见
+    /// `migration_identifier` 的失败路径），但用户会看到迁移未完成。因此界面在失败
+    /// 提示里明确建议"先重启应用、不要在迁移刚失败时反复重试"。
     pub restart_required: bool,
     /// 目标里那个"从未使用过的空库"被改名让位后的路径（若有）。
     ///
@@ -252,6 +267,9 @@ pub fn apply_identifier_migration(
         target: new_dir.to_string_lossy().to_string(),
         files: 0,
         bytes: 0,
+        delivered_files: 0,
+        delivered_bytes: 0,
+        kept_existing: 0,
         skip_reason: None,
         error: None,
         paths_rewritten: false,
@@ -266,6 +284,9 @@ pub fn apply_identifier_migration(
             source,
             files,
             bytes,
+            delivered_files,
+            delivered_bytes,
+            kept_existing,
             yielded_db,
             ..
         } => {
@@ -273,6 +294,9 @@ pub fn apply_identifier_migration(
             report.source = source.to_string_lossy().to_string();
             report.files = *files;
             report.bytes = *bytes;
+            report.delivered_files = *delivered_files;
+            report.delivered_bytes = *delivered_bytes;
+            report.kept_existing = *kept_existing;
             report.restart_required = new_dir.join("clipboard.db").exists();
             report.superseded_db =
                 yielded_db.as_ref().map(|p| p.to_string_lossy().to_string());

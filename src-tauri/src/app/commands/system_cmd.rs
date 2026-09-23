@@ -86,54 +86,144 @@ pub fn remove_legacy_data_dir(state: State<'_, AppDataDir>, path: String) -> App
         .map_err(AppError::Validation)
 }
 
-/// 判定某个数据目录里的数据库是不是**从未使用过的空库**（0 条剪贴板记录）。
+/// 判定某个数据目录里的数据库是不是**从未使用过的空库**。
 ///
 /// 放在命令层而不是 `migration_identifier` 里，是因为它需要读 SQLite（rusqlite），
-/// 而后者按设计**只依赖 `std`**，以便脱离 Tauri 与平台专用代码独立编译验证。判据本身
-/// 很简单：能打开、有 `clipboard_history` 表、且条数为 0。
+/// 而后者按设计**只依赖 `std`**，以便脱离 Tauri 与平台专用代码独立编译验证。
 ///
-/// 实现上**先把库连同 WAL 侧车复制到临时目录再查**，而不是直接打开目标库：实测
-/// （`migration_identifier` 的回归测试抓出）即便以只读方式打开，SQLite 也会改写目标
-/// 的 `clipboard.db-shm`。那个副作用会干扰正在运行的应用，也让"这次检查没动过任何
-/// 东西"不再成立。
+/// ## 为什么不能只看剪贴板条数
 ///
-/// 保守性：库存在但复制失败、打不开或没有该表时一律返回 `false`（按"有数据"处理）。
-/// 宁可少迁，不可覆盖。
+/// 复核（G-2）实证：用户完全可能在新版里**一条剪贴板记录都没有**，但已经建了自己的
+/// 标签、调过设置。若只看 `clipboard_history` 条数就判定"没用过"并接管，源库会**整体
+/// 替换**目标库，用户在新版里建的标签/设置被静默丢弃（实测报
+/// `no such table: saved_tags`）。这与本任务"绝不伤害用户既有数据"的目标直接冲突。
+///
+/// ## 判定方式：与"刚装好的新版"逐键逐值比对
+///
+/// 不硬编码"哪些设置算默认"，而是**现场造一个全新的种子库**（同样的迁移 + 同样的
+/// `seed_defaults`），把它当作"刚装好的新版"基线，再与目标逐 key、逐 value 比较。
+/// 这样将来新增任何设置项都会自动被基线覆盖，**不需要回来维护一份白名单**——白名单
+/// 一旦漏项就会把用户数据误判成空库，是本项目最不能承受的错误方向。
+///
+/// 只有三者**同时**成立才判定"没用过"：
+/// 1. `clipboard_history` 条数为 0；
+/// 2. `saved_tags` 里没有用户自建标签（默认的 `sensitive` / `密码` 不算）；
+/// 3. `settings` 与全新种子库**完全一致**（key 集合与每个 value 都相同）。
+///
+/// ## 副作用
+///
+/// `seed_defaults` 是幂等的 `INSERT OR IGNORE`，因此把它作用在**探针副本**上是安全的；
+/// 目标目录从未被本函数写过。探针是**文件层完整复制**（含 `-wal`/`-shm`），因此不会
+/// 像"只复制主库"那样在 WAL 模式下漏读尚未 checkpoint 的记录；也避免了直接打开目标库
+/// 会改写其 `clipboard.db-shm` 的副作用（该副作用由 `migration_identifier` 的回归测试
+/// 抓出）。
+///
+/// ## 保守性
+///
+/// 库存在但复制失败、打不开、缺表、查询失败或基线库造不出来时，一律返回 `false`
+/// （按"有数据"处理）。宁可少迁，不可覆盖。
 fn target_db_is_pristine(target: &std::path::Path) -> bool {
     let db = target.join("clipboard.db");
     if !db.is_file() {
         return true; // 连库都没有 = 完全没用过
     }
 
-    let probe_dir = std::env::temp_dir().join(format!(
-        "tiez-db-probe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
+    let stamp = std::process::id().to_string()
+        + "-"
+        + &std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
-    ));
+            .to_string();
+    let probe_dir = std::env::temp_dir().join(format!("tiez-db-probe-{}", stamp));
     if std::fs::create_dir_all(&probe_dir).is_err() {
         return false;
     }
+
+    // 文件层完整复制（含 WAL 侧车）：只读目标，不改目标。
+    let mut copy_failed = false;
     for suffix in ["", "-wal", "-shm"] {
         let name = format!("clipboard.db{}", suffix);
         let from = target.join(&name);
         if from.is_file() && std::fs::copy(&from, probe_dir.join(&name)).is_err() {
-            let _ = std::fs::remove_dir_all(&probe_dir);
-            return false;
+            copy_failed = true;
+            break;
         }
     }
+    if copy_failed {
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        return false;
+    }
 
-    let count: Option<i64> = rusqlite::Connection::open(probe_dir.join("clipboard.db"))
+    let probe_db = probe_dir.join("clipboard.db");
+
+    // 1) 剪贴板历史必须一条都没有。
+    let clips: Option<i64> = rusqlite::Connection::open(&probe_db)
         .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0))
+        .and_then(|c| {
+            c.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0))
                 .ok()
         });
-    let _ = std::fs::remove_dir_all(&probe_dir); // 探针目录始终清理；目标目录从未被写过
+    if clips != Some(0) {
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        return false;
+    }
 
-    matches!(count, Some(0))
+    // 2) 用户自建标签必须为空（默认的两个标签不算）。
+    let user_tags: Option<i64> = rusqlite::Connection::open(&probe_db)
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM saved_tags WHERE name NOT IN ('sensitive', ?1)",
+                rusqlite::params!["密码"],
+                |r| r.get(0),
+            )
+            .ok()
+        });
+    if user_tags != Some(0) {
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        return false;
+    }
+
+    // 3) settings 必须与"刚装好的新版"完全一致。
+    let baseline = build_seed_settings_baseline(&probe_dir.join("baseline.db"));
+    let actual = read_settings(&probe_db);
+    let pristine = match (baseline, actual) {
+        (Some(base), Some(act)) => act == base,
+        _ => false, // 无法判定 → 按"在用"处理
+    };
+
+    let _ = std::fs::remove_dir_all(&probe_dir); // 探针目录始终清理；目标目录从未被写过
+    pristine
+}
+
+/// 现场造一个"刚装好的新版"数据库，返回它的 settings 映射作为比对基线。
+///
+/// 复用产品自己的 `init_db`（迁移 + `seed_defaults`），因此基线永远与当前版本一致，
+/// 新增设置项会自动进入基线，无需维护白名单。失败返回 `None`，调用方按"在用"处理。
+fn build_seed_settings_baseline(
+    path: &std::path::Path,
+) -> Option<std::collections::HashMap<String, String>> {
+    let path_str = path.to_string_lossy().to_string();
+    // init_db 会建表、跑迁移并写入默认设置；对全新文件而言这是纯创建操作。
+    crate::database::init_db(&path_str).ok()?;
+    read_settings(path)
+}
+
+/// 读取一个数据库里的全部 settings 键值（只读）。
+///
+/// 返回 `None` 表示读不到（打不开 / 缺 `settings` 表）——调用方须按"在用"处理。
+fn read_settings(db: &std::path::Path) -> Option<std::collections::HashMap<String, String>> {
+    let conn = rusqlite::Connection::open(db).ok()?;
+    let mut stmt = conn.prepare("SELECT key, value FROM settings").ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .ok()?
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .ok()?;
+    Some(rows)
 }
 
 /// 删除旧目录前的守卫：**只有新版确实存有可用数据时，才允许删掉用户手选的旧目录**。
@@ -1029,4 +1119,194 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 迁移安全回归测试（复核 G-2 的直接证据）
+//
+// 这些测试守护本任务里**最危险**的一条路径：把"用户已经用过的新版数据目录"误判成
+// "从未使用过的空库"，进而在手动迁移接管时把用户自己建的标签/设置静默丢弃。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod migration_pristine_tests {
+    use super::*;
+
+    fn tmp_root(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tiez-pristine-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 造一个"刚装好的新版"数据目录：走真实的 init_db（迁移 + seed_defaults）。
+    fn seeded_dir(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join("fresh-install");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("clipboard.db");
+        crate::database::init_db(&db.to_string_lossy()).unwrap();
+        dir
+    }
+
+    /// 全新装好的数据目录 → 判定为"从未使用过"（否则手动迁移会被自己刚装好的空库挡住）。
+    #[test]
+    fn fresh_install_is_pristine() {
+        let root = tmp_root("fresh");
+        let dir = seeded_dir(&root);
+        assert!(
+            target_db_is_pristine(&dir),
+            "刚装好的新版数据目录应判定为未使用过"
+        );
+    }
+
+    /// **G-2 核心回归**：0 条剪贴板记录、但用户建了自己的标签 → 必须判定为"在用"。
+    ///
+    /// 修复前判据只看 `clipboard_history` 条数，这种情况会被判成空库并接管，源库整体
+    /// 替换目标库，用户新建的标签被静默丢弃（实测 `no such table: saved_tags`）。
+    #[test]
+    fn user_created_tag_makes_target_non_pristine() {
+        let root = tmp_root("tag");
+        let dir = seeded_dir(&root);
+        assert!(target_db_is_pristine(&dir), "前提：先确认基线是空库");
+
+        let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        conn.execute(
+            "INSERT INTO saved_tags (name, color) VALUES ('我自己建的标签', '#ff0000')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            !target_db_is_pristine(&dir),
+            "用户已建标签时绝不能判定为空库——否则接管会丢弃它"
+        );
+    }
+
+    /// **G-2 核心回归**：0 条剪贴板记录、但用户改过设置 → 必须判定为"在用"。
+    ///
+    /// 用"与全新种子库逐键逐值比对"实现，因此这里改一个已存在的 key 即可触发。
+    #[test]
+    fn customized_setting_makes_target_non_pristine() {
+        let root = tmp_root("setting");
+        let dir = seeded_dir(&root);
+        assert!(target_db_is_pristine(&dir), "前提：先确认基线是空库");
+
+        let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        conn.execute(
+            "UPDATE settings SET value = 'definitely-not-the-default' WHERE key = 'app.theme'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            !target_db_is_pristine(&dir),
+            "用户改过设置时绝不能判定为空库"
+        );
+    }
+
+    /// 有一条剪贴板记录 → 判定为"在用"（最基础的判据仍生效）。
+    #[test]
+    fn existing_clipboard_record_makes_target_non_pristine() {
+        let root = tmp_root("record");
+        let dir = seeded_dir(&root);
+        let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        conn.execute(
+            "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+             VALUES ('text', 'x', 'app', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!target_db_is_pristine(&dir));
+    }
+
+    /// 目录里压根没有数据库 → "从未使用过"（接管是安全的）。
+    #[test]
+    fn missing_database_counts_as_pristine() {
+        let root = tmp_root("nodir");
+        let dir = root.join("no-db-here");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(target_db_is_pristine(&dir));
+    }
+
+    /// 数据库打不开（不是合法 SQLite 文件）→ **保守判为"在用"**，绝不接管。
+    #[test]
+    fn unreadable_database_is_treated_as_in_use() {
+        let root = tmp_root("broken");
+        let dir = root.join("broken-db");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clipboard.db"), b"this is not a sqlite database").unwrap();
+        assert!(
+            !target_db_is_pristine(&dir),
+            "无法确认是空库时必须按'在用'处理（宁可少迁，不可覆盖）"
+        );
+    }
+
+    /// 判定过程**不得改动目标目录**（文件层复制探针 + 探针目录清理）。
+    ///
+    /// SQLite 打开库时会改写 `-shm`，因此这里对目标的字节内容做前后比对。
+    #[test]
+    fn pristine_check_leaves_target_untouched() {
+        let root = tmp_root("untouched");
+        let dir = seeded_dir(&root);
+
+        let snapshot = |d: &std::path::Path| -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().to_string(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = snapshot(&dir);
+
+        let _ = target_db_is_pristine(&dir);
+
+        assert_eq!(
+            snapshot(&dir),
+            before,
+            "空库判定不得在目标目录留下任何改动（含 -shm 大小变化）"
+        );
+    }
+
+    /// 删除守卫：新版还没有数据时必须拒绝删除用户手选的旧目录。
+    #[test]
+    fn delete_guard_blocks_until_new_version_has_data() {
+        let root = tmp_root("guard");
+        // 目录不存在 → 拒绝
+        assert!(can_remove_source_safely(&root.join("nope")).is_err());
+        // 全新装好（无记录）→ 仍然拒绝
+        let dir = seeded_dir(&root);
+        assert!(
+            can_remove_source_safely(&dir).is_err(),
+            "新版尚无记录时必须拦住删除，否则用户会丢掉唯一的旧数据"
+        );
+        // 有记录 → 放行
+        let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        conn.execute(
+            "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+             VALUES ('text', 'x', 'app', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(can_remove_source_safely(&dir).is_ok());
+    }
 }

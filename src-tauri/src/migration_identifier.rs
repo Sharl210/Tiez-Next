@@ -63,8 +63,19 @@ pub enum MigrationOutcome {
     Migrated {
         source: PathBuf,
         target: PathBuf,
+        /// 源侧条目总数（**含目录条目**，与内部一致性校验同一口径）。
         files: u64,
+        /// 源侧全部条目的字节数之和。
         bytes: u64,
+        /// 本次**新交付**的文件数（不含目录条目，也不含目标里已存在而未被覆盖的文件）。
+        ///
+        /// 界面展示"复制了多少"应该用这个数，而不是 `files`——后者含目录条目、也含
+        /// 被沿用的条目，会让人高估实际交付量（复核 G-6）。
+        delivered_files: u64,
+        /// 本次**新交付**的字节数（与 `delivered_files` 同口径）。
+        delivered_bytes: u64,
+        /// 目标里**原本就存在、本次未覆盖**的文件数（按设计沿用目标版本）。
+        kept_existing: u64,
         /// 目标里"从未使用过的空库"被改名让位后的路径（若有）。
         ///
         /// 只在目标原先只有空库、本次接管了它时出现；界面据此说明"新版原先的空数据
@@ -83,7 +94,13 @@ pub enum SkipReason {
     NoLegacyDir,
     /// 旧目录与新目录是同一个路径（防御性检查）。
     SamePath,
-    /// 旧目录存在但不是目录。
+    /// 源路径根本不存在（移动硬盘未插、网络盘断开、路径打错）。
+    ///
+    /// 与 [`SkipReason::EmptySource`] 必须分开：两者给用户的诊断完全不同——"不存在"
+    /// 要去检查盘/路径，"空的"说明路径对了但没数据。历史上两者被合并成一个原因码，
+    /// 导致用户选到不存在的路径时看到「所选目录是空的」这种误导性提示（复核 G-3）。
+    SourceMissing,
+    /// 源路径存在但不是目录（例如用户手选到了一个文件）。
     NotADirectory,
     /// 源目录为空：没有可迁移的内容，不迁移也不删除。
     EmptySource,
@@ -100,6 +117,7 @@ impl SkipReason {
             SkipReason::TargetAlreadyHasData => "target_already_has_data",
             SkipReason::NoLegacyDir => "no_legacy_dir",
             SkipReason::SamePath => "same_path",
+            SkipReason::SourceMissing => "source_missing",
             SkipReason::NotADirectory => "not_a_directory",
             SkipReason::EmptySource => "empty_source",
             SkipReason::SourceIsAncestorOfTarget => "source_is_ancestor_of_target",
@@ -134,14 +152,26 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
 
     for legacy in legacy_dirs_for(new_dir) {
         match migrate_from(&legacy, new_dir, false) {
-            Outcome::Preserve => {}
+            // 该候选路径不存在 → 继续看下一个候选（候选是白名单枚举出来的，
+            // 本来就可能只有其中一个存在）。
+            Outcome::Absent | Outcome::Preserve => {}
             Outcome::Skipped(r) => return MigrationOutcome::Skipped(r),
-            Outcome::Migrated { files, bytes, .. } => {
+            Outcome::Migrated {
+                files,
+                bytes,
+                delivered_files,
+                delivered_bytes,
+                kept_existing,
+                ..
+            } => {
                 return MigrationOutcome::Migrated {
                     source: legacy,
                     target: new_dir.to_path_buf(),
                     files,
                     bytes,
+                    delivered_files,
+                    delivered_bytes,
+                    kept_existing,
                     yielded_db: None,
                 }
             }
@@ -213,17 +243,27 @@ fn migrate_from_inner(
     allow_pristine_target: bool,
 ) -> MigrationOutcome {
     match migrate_from(source, target, allow_pristine_target) {
+        // 用户手选的路径不存在：必须与"目录为空"区分开，否则会告诉用户一个错误的
+        // 诊断（移动硬盘没插 vs 目录里没数据，处置完全不同）。
+        Outcome::Absent => MigrationOutcome::Skipped(SkipReason::SourceMissing),
+        // 路径存在但为空目录：没有可迁移内容。
         Outcome::Preserve => MigrationOutcome::Skipped(SkipReason::EmptySource),
         Outcome::Skipped(r) => MigrationOutcome::Skipped(r),
         Outcome::Migrated {
             files,
             bytes,
+            delivered_files,
+            delivered_bytes,
+            kept_existing,
             yielded_db,
         } => MigrationOutcome::Migrated {
             source: source.to_path_buf(),
             target: target.to_path_buf(),
             files,
             bytes,
+            delivered_files,
+            delivered_bytes,
+            kept_existing,
             yielded_db,
         },
         Outcome::Failed(error) => MigrationOutcome::Failed {
@@ -231,14 +271,6 @@ fn migrate_from_inner(
             error,
         },
     }
-}
-
-/// 源目录根层是否含主数据库。
-///
-/// 只读取根层（不递归），用于在迁移**之前**提示用户"所选目录看起来不是本应用的数据
-/// 目录"。这是一个提示，不是拒绝条件：真实迁移仍以内容一致性校验为准。
-pub fn source_has_database(source: &Path) -> bool {
-    source.is_dir() && source.join(DB_FILE).is_file()
 }
 
 /// 迁移在源目录上的**只读检查**：把源目录里会被迁移的文件逐个打开读取一遍。
@@ -404,12 +436,18 @@ fn backup_path_for(target: &Path) -> PathBuf {
 
 /// 内部三态：无此候选 / 跳过 / 成功 / 失败。
 enum Outcome {
-    /// 该候选不存在或无需处理，继续试下一个。
+    /// 该候选**路径不存在**。对候选扫描意味着"换下一个候选"；对用户手选路径意味着
+    /// 要回报 [`SkipReason::SourceMissing`]（而不是"目录为空"）。
+    Absent,
+    /// 该候选存在但无需处理（空目录）。同样继续试下一个候选。
     Preserve,
     Skipped(SkipReason),
     Migrated {
         files: u64,
         bytes: u64,
+        delivered_files: u64,
+        delivered_bytes: u64,
+        kept_existing: u64,
         /// 目标里那个"从未使用过的空库"被改名让位后的路径（若有）。
         yielded_db: Option<PathBuf>,
     },
@@ -498,10 +536,10 @@ fn restore_yielded_target_db(yielded: &[PathBuf], target: &Path) {
 fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Outcome {
     // ---- 前置检查：任何一项不满足都保持原状 ----
     if !source.exists() {
-        return Outcome::Preserve;
+        return Outcome::Absent;
     }
     if !source.is_dir() {
-        return Outcome::Failed(format!("源路径不是目录: {}", source.display()));
+        return Outcome::Skipped(SkipReason::NotADirectory);
     }
     if source == target {
         return Outcome::Skipped(SkipReason::SamePath);
@@ -550,6 +588,21 @@ fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Ou
     // ---- 第一步：复制到独立暂存目录 ----
     // 暂存目录放在目标同级，保证后续 rename 是同一文件系统内的原子操作。
     let staging = staging_dir(target);
+    // 【为什么必须先查这一条】暂存目录名是 `.<目标名>.migrating.<pid>`，用户手选源路径
+    // 时**完全可能恰好选中这个目录**（例如上次崩溃后残留的暂存目录，或用户自己起了
+    // 同名目录）。而下面"清理上次崩溃残留的暂存目录"是无条件的 `remove_dir_all`——
+    // 若不先拦住，源目录会在这一行被整个删掉，随后校验必然失败，用户还会收到一句
+    // "源数据未改动"的错误信息。实测（本文件回归测试 `staging_never_deletes_the_source`
+    // 抓出）：源 2 个文件 → 目录消失、文件全丢。
+    //
+    // 这是"源的每一条失败出路都必须保留源"这条核心保证的一部分，因此与 SamePath /
+    // ancestor / inside 并列，放在任何写操作之前。
+    if staging == source {
+        return Outcome::Failed(format!(
+            "源目录与本次迁移要使用的暂存目录同名（{}）。为避免覆盖你选择的源目录，已放弃本次迁移；源目录未被读取也未被改动。请改选其它目录。",
+            staging.display()
+        ));
+    }
     // 清理上次崩溃残留的暂存目录（它从未被提升，删掉是安全的）。
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
@@ -616,9 +669,30 @@ fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Ou
     }
 
     let bytes = source_entries.iter().map(|(_, s)| *s).sum();
+
+    // 精确计数（复核 G-6）：把"本次真正交付的"与"目标里原本就有、按设计沿用的"分开。
+    // 目录条目（`rel` 以 '/' 结尾）不计入文件数。
+    let mut delivered_files = 0u64;
+    let mut delivered_bytes = 0u64;
+    let mut kept_existing = 0u64;
+    for (rel, size) in &source_entries {
+        if rel.ends_with('/') {
+            continue;
+        }
+        if preexisting.contains(rel) {
+            kept_existing += 1;
+        } else {
+            delivered_files += 1;
+            delivered_bytes += *size;
+        }
+    }
+
     Outcome::Migrated {
         files: source_entries.len() as u64,
         bytes,
+        delivered_files,
+        delivered_bytes,
+        kept_existing,
         yielded_db: yielded.first().cloned(),
     }
 }
@@ -970,13 +1044,13 @@ mod tests {
 
         let outcome = migrate_legacy_identifier_data(&target);
 
-        // 不是目录：不迁移、不破坏，且不会把该文件删掉
-        assert!(root.join("com.tiez.app").exists());
-        assert!(!target.exists());
+        // 不是目录：明确回报 NotADirectory，且不会把该文件删掉
         assert!(matches!(
             outcome,
-            MigrationOutcome::Failed { .. } | MigrationOutcome::Skipped(_)
+            MigrationOutcome::Skipped(SkipReason::NotADirectory)
         ));
+        assert!(root.join("com.tiez.app").exists());
+        assert!(!target.exists());
     }
 
     #[test]
@@ -1308,7 +1382,11 @@ mod tests {
 
         let outcome = migrate_from_source_dir(&source, &target, false);
 
-        assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
+        assert!(
+            matches!(outcome, MigrationOutcome::Skipped(SkipReason::NotADirectory)),
+            "选到文件应回报 NotADirectory，实际 {:?}",
+            outcome
+        );
         assert!(source.exists(), "用户选错的文件不得被删除");
         assert_eq!(fs::read(&source).unwrap(), b"user file");
         assert!(!target.exists());
@@ -1506,6 +1584,95 @@ mod tests {
         }
     }
 
+    /// **数据丢失回归（复核 G-1）**：源路径恰好等于本次迁移要用的暂存路径时，
+    /// 源目录绝不能被"清理残留暂存目录"那一步删掉。
+    ///
+    /// 历史实现：`staging_dir(target)` 先算出 `.<目标名>.migrating.<pid>`，随后在
+    /// `staging.exists()` 时**无条件** `remove_dir_all`。用户若手选到同名目录（例如上次
+    /// 崩溃残留的暂存目录），源会被整个删除，而错误信息还写着"源数据未改动"。实测：
+    /// 源 2 个文件 → 结果 Failed，但源目录已不存在、文件全丢。
+    #[test]
+    fn staging_never_deletes_the_source() {
+        let root = tmp("staging-collision");
+        let target = root.join("com.tieznext");
+        // 源目录名 == staging_dir(target) 的名字
+        let source = root.join(format!(
+            ".com.tieznext.migrating.{}",
+            std::process::id()
+        ));
+        seed_legacy(&source);
+        let before = scan_tree(&source).unwrap();
+        assert_eq!(staging_dir(&target), source, "测试前提：两者路径必须相同");
+
+        let outcome = migrate_from_source_dir(&source, &target, true);
+
+        // 核心断言：源目录及其全部内容必须完好
+        assert!(source.exists(), "源目录绝不能被删除");
+        assert_eq!(
+            scan_tree(&source).unwrap(),
+            before,
+            "源目录内容必须逐项未变"
+        );
+        assert!(source.join(DB_FILE).exists(), "源数据库必须还在");
+        // 且必须明确失败并说明原因，不得谎称"源数据未改动"后其实删了它
+        match outcome {
+            MigrationOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("同名"),
+                    "错误信息应说明是暂存目录同名，实际: {}",
+                    error
+                );
+            }
+            other => panic!("应明确失败，实际 {:?}", other),
+        }
+    }
+
+    /// **诊断准确性回归（复核 G-3）**：源路径**不存在**时必须回报 `SourceMissing`，
+    /// 不能与"目录为空"混为一谈——前者要用户检查盘/路径，后者说明路径对了但没数据。
+    #[test]
+    fn missing_source_reports_source_missing_not_empty_source() {
+        let root = tmp("missing-src");
+        let target = root.join("com.tieznext");
+        let source = root.join("D-does-not-exist");
+
+        let outcome = migrate_from_source_dir(&source, &target, true);
+
+        assert_eq!(
+            outcome_as_reason(&outcome),
+            Some(SkipReason::SourceMissing),
+            "不存在的路径应回报 SourceMissing，实际 {:?}",
+            outcome
+        );
+        assert!(!target.exists());
+    }
+
+    /// 对照：源目录**存在但为空**时回报 `EmptySource`（两个原因码必须可区分）。
+    #[test]
+    fn existing_but_empty_source_reports_empty_source() {
+        let root = tmp("empty-src");
+        let target = root.join("com.tieznext");
+        let source = root.join("present-but-empty");
+        fs::create_dir_all(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, true);
+
+        assert_eq!(
+            outcome_as_reason(&outcome),
+            Some(SkipReason::EmptySource),
+            "空目录应回报 EmptySource，实际 {:?}",
+            outcome
+        );
+        assert!(source.exists(), "空源目录也不得被删除");
+    }
+
+    /// 便捷取值：把 `Skipped` 的原因抽出来，便于断言。
+    fn outcome_as_reason(o: &MigrationOutcome) -> Option<SkipReason> {
+        match o {
+            MigrationOutcome::Skipped(r) => Some(*r),
+            _ => None,
+        }
+    }
+
     /// 只读检查必须能读完源目录全部文件，且读完不改动源。
     #[test]
     fn read_only_check_reads_every_file_and_changes_nothing() {
@@ -1519,7 +1686,6 @@ mod tests {
         assert_eq!(files, 7, "seed_legacy 造 7 个文件");
         assert!(bytes > 0);
         assert_eq!(scan_tree(&source).unwrap(), before, "只读检查不得改动源");
-        assert!(source_has_database(&source));
     }
 
     /// 跳过原因必须带稳定机器码，供界面按语言映射文案。
@@ -1531,6 +1697,7 @@ mod tests {
         );
         assert_eq!(SkipReason::NoLegacyDir.code(), "no_legacy_dir");
         assert_eq!(SkipReason::SamePath.code(), "same_path");
+        assert_eq!(SkipReason::SourceMissing.code(), "source_missing");
         assert_eq!(SkipReason::NotADirectory.code(), "not_a_directory");
         assert_eq!(SkipReason::EmptySource.code(), "empty_source");
         assert_eq!(
