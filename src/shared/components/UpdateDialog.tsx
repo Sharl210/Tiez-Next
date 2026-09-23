@@ -33,7 +33,8 @@ const UpdateDialog: React.FC<UpdateDialogProps> = ({
   }, [isOpen]);
 
   const handleOpenWebsite = () => {
-    openUrl("https://tiez.name666.top/");
+    // 更新失败时让用户能自己去下载。本项目没有官网，指向 Releases 页。
+    openUrl("https://github.com/Sharl210/Tiez-Next/releases");
   };
 
   return (
@@ -104,7 +105,7 @@ const UpdateDialog: React.FC<UpdateDialogProps> = ({
                     className="update-btn"
                   >
                     <ExternalLink size={16} />
-                    前往官网
+                    前往下载页
                   </button>
                 ) : status === "ready" ? (
                   <button

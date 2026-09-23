@@ -23,7 +23,6 @@ import DataSettingsGroup from "./groups/DataSettingsGroup";
 import FileTransferSettingsGroup from "./groups/FileTransferSettingsGroup";
 import AiSettingsGroup from "./groups/AiSettingsGroup";
 import SettingsFooter from "./SettingsFooter";
-import ThemeStorePanel from "../../theme-store/components/ThemeStorePanel";
 import { CLOUD_SYNC_ENABLED } from "../../../shared/config/edition";
 
 interface SettingsPanelProps {
@@ -284,7 +283,6 @@ const SettingsPanel = (props: SettingsPanelProps) => {
         aiProfiles, setAiProfiles, aiAssignedProfileTask, setAiAssignedProfileTask, aiAssignedProfileMouthpiece, setAiAssignedProfileMouthpiece, aiAssignedProfileTranslate, setAiAssignedProfileTranslate
     } = props;
 
-    const [emailCopied, setEmailCopied] = useState(false);
     const [appVersion, setAppVersion] = useState("");
     const [mqttStatus, setMqttStatus] = useState<"connected" | "disconnected" | "connecting">("disconnected");
     const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncStatusPayload>({
@@ -465,16 +463,7 @@ const SettingsPanel = (props: SettingsPanelProps) => {
             animate={{ opacity: 1, x: 0 }}
             style={{ display: 'flex', flexDirection: 'column', gap: '4px', minHeight: '100%', flex: 1 }}
         >
-            {settingsSubpage === "theme-store" ? (
-                <ThemeStorePanel
-                    t={t}
-                    theme={theme}
-                    setTheme={setTheme}
-                    saveAppSetting={saveAppSetting}
-                    language={language}
-                    onBack={() => setSettingsSubpage("home")}
-                />
-            ) : settingsSubpage === "advanced" ? (
+            {settingsSubpage === "advanced" ? (
                 <>
                     <AdvancedSettingsGroup
                         t={t}
@@ -640,7 +629,6 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 surfaceOpacity={surfaceOpacity}
                 setSurfaceOpacity={setSurfaceOpacity}
                 saveAppSetting={saveAppSetting}
-                setSettingsSubpage={setSettingsSubpage}
             />
 
             {/* Sync Settings */}
@@ -803,8 +791,6 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 setUpdateStatus={setUpdateStatus}
                 // Removed setUpdateModalData
                 onResetSettings={handleResetSettings}
-                emailCopied={emailCopied}
-                setEmailCopied={setEmailCopied}
             />
 
             <AiProfileModal

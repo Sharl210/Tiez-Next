@@ -25,6 +25,12 @@ interface AppMainContentProps {
   showSettings: boolean;
   showTagManager: boolean;
   tagManagerEnabled: boolean;
+  /**
+   * The persisted tag-manager split geometry from the settings blob the app loaded
+   * at boot. Passed down so the manager can render its remembered ratio on the very
+   * first frame instead of reading settings asynchronously and jumping.
+   */
+  tagManagerSize: unknown;
   showEmojiPanel: boolean;
   chatMode: boolean;
   localIp: string;
@@ -98,6 +104,7 @@ const AppMainContent = ({
   showSettings,
   showTagManager,
   tagManagerEnabled,
+  tagManagerSize,
   showEmojiPanel,
   chatMode,
   localIp,
@@ -196,7 +203,7 @@ const AppMainContent = ({
         animate={{ opacity: 1, x: 0 }}
         style={{ height: "100%" }}
       >
-        <TagManager t={t} theme={theme} />
+        <TagManager t={t} theme={theme} persistedSize={tagManagerSize} />
       </motion.div>
     );
   }

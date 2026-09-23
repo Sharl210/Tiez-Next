@@ -221,6 +221,9 @@ export const useClipboardItemRenderer = ({
             : undefined}
           onNoteEditCancel={closeNoteEditor}
           tagSuggestions={isEditingTags ? allTags : EMPTY_TAG_SUGGESTIONS}
+          // v0.5 需求⑨：「移动到标签 / 复制到标签」需要一个**不依赖编辑态**的全库标签
+          // 候选表（对话框可以脱离标签编辑器单独打开），因此单列一个 prop。
+          allTagNames={allTags}
           tagColors={tagColors}
           theme={theme}
           language={language}

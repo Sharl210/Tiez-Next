@@ -180,6 +180,36 @@ pub fn catalog() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "move_entry_to_tag",
+            title: "移动条目标签",
+            description: "把一个条目从标签 A 移动到标签 B：A 从该条目的标签集合里换成 B，条目上的其他标签不受影响（条目与标签是多对多关系）。与界面上的“移动到标签”是同一份实现。",
+            access: Access::Write,
+            destructive: false,
+            input_schema: obj(
+                json!({
+                    "id": id_prop,
+                    "fromTag": {"type": "string", "description": "源标签名（从哪个标签移出）"},
+                    "toTag": {"type": "string", "description": "目标标签名（移动到哪个标签）"},
+                }),
+                vec!["id", "fromTag", "toTag"],
+            ),
+        },
+        ToolSpec {
+            name: "copy_entry_to_tag",
+            title: "复制条目标签",
+            description: "把条目复制到标签 B：保留原有的全部标签，额外加上 B（已存在则不重复）。与界面上的“复制到标签”是同一份实现。",
+            access: Access::Write,
+            destructive: false,
+            input_schema: obj(
+                json!({
+                    "id": id_prop,
+                    "fromTag": {"type": "string", "description": "源标签名（从哪个标签复制）"},
+                    "toTag": {"type": "string", "description": "目标标签名（复制到哪个标签）"},
+                }),
+                vec!["id", "fromTag", "toTag"],
+            ),
+        },
+        ToolSpec {
             name: "set_entry_pinned",
             title: "设置条目置顶",
             description: "设置或取消条目置顶。与界面一样会更新置顶顺序并请求云同步。",
@@ -470,6 +500,64 @@ fn require_entry(store: &McpStore, id: i64) -> Result<(), String> {
     }
 }
 
+/// 「移动到标签」与「复制到标签」的共同实现。
+///
+/// 与界面命令 `move_entry_to_tag` / `copy_entry_to_tag` 的关系：**同一个共享内核
+/// 调用序列**——读旧集合 → 由 [`mutation::transferred_tags`] 算出新集合 →
+/// [`mutation::apply_entry_tag_transfer`] 落库 → 按敏感性翻转入队加解密。
+/// 因此"人能操作的 MCP 也支持"不是两份实现的巧合，而是同一份实现的两个入口。
+///
+/// 返回值刻意带上 `tagsBefore` / `tagsAfter`：AI 调完就能自己核对"源没了、目标有了、
+/// 其他标签还在"，不必再发一次读取请求。
+fn tag_transfer(ctx: &Ctx<'_>, args: &Value, kind: mutation::TagTransfer) -> ToolOutcome {
+    let store = ctx.store;
+    let id = match i64_arg(args, "id") {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::failed(e),
+    };
+    let from_tag = match str_arg(args, "fromTag") {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::failed(e),
+    };
+    let to_tag = match str_arg(args, "toTag") {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::failed(e),
+    };
+    if let Err(e) = require_entry(store, id) {
+        return ToolOutcome::failed(e);
+    }
+
+    // 变更前的集合从库里读，而不是相信调用方传进来的 tags。
+    let before = match mutation::read_entry_tags(&store.conn, id) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::failed(e),
+    };
+
+    match mutation::apply_entry_tag_transfer(&store.conn, &store.tag_repo, id, &from_tag, &to_tag, kind)
+    {
+        Ok(step) => {
+            match step {
+                mutation::SensitiveTransition::Encrypt => ctx.effects.enqueue_encryption(id, true),
+                mutation::SensitiveTransition::Decrypt => ctx.effects.enqueue_encryption(id, false),
+                mutation::SensitiveTransition::None => {}
+            }
+            ctx.effects.emit_changed();
+            ctx.effects.request_cloud_sync();
+            let after = mutation::read_entry_tags(&store.conn, id).unwrap_or_default();
+            ToolOutcome::ok(json!({
+                "id": id,
+                "mode": if kind == mutation::TagTransfer::Move { "move" } else { "copy" },
+                "fromTag": from_tag,
+                "toTag": to_tag,
+                "tagsBefore": before,
+                "tagsAfter": after,
+                "sensitivityChanged": !matches!(step, mutation::SensitiveTransition::None),
+            }))
+        }
+        Err(e) => ToolOutcome::failed(format!("标签转移失败：{}", e)),
+    }
+}
+
 /// 执行一次工具调用。
 ///
 /// 调用方（`server.rs`）已完成：JSON-RPC 形状校验、工具存在性、写权限、破坏性
@@ -755,6 +843,10 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
                 Err(e) => ToolOutcome::failed(format!("修改标签失败：{}", e)),
             }
         }
+
+        "move_entry_to_tag" => tag_transfer(ctx, args, mutation::TagTransfer::Move),
+
+        "copy_entry_to_tag" => tag_transfer(ctx, args, mutation::TagTransfer::Copy),
 
         "set_entry_pinned" => {
             let id = match i64_arg(args, "id") {

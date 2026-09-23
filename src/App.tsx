@@ -1098,6 +1098,7 @@ const App = () => {
           showSettings={showSettings}
           showTagManager={effectiveShowTagManager}
           tagManagerEnabled={tagManagerEnabled}
+          tagManagerSize={appSettings["app.tag_manager_size"]}
           showEmojiPanel={effectiveShowEmojiPanel}
           chatMode={chatMode}
           localIp={localIp}

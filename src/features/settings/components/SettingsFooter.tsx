@@ -1,4 +1,4 @@
-import { Github, MessageSquare, RotateCcw, X, ArrowUpCircle } from "lucide-react";
+import { Github, RotateCcw, X, ArrowUpCircle } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -10,8 +10,6 @@ interface SettingsFooterProps {
     updateStatus: string;
     setUpdateStatus: (val: string) => void;
     onResetSettings: () => void;
-    emailCopied: boolean;
-    setEmailCopied: (val: boolean) => void;
 }
 
 const SettingsFooter = ({
@@ -19,9 +17,7 @@ const SettingsFooter = ({
     appVersion,
     updateStatus,
     setUpdateStatus,
-    onResetSettings,
-    emailCopied,
-    setEmailCopied
+    onResetSettings
 }: SettingsFooterProps) => {
     const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
 
@@ -217,33 +213,7 @@ const SettingsFooter = ({
                 gap: '12px',
                 flexWrap: 'wrap'
             }}>
-                {/* Feedback Card */}
-                <div
-                    className="settings-group"
-                    style={{
-                        cursor: 'pointer',
-                        transition: 'all 0.2s',
-                        margin: 0,
-                        width: 'auto',
-                        padding: '10px 16px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        marginBottom: '0'
-                    }}
-                    onClick={() => {
-                        navigator.clipboard.writeText('tiez@name666.top');
-                        setEmailCopied(true);
-                        setTimeout(() => setEmailCopied(false), 2000);
-                    }}
-                >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <MessageSquare size={16} />
-                        <span style={{ fontSize: '13px', fontWeight: 600 }}>
-                            {emailCopied ? t('email_copied') : t('feedback')}
-                        </span>
-                    </div>
-                </div>
+                {/* Feedback Card 已移除：原先复制的是上游项目的邮箱，本项目没有对应的反馈渠道。 */}
 
                 {/* Reset Card */}
                 <div
@@ -341,25 +311,7 @@ const SettingsFooter = ({
                     flexWrap: 'wrap'
                 }}>
                     <button
-                        onClick={() => openUrl('https://tiez.name666.top/')}
-                        style={{
-                            fontSize: '11px',
-                            color: 'var(--accent-color)',
-                            background: 'transparent',
-                            border: 'none',
-                            cursor: 'pointer',
-                            textDecoration: 'underline',
-                            opacity: 0.7,
-                            fontWeight: 600,
-                            padding: '2px 4px'
-                        }}
-                        onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
-                        onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.7')}
-                    >
-                        {t('official_website')}
-                    </button>
-                    <button
-                        onClick={() => openUrl('https://github.com/jimuzhe/tiez-clipboard')}
+                        onClick={() => openUrl('https://github.com/Sharl210/Tiez-Next')}
                         style={{
                             fontSize: '11px',
                             color: 'var(--accent-color)',

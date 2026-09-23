@@ -1,16 +1,37 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronDown, ChevronRight, Copy, RefreshCw } from "lucide-react";
+import {
+    ChevronDown,
+    ChevronRight,
+    Copy,
+    Globe,
+    Lock,
+    RefreshCw,
+    ServerOff,
+    ShieldAlert,
+} from "lucide-react";
 
-/** 后端 `get_mcp_status` 的返回形状。 */
+/** 后端 `get_mcp_status` 的返回形状（camelCase）。 */
 interface McpStatus {
     running: boolean;
     port: number;
     enabled: boolean;
     allowWrite: boolean;
     autostart: boolean;
+    /** 是否强制校验令牌。`false` = 免鉴权（出厂默认）。 */
+    requireToken: boolean;
+    /** 是否允许局域网访问。`false` = 仅本机（出厂默认）。 */
+    allowLan: boolean;
     token: string;
+    /** 本机入口；无论是否开放局域网都可用。仅在运行中非空。 */
     endpoint: string;
+    /** 局域网入口；仅"运行中 + 已开放局域网"时非空。 */
+    lanEndpoint: string;
+    defaultPort: number;
+    defaultEnabled: boolean;
+    defaultAllowWrite: boolean;
+    defaultRequireToken: boolean;
+    defaultAllowLan: boolean;
 }
 
 interface McpSettingsGroupProps {
@@ -20,25 +41,108 @@ interface McpSettingsGroupProps {
 }
 
 /**
+ * 与相邻分组共用的内联样式片段。
+ *
+ * 取值刻意与 `DataSettingsGroup` / `CloudSyncSettingsGroup` 对齐：说明文字 10–11px、
+ * 区块标题 11px + uppercase、分隔线用 `--border-color`、控件用 `--search-input` 与
+ * `btn-icon`，危险色用 `var(--danger-color, #c05050)`。此处只做复用，不引入新视觉规则。
+ */
+const STYLES = {
+    /** 区块小标题：与 DataSettingsGroup 的 `data_path` / `backup_section` 同款。 */
+    sectionTitle: {
+        textTransform: "uppercase",
+        fontSize: "11px",
+        opacity: 0.8,
+    },
+    /** 二级说明文字：与 DataSettingsGroup 的按钮下方提示同款。 */
+    subNote: {
+        fontSize: "10px",
+        color: "var(--text-secondary)",
+        opacity: 0.85,
+        lineHeight: 1.5,
+    },
+    /** 徽标（默认 / 需重启 等）。 */
+    badge: {
+        fontSize: "10px",
+        lineHeight: 1,
+        padding: "3px 6px",
+        borderRadius: "4px",
+        border: "1px solid var(--border-color, rgba(128,128,128,0.25))",
+        color: "var(--text-secondary)",
+        whiteSpace: "nowrap" as const,
+        flexShrink: 0,
+    },
+    /** 提示框：沿用 DataSettingsGroup 结果框的圆角/内边距/行高。 */
+    callout: {
+        borderRadius: "6px",
+        padding: "8px 10px",
+        fontSize: "10px",
+        lineHeight: 1.6,
+        wordBreak: "break-all" as const,
+    },
+    /** 小尺寸文字按钮：与 DataSettingsGroup 的操作按钮尺寸一致。 */
+    actionButton: {
+        width: "auto",
+        padding: "4px 12px",
+        fontSize: "10px",
+        height: "24px",
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+    },
+    iconButton: {
+        width: "auto",
+        padding: "4px 8px",
+        height: "24px",
+    },
+} as const;
+
+const DANGER_COLOR = "var(--danger-color, #c05050)";
+
+/**
  * MCP 服务设置。
  *
- * 设计要点（与后端一致）：
- * - 默认 **关闭**、默认 **只读**：两件事都必须由用户显式打开；
- * - 令牌由后端生成，界面只负责展示与复制，不参与生成；
- * - 界面永远显示"现在到底能不能写"，避免用户以为已经开了。
+ * 设计要点（与后端契约一致）：
+ * - 出厂姿态是"开箱即用但只监听本机"：服务开、可写、免鉴权、固定端口 23123，且
+ *   **仅绑回环**。免鉴权只有在"外部机器根本连不上"时才成立，因此开放局域网是这一组
+ *   设置里风险最高的一项，界面必须把它讲清楚，而不是等用户自己去推断。
+ * - 不同开关生效方式不同：令牌校验与写权限即时生效；监听地址在 bind 时定下，改局域网
+ *   开关必须重启服务——界面上用徽标区分，不能让用户以为点完就生效了。
+ * - 令牌由后端生成，界面只负责展示与复制；免鉴权模式下它依然存在，用户随时可以打开
+ *   校验而不必重新生成，所以这里不隐藏令牌，只说明"当前未校验"。
  */
 const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => {
     const [status, setStatus] = useState<McpStatus | null>(null);
+    const [configuredPort, setConfiguredPort] = useState<number | null>(null);
     const [portInput, setPortInput] = useState("");
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState("");
-    const [copied, setCopied] = useState(false);
+    const [copied, setCopied] = useState<"endpoint" | "lanEndpoint" | "token" | null>(null);
+    /** 局域网开关触发重启后返回的端口，用于给用户一个明确的"已生效"回执。 */
+    const [restartedPort, setRestartedPort] = useState<number | null>(null);
 
     const refresh = useCallback(async () => {
         try {
             const next = await invoke<McpStatus>("get_mcp_status");
             setStatus(next);
-            setPortInput(String(next.port || next.port === 0 ? next.port || "" : ""));
+            // 服务停止时后端返回 port=0，此时"当前端口"要回到已保存的配置值，
+            // 否则重启后用户就看不到自己设过的端口了。
+            if (next.running) {
+                setConfiguredPort(next.port);
+                setPortInput(String(next.port));
+            } else {
+                let saved: number | null = null;
+                try {
+                    const settings = await invoke<Record<string, string>>("get_settings");
+                    const raw = Number.parseInt(settings?.["mcp.port"] ?? "", 10);
+                    if (!Number.isNaN(raw)) saved = raw;
+                } catch {
+                    // 读不到就退回默认值展示，不影响主流程
+                }
+                const shown = saved ?? next.defaultPort;
+                setConfiguredPort(shown);
+                setPortInput(String(shown));
+            }
             setError("");
         } catch (e) {
             setError(String(e));
@@ -62,14 +166,39 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
         }
     };
 
+    const copy = async (kind: "endpoint" | "lanEndpoint" | "token", value: string) => {
+        if (!value) return;
+        try {
+            await navigator.clipboard.writeText(value);
+            setCopied(kind);
+            window.setTimeout(() => setCopied(null), 1500);
+        } catch (e) {
+            setError(String(e));
+        }
+    };
+
     const toggleEnabled = (next: boolean) =>
         run(async () => {
             await invoke<number>("set_mcp_server_enabled", { enabled: next });
         });
 
+    /** 即时生效：只改运行时开关，不重启服务。 */
+    const toggleRequireToken = (next: boolean) =>
+        run(async () => {
+            await invoke("set_mcp_require_token", { require: next });
+        });
+
+    /** 即时生效：立刻收回/放开写权限。 */
     const toggleWrite = (next: boolean) =>
         run(async () => {
             await invoke("set_mcp_allow_write", { allow: next });
+        });
+
+    /** 需要重启服务：监听地址在 bind 时定下，运行中改不了。 */
+    const toggleAllowLan = (next: boolean) =>
+        run(async () => {
+            const port = await invoke<number>("set_mcp_allow_lan", { allow: next });
+            setRestartedPort(port > 0 ? port : null);
         });
 
     const toggleAutostart = (next: boolean) =>
@@ -91,130 +220,384 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
             await invoke<string>("regenerate_mcp_token");
         });
 
-    const copyToken = async () => {
+    const resetPortInput = () => {
         if (!status) return;
-        try {
-            await navigator.clipboard.writeText(status.token);
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1500);
-        } catch (e) {
-            setError(String(e));
-        }
+        setPortInput(String(configuredPort ?? status.defaultPort));
     };
+
+    const enabled = status?.enabled ?? false;
+    const running = status?.running ?? false;
+    const allowLan = status?.allowLan ?? false;
+    const requireToken = status?.requireToken ?? false;
+    const currentPort = configuredPort ?? status?.port ?? 0;
+    const defaultPort = status?.defaultPort ?? 23123;
+    const portIsDefault = currentPort === defaultPort;
+    /** 高风险组合：已开放局域网、却不要令牌。两者正交，因此只提示、不联动。 */
+    const riskyCombo = allowLan && !requireToken;
 
     return (
         <div className={`settings-group ${collapsed ? "collapsed" : ""}`}>
-            <button type="button" className="group-header" onClick={onToggle}>
-                <h3>{t("mcp_service")}</h3>
+            <div className="group-header" onClick={onToggle}>
+                <h3 style={{ margin: 0 }}>{t("mcp_service")}</h3>
                 {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-            </button>
+            </div>
 
             {!collapsed && (
                 <div className="group-content">
                     <p className="settings-subpage-note">{t("mcp_service_desc")}</p>
 
-                    <div className="setting-row">
-                        <div className="setting-label">
-                            <span>{t("mcp_enable")}</span>
-                            <small>{t("mcp_enable_hint")}</small>
+                    {/* 当前暴露面：用户最该一眼看懂的两件事——能从哪里连进来、连进来要不要令牌 */}
+                    <div className="setting-item column no-border">
+                        <div
+                            style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                marginBottom: "8px",
+                            }}
+                        >
+                            <span className="item-label" style={STYLES.sectionTitle}>
+                                {t("mcp_exposure_title")}
+                            </span>
+                            <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
+                                <span
+                                    style={{
+                                        ...STYLES.badge,
+                                        color: running ? "var(--text-primary)" : "var(--text-secondary)",
+                                        borderColor: running
+                                            ? "rgba(64,160,96,0.5)"
+                                            : "var(--border-color, rgba(128,128,128,0.25))",
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "4px",
+                                    }}
+                                >
+                                    <ServerOff size={10} style={{ display: running ? "none" : "block" }} />
+                                    {running ? t("mcp_status_running") : t("mcp_status_stopped")}
+                                </span>
+                                <span
+                                    style={{
+                                        ...STYLES.badge,
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "4px",
+                                        color: allowLan ? DANGER_COLOR : "var(--text-secondary)",
+                                        borderColor: allowLan
+                                            ? "rgba(200,80,80,0.5)"
+                                            : "var(--border-color, rgba(128,128,128,0.25))",
+                                    }}
+                                >
+                                    <Globe size={10} />
+                                    {allowLan ? t("mcp_exposure_lan") : t("mcp_exposure_local")}
+                                </span>
+                                <span
+                                    style={{
+                                        ...STYLES.badge,
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "4px",
+                                        color: requireToken ? "var(--text-primary)" : DANGER_COLOR,
+                                        borderColor: requireToken
+                                            ? "var(--border-color, rgba(128,128,128,0.25))"
+                                            : "rgba(200,80,80,0.5)",
+                                    }}
+                                >
+                                    <Lock size={10} />
+                                    {requireToken ? t("mcp_exposure_auth_on") : t("mcp_exposure_auth_off")}
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* 本机端点：始终可用，因此永远显示；复制按钮沿用相邻分组的 btn-icon */}
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "6px" }}>
+                            <span style={{ ...STYLES.subNote, flexShrink: 0 }}>{t("mcp_endpoint_local")}</span>
+                            <div
+                                className="data-panel"
+                                style={{ fontSize: "11px", flex: 1, minWidth: 0 }}
+                                title={status?.endpoint || "-"}
+                            >
+                                {running && status?.endpoint ? status.endpoint : "-"}
+                            </div>
+                            <button
+                                type="button"
+                                className="btn-icon"
+                                disabled={!running || !status?.endpoint}
+                                onClick={() => void copy("endpoint", status?.endpoint ?? "")}
+                                title={t("mcp_copy")}
+                                style={STYLES.iconButton}
+                            >
+                                <Copy size={12} />
+                            </button>
+                        </div>
+
+                        {/* 局域网端点：只在真的对外开放且服务在跑时才有值，没有就不编一个出来 */}
+                        {running && allowLan && status?.lanEndpoint && (
+                            <div style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "6px" }}>
+                                <span style={{ ...STYLES.subNote, flexShrink: 0 }}>{t("mcp_endpoint_lan")}</span>
+                                <div
+                                    className="data-panel"
+                                    style={{ fontSize: "11px", flex: 1, minWidth: 0, color: DANGER_COLOR }}
+                                    title={status.lanEndpoint}
+                                >
+                                    {status.lanEndpoint}
+                                </div>
+                                <button
+                                    type="button"
+                                    className="btn-icon"
+                                    onClick={() => void copy("lanEndpoint", status.lanEndpoint)}
+                                    title={t("mcp_copy")}
+                                    style={STYLES.iconButton}
+                                >
+                                    <Copy size={12} />
+                                </button>
+                            </div>
+                        )}
+
+                        {restartedPort !== null && (
+                            <div style={{ ...STYLES.subNote, marginBottom: "6px" }}>
+                                {t("mcp_lan_restarted").replace("{port}", String(restartedPort))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* 安全提示：开放局域网是这一组设置里唯一会扩大攻击面的一项，必须显著 */}
+                    {allowLan && (
+                        <div
+                            style={{
+                                ...STYLES.callout,
+                                border: `1px solid ${riskyCombo ? "rgba(200,80,80,0.5)" : "rgba(217,119,6,0.5)"}`,
+                                marginTop: "8px",
+                                display: "flex",
+                                gap: "8px",
+                                alignItems: "flex-start",
+                            }}
+                        >
+                            <ShieldAlert size={14} style={{ color: DANGER_COLOR, flexShrink: 0, marginTop: "1px" }} />
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{ fontWeight: 600, marginBottom: "4px", color: DANGER_COLOR }}>
+                                    {t("mcp_lan_warning_title")}
+                                </div>
+                                <div>{t("mcp_lan_warning")}</div>
+                                {riskyCombo && (
+                                    <div style={{ marginTop: "4px" }}>{t("mcp_lan_suggest_token")}</div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* 免鉴权只在"仅本机"下成立——这是出厂姿态能安全的原因，必须写出来 */}
+                    {!requireToken && !allowLan && (
+                        <div style={{ ...STYLES.callout, border: "1px solid var(--border-color, rgba(128,128,128,0.25))", marginTop: "8px" }}>
+                            {t("mcp_noauth_warning")}
+                        </div>
+                    )}
+
+                    <div className="setting-item">
+                        <div className="item-label-group">
+                            <span className="item-label">{t("mcp_enable")}</span>
+                            <span className="hint">{t("mcp_enable_hint")}</span>
                         </div>
                         <label className="switch">
                             <input
+                                className="cb"
                                 type="checkbox"
-                                checked={status?.enabled ?? false}
+                                checked={enabled}
                                 disabled={busy}
                                 onChange={(e) => void toggleEnabled(e.target.checked)}
                             />
-                            <span className="slider" />
+                            <div className="toggle"><div className="left" /><div className="right" /></div>
                         </label>
                     </div>
 
-                    <div className="setting-row">
-                        <div className="setting-label">
-                            <span>{t("mcp_allow_write")}</span>
-                            <small>{t("mcp_allow_write_hint")}</small>
+                    <div className="setting-item">
+                        <div className="item-label-group">
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span className="item-label">{t("mcp_require_token")}</span>
+                                <span style={STYLES.badge}>{t("mcp_instant_badge")}</span>
+                            </div>
+                            <span className="hint">{t("mcp_require_token_hint")}</span>
                         </div>
                         <label className="switch">
                             <input
+                                className="cb"
+                                type="checkbox"
+                                checked={requireToken}
+                                disabled={busy || !enabled}
+                                onChange={(e) => void toggleRequireToken(e.target.checked)}
+                            />
+                            <div className="toggle"><div className="left" /><div className="right" /></div>
+                        </label>
+                    </div>
+
+                    <div className="setting-item">
+                        <div className="item-label-group">
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span className="item-label">{t("mcp_allow_lan")}</span>
+                                <span style={{ ...STYLES.badge, color: DANGER_COLOR, borderColor: "rgba(200,80,80,0.5)" }}>
+                                    {t("mcp_restart_badge")}
+                                </span>
+                            </div>
+                            <span className="hint">{t("mcp_allow_lan_hint")}</span>
+                        </div>
+                        <label className="switch">
+                            <input
+                                className="cb"
+                                type="checkbox"
+                                checked={allowLan}
+                                disabled={busy || !enabled}
+                                onChange={(e) => void toggleAllowLan(e.target.checked)}
+                            />
+                            <div className="toggle"><div className="left" /><div className="right" /></div>
+                        </label>
+                    </div>
+
+                    <div className="setting-item">
+                        <div className="item-label-group">
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span className="item-label">{t("mcp_allow_write")}</span>
+                                <span style={STYLES.badge}>{t("mcp_instant_badge")}</span>
+                            </div>
+                            <span className="hint">{t("mcp_allow_write_hint")}</span>
+                        </div>
+                        <label className="switch">
+                            <input
+                                className="cb"
                                 type="checkbox"
                                 checked={status?.allowWrite ?? false}
-                                disabled={busy || !status?.enabled}
+                                disabled={busy || !enabled}
                                 onChange={(e) => void toggleWrite(e.target.checked)}
                             />
-                            <span className="slider" />
+                            <div className="toggle"><div className="left" /><div className="right" /></div>
                         </label>
                     </div>
 
-                    <div className="setting-row">
-                        <div className="setting-label">
-                            <span>{t("mcp_autostart")}</span>
-                            <small>{t("mcp_autostart_hint")}</small>
+                    <div className="setting-item">
+                        <div className="item-label-group">
+                            <span className="item-label">{t("mcp_autostart")}</span>
+                            <span className="hint">{t("mcp_autostart_hint")}</span>
                         </div>
                         <label className="switch">
                             <input
+                                className="cb"
                                 type="checkbox"
                                 checked={status?.autostart ?? false}
                                 disabled={busy}
                                 onChange={(e) => void toggleAutostart(e.target.checked)}
                             />
-                            <span className="slider" />
+                            <div className="toggle"><div className="left" /><div className="right" /></div>
                         </label>
                     </div>
 
-                    <div className="setting-row">
-                        <div className="setting-label">
-                            <span>{t("mcp_port")}</span>
-                            <small>{t("mcp_port_hint")}</small>
+                    <div className="setting-item column no-border">
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                                <span className="item-label">{t("mcp_port")}</span>
+                                {portIsDefault && <span style={STYLES.badge}>{t("mcp_default_badge")}</span>}
+                            </div>
+                            <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
+                                <input
+                                    className="search-input"
+                                    inputMode="numeric"
+                                    value={portInput}
+                                    disabled={busy}
+                                    onChange={(e) => setPortInput(e.target.value.replace(/[^0-9]/g, ""))}
+                                    style={{ borderRadius: "4px", padding: "4px 8px", width: "84px", textAlign: "right" }}
+                                />
+                                <button
+                                    type="button"
+                                    className="btn-icon"
+                                    disabled={busy}
+                                    onClick={() => void applyPort()}
+                                    style={STYLES.actionButton}
+                                >
+                                    {t("mcp_apply")}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="btn-icon"
+                                    disabled={busy || portInput === String(currentPort)}
+                                    onClick={resetPortInput}
+                                    title={t("mcp_port_reset_hint")}
+                                    style={STYLES.iconButton}
+                                >
+                                    <RefreshCw size={12} />
+                                </button>
+                            </div>
                         </div>
-                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                            <input
-                                type="text"
-                                inputMode="numeric"
-                                value={portInput}
-                                disabled={busy}
-                                onChange={(e) => setPortInput(e.target.value.replace(/[^0-9]/g, ""))}
-                                style={{ width: 90 }}
-                            />
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => void applyPort()}>
-                                {t("mcp_apply")}
-                            </button>
+                        <div style={STYLES.subNote}>
+                            {t("mcp_port_default_note")
+                                .replace("{default}", String(defaultPort))
+                                .replace("{current}", String(currentPort))}
                         </div>
+                        <div style={STYLES.subNote}>{t("mcp_port_hint")}</div>
                     </div>
 
-                    <div className="setting-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
-                        <div className="setting-label">
-                            <span>{t("mcp_token")}</span>
-                            <small>
-                                {t("mcp_token_hint")}
-                                {status?.running
-                                    ? ` ${t("mcp_running_on")} ${status.endpoint}`
-                                    : ` ${t("mcp_not_running")}`}
-                            </small>
+                    <div className="setting-item column no-border">
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
+                            <span className="item-label">{t("mcp_token")}</span>
+                            <span
+                                style={{
+                                    ...STYLES.badge,
+                                    color: requireToken ? "var(--text-primary)" : DANGER_COLOR,
+                                    borderColor: requireToken
+                                        ? "var(--border-color, rgba(128,128,128,0.25))"
+                                        : "rgba(200,80,80,0.5)",
+                                }}
+                            >
+                                {requireToken ? t("mcp_exposure_auth_on") : t("mcp_exposure_auth_off")}
+                            </span>
                         </div>
-                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
                             <input
+                                className="search-input"
                                 type="text"
                                 readOnly
                                 value={status?.token ?? ""}
                                 onFocus={(e) => e.currentTarget.select()}
-                                style={{ flex: 1, fontFamily: "monospace" }}
+                                style={{
+                                    borderRadius: "4px",
+                                    padding: "4px 8px",
+                                    flex: 1,
+                                    minWidth: 0,
+                                    fontFamily: "monospace",
+                                    fontSize: "11px",
+                                }}
                             />
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => void copyToken()}>
-                                <Copy size={14} />
-                                {copied ? t("mcp_copied") : t("mcp_copy")}
+                            <button
+                                type="button"
+                                className="btn-icon"
+                                onClick={() => void copy("token", status?.token ?? "")}
+                                style={STYLES.actionButton}
+                            >
+                                <Copy size={12} />
+                                {copied === "token" ? t("mcp_copied") : t("mcp_copy")}
                             </button>
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => void regenerate()} title={t("mcp_regenerate_hint")}>
-                                <RefreshCw size={14} />
+                            <span
+                                aria-hidden="true"
+                                style={{ width: "1px", height: "16px", background: "var(--border-color, rgba(128,128,128,0.3))" }}
+                            />
+                            <button
+                                type="button"
+                                className="btn-icon"
+                                disabled={busy}
+                                onClick={() => void regenerate()}
+                                title={t("mcp_regenerate_hint")}
+                                style={STYLES.actionButton}
+                            >
+                                <RefreshCw size={12} />
                                 {t("mcp_regenerate")}
                             </button>
+                        </div>
+                        <div style={STYLES.subNote}>
+                            {requireToken ? t("mcp_token_hint") : t("mcp_token_idle_hint")}
                         </div>
                     </div>
 
                     <p className="settings-subpage-note">{t("mcp_client_hint")}</p>
-                    {status?.running && !status.allowWrite && (
+                    {running && !status?.allowWrite && (
                         <p className="settings-subpage-note">{t("mcp_readonly_notice")}</p>
                     )}
-                    {error && <p className="settings-subpage-note" style={{ color: "#e5484d" }}>{error}</p>}
+                    {error && <p className="settings-subpage-note" style={{ color: DANGER_COLOR }}>{error}</p>}
                 </div>
             )}
         </div>

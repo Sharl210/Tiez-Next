@@ -19,13 +19,23 @@ interface DataSettingsGroupProps {
     dataPath: string;
 }
 
-/** 一条历史数据目录信息（对应后端 `list_legacy_data_dirs`）。 */
+/** 一条可迁移来源目录信息（对应后端 `list_legacy_data_dirs`）。 */
 interface LegacyDir {
     path: string;
     identifier: string;
+    /**
+     * 这条数据原本属于哪个应用：
+     * - `legacy_tiez`：旧版 TieZ（应用改名前的上游版本）
+     * - `previous_tiez_next`：历史版本的 Tiez-Next（标识符未变，含之后所有版本）
+     *
+     * 是机器可读码，界面按语言映射成 `legacy_origin_*` 文案。
+     */
+    origin: string;
     bytes: number;
     files: number;
     has_database: boolean;
+    /** 是否允许"备份后删除"。本应用自己标识符的目录恒为 false。 */
+    canDelete: boolean;
 }
 
 /**
@@ -250,6 +260,21 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
     const skipReasonText = (code: string | null): string => {
         if (!code) return "";
         const key = `legacy_migrate_notice_${code}`;
+        const text = t(key);
+        return text === key ? code : text;
+    };
+
+    /**
+     * 把后端给的来源码翻成当前语言，让用户知道每条是**谁的数据**。
+     *
+     * 两类来源必须区分清楚，因为它们的处置完全不同：
+     * - 旧版 TieZ 的数据：可以迁移，也可以在确认新版无误后清理；
+     * - 历史版本 Tiez-Next 的数据：可以迁移，但**不能清理**（那不是被取代的旧应用）。
+     *
+     * 与 `skipReasonText` 同一约定：查不到词条时退回显示原始码，不把内部键名甩给用户。
+     */
+    const originText = (code: string): string => {
+        const key = `legacy_origin_${code}`;
         const text = t(key);
         return text === key ? code : text;
     };
@@ -825,6 +850,23 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                     <div style={{ minWidth: 0, flex: 1 }}>
                                         <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '2px' }}>
                                             {dir.identifier}
+                                            {/* 来源标签：如实告诉用户这是"谁的数据"。
+                                                两类来源的处置不同——旧版 TieZ 的可以清理，
+                                                历史版本 Tiez-Next 的不能，所以必须分得清。 */}
+                                            <span
+                                                style={{
+                                                    marginLeft: '6px',
+                                                    fontSize: '9px',
+                                                    fontWeight: 500,
+                                                    padding: '1px 5px',
+                                                    borderRadius: '3px',
+                                                    background: 'var(--bg-main)',
+                                                    color: 'var(--text-secondary)',
+                                                    verticalAlign: 'middle',
+                                                }}
+                                            >
+                                                {originText(dir.origin)}
+                                            </span>
                                         </div>
                                         <div style={{ fontSize: '10px', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
                                             {dir.path}
@@ -858,26 +900,33 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                         </button>
                                         {/* 危险操作：删除原版数据。
                                             刻意与「迁移」拉开距离并弱化配色 —— 两者语义相反
-                                            （一个只读源、一个销毁源），并排放置容易被当成同一件事。 */}
-                                        <span
-                                            aria-hidden="true"
-                                            style={{ width: '1px', height: '16px', background: 'var(--border-color, rgba(128,128,128,0.3))' }}
-                                        />
-                                        <button
-                                            className="btn-icon"
-                                            title={t('legacy_dir_delete_hint')}
-                                            disabled={busyPath === dir.path}
-                                            onClick={() => handleRemove(dir)}
-                                            style={{
-                                                width: 'auto',
-                                                padding: '4px 8px',
-                                                height: '24px',
-                                                opacity: 0.7,
-                                                color: 'var(--danger-color, #c05050)',
-                                            }}
-                                        >
-                                            <Trash2 size={12} />
-                                        </button>
+                                            （一个只读源、一个销毁源），并排放置容易被当成同一件事。
+                                            本应用自己标识符的目录（`canDelete === false`）整组不渲染：
+                                            那是用户留着的旧版 Tiez-Next 数据，不是被取代的旧应用，
+                                            清理按钮不该销毁它。后端同样会拒绝，这里是第一道防线。 */}
+                                        {dir.canDelete && (
+                                            <>
+                                                <span
+                                                    aria-hidden="true"
+                                                    style={{ width: '1px', height: '16px', background: 'var(--border-color, rgba(128,128,128,0.3))' }}
+                                                />
+                                                <button
+                                                    className="btn-icon"
+                                                    title={t('legacy_dir_delete_hint')}
+                                                    disabled={busyPath === dir.path}
+                                                    onClick={() => handleRemove(dir)}
+                                                    style={{
+                                                        width: 'auto',
+                                                        padding: '4px 8px',
+                                                        height: '24px',
+                                                        opacity: 0.7,
+                                                        color: 'var(--danger-color, #c05050)',
+                                                    }}
+                                                >
+                                                    <Trash2 size={12} />
+                                                </button>
+                                            </>
+                                        )}
                                     </div>
                                 </div>
                             </div>
