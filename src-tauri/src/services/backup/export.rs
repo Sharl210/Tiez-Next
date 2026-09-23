@@ -72,6 +72,50 @@ pub struct BackupReport {
 ///
 /// 全程**只读**数据目录：数据库用 `VACUUM INTO` 导到临时文件，附件/表情目录只做读取。
 /// 导出失败时清理临时目录与半成品 zip，不影响现有数据。
+/// 对"可能尚不存在"的输出路径做规范化，用于安全检查。
+///
+/// `canonicalize` 要求路径存在，因此这里规范化**父目录**再把文件名拼回去。
+/// 连父目录都取不到时返回 `Err`，调用方按"无法判定"处理（不拦截，避免误伤）。
+fn canonicalize_for_guard(p: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    if let Ok(c) = p.canonicalize() {
+        return Ok(c);
+    }
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file = p.file_name().unwrap_or_default();
+    Ok(parent.canonicalize()?.join(file))
+}
+
+/// 拒绝把备份写进数据目录内部。
+///
+/// 这条守卫原本只存在于界面侧的导出命令里，于是 MCP 的 `export_backup` **完全绕过**
+/// 了它：AI 客户端可以让应用把一个 zip 写到任意路径，包括数据目录内部。
+///
+/// 危害不是"写到不该写的地方"这么轻：写目标文件会**截断同名文件**，若路径被指向
+/// `.../com.tieznext/clipboard.db`，就会把正在使用的数据库截断——不可逆的用户数据
+/// 破坏。而且备份包本该是"数据之外的一份副本"，落在数据目录内本身也不合理。
+///
+/// 放在 `create_backup` 里而不是各调用方：这里是所有导出路径的唯一汇聚点，
+/// 谁调用都自动受保护，新增调用方也不必记得补这道检查。
+fn guard_output_outside_data_dir(
+    data_dir: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), BackupError> {
+    let (Ok(canon_out), Ok(canon_data)) = (
+        canonicalize_for_guard(output_path),
+        data_dir.canonicalize(),
+    ) else {
+        // 无法判定时不拦截：宁可放过也不误伤（例如数据目录本身取不到 canonical）。
+        return Ok(());
+    };
+    if canon_out.starts_with(&canon_data) {
+        return Err(BackupError::Land(format!(
+            "不能把备份导出到数据目录内部（{}）。请选择数据目录以外的位置，例如「文档」或桌面。",
+            data_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 pub fn create_backup(req: &BackupRequest) -> Result<BackupReport, BackupError> {
     let data_dir = &req.data_dir;
     if !data_dir.is_dir() {
@@ -80,6 +124,9 @@ pub fn create_backup(req: &BackupRequest) -> Result<BackupReport, BackupError> {
             data_dir.display()
         )));
     }
+
+    // 所有导出路径的唯一汇聚点，护栏放这里让界面与 MCP 同时受保护。
+    guard_output_outside_data_dir(data_dir, &req.output_path)?;
 
     // 临时工作目录放在输出文件同级的 `.tmp` 下，保证 rename 在同一文件系统内。
     let work_dir = temp_work_dir(&req.output_path);
@@ -534,4 +581,72 @@ pub enum EntryKind {
     Emoji,
     BackgroundFile,
     Unknown,
+}
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("tiez-guard-{tag}-{}", std::process::id()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        (root, data)
+    }
+
+    /// 守卫函数本身：数据目录内必须被拒。
+    #[test]
+    fn refuses_output_inside_the_data_directory() {
+        let (root, data) = scratch("in");
+        assert!(guard_output_outside_data_dir(&data, &data.join("backup.zip")).is_err());
+        assert!(
+            guard_output_outside_data_dir(&data, &data.join("clipboard.db")).is_err(),
+            "指向 clipboard.db 会截断数据库"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 守卫函数本身：数据目录之外必须放行。
+    #[test]
+    fn allows_output_outside_the_data_directory() {
+        let (root, data) = scratch("out");
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        assert!(guard_output_outside_data_dir(&data, &docs.join("backup.zip")).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **守卫确实接线到 `create_backup`**。
+    ///
+    /// 前两条只测了守卫函数本身：把它们单独留下、却把 `create_backup` 里的调用删掉，
+    /// 它们**依然全绿**——而"护栏没接上"正是这次要修的缺陷（界面有、MCP 没有）。
+    /// 所以必须从这里走一遍真实入口，用返回值证明它被拦住了。
+    #[test]
+    fn create_backup_actually_applies_the_guard() {
+        let (root, data) = scratch("wired");
+        let req = BackupRequest {
+            data_dir: data.clone(),
+            output_path: data.join("backup.zip"),
+            app_version: "0.0.0-test".to_string(),
+        };
+
+        let err = create_backup(&req).expect_err(
+            "create_backup 必须自己拦住落在数据目录内的输出路径，而不是指望每个调用方各自记得检查（MCP 就漏了）",
+        );
+
+        // 断言**是哪一条**拒绝的，而不是"反正失败了"。
+        //
+        // 只断言 is_err() 是不够的：数据目录是空的，create_backup 会因为别的原因失败，
+        // 于是护栏即使被删掉，这里也照样"通过"。必须认准护栏自己的那条消息。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("数据目录内部"),
+            "应当由护栏拒绝，实际错误却是：{msg}"
+        );
+        assert!(
+            !data.join("backup.zip").exists(),
+            "被拒绝时不应留下任何文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

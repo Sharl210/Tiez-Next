@@ -120,7 +120,6 @@
                 }
               ]
             },
-            "opener:default",
             {
               "identifier": "opener:allow-open-url",
               "allow": [
@@ -128,7 +127,7 @@
                   "url": "https://github.com/Sharl210/Tiez-Next/**"
                 },
                 {
-                  "url": "https://github.com/jimuzhe/tiez-clipboard/**"
+                  "url": "https://github.com/Sharl210/Tiez-Next"
                 }
               ]
             },

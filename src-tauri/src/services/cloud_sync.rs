@@ -509,6 +509,18 @@ fn is_cloud_clipboard_content_type(content_type: &str) -> bool {
 }
 
 fn is_setting_sync_eligible(key: &str) -> bool {
+    // 【整族排除 MCP 设置】按前缀而不是逐键列举。
+    //
+    // 这些键里含有 `mcp.token`（访问令牌）与 `mcp.allow_write`、`mcp.allow_lan`
+    // 这类**安全姿态**。云同步会把远端写回的设置落进本地 settings 并持久化，于是
+    // 一个被篡改的远端快照就能把"免鉴权 + 允许写入 + 开放局域网"种进这台机器，
+    // 等下次 MCP 重启时生效——而用户从未在本机做过这个选择。
+    //
+    // 逐键列举在这里是错的：`mcp.*` 会继续增长，新增一个键就会静默重新打开这个口子，
+    // 而漏掉一个键不会有任何编译错误或测试失败。按前缀排除没有这个失效模式。
+    if key.starts_with("mcp.") {
+        return false;
+    }
     !matches!(
         key,
         "app.anon_id"
@@ -3461,9 +3473,45 @@ fn merge_remote_emojis(app: &AppHandle, remote_json: &str) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    /// MCP 的安全姿态设置**不得**参与云同步。
+    ///
+    /// 云同步会把远端写回的键落进本地 settings 并持久化。若 `mcp.*` 能同步，
+    /// 一个被篡改的远端快照就能把"免鉴权 + 允许写入 + 开放局域网"种进这台机器，
+    /// 等 MCP 下次重启时生效——用户从未在本机做过这个选择。
+    #[test]
+    fn mcp_settings_never_sync_from_the_cloud() {
+        for key in [
+            "mcp.enabled",
+            "mcp.allow_write",
+            "mcp.allow_lan",
+            "mcp.require_token",
+            "mcp.token",
+            "mcp.port",
+            "mcp.autostart",
+        ] {
+            assert!(
+                !is_setting_sync_eligible(key),
+                "{key} 参与云同步会让远端快照改写本机的 MCP 安全姿态"
+            );
+        }
+    }
+
+    /// 前缀排除要能覆盖**将来新增**的 mcp 键，否则这条保护会随版本悄悄失效。
+    #[test]
+    fn unknown_mcp_keys_are_also_excluded() {
+        assert!(!is_setting_sync_eligible("mcp.some_future_switch"));
+    }
+
+    /// 普通界面设置仍应正常同步——不能因为加排除把正常功能也关掉。
+    #[test]
+    fn ordinary_settings_still_sync() {
+        assert!(is_setting_sync_eligible("app.theme"));
+        assert!(is_setting_sync_eligible("app.language"));
+    }
+
     use super::{
-        normalize_item_for_sync, rewrite_rich_html_resources_for_sync, CloudSyncItem,
-        RICH_IMAGE_FALLBACK_PREFIX, RICH_IMAGE_FALLBACK_SUFFIX,
+        is_setting_sync_eligible, normalize_item_for_sync, rewrite_rich_html_resources_for_sync,
+        CloudSyncItem, RICH_IMAGE_FALLBACK_PREFIX, RICH_IMAGE_FALLBACK_SUFFIX,
     };
     use std::fs;
     use std::path::PathBuf;
