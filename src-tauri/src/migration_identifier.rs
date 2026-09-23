@@ -37,6 +37,12 @@
 //!
 //! 第 1 与第 5 条共同保证：**本模块在最坏情况下只会"没迁成"，不会造成数据丢失**。
 //!
+//! 6. **源必须是数据目录**——归一化之后、复制任何字节之前，先确认所选路径确实含
+//!    `clipboard.db`（或便携版的 `data/clipboard.db`）。不是就拒绝并如实说明原因
+//!    （[`SkipReason::NotADataDirectory`]），绝不把"用户选错的那一层"整棵复制进
+//!    应用数据目录。这条保证的是**不把无关文件搬进应用数据目录**：迁移只在两个
+//!    数据目录之间成立，"把一个普通目录整体搬进来"从来不是这个功能要做的事。
+//!
 //! ## 两条入口：自动候选 vs 用户手动指定
 //!
 //! - [`migrate_legacy_identifier_data`]：扫描同名父目录下的**可迁移来源**目录
@@ -215,6 +221,23 @@ pub enum SkipReason {
     NotADirectory,
     /// 源目录为空：没有可迁移的内容，不迁移也不删除。
     EmptySource,
+    /// 源路径存在、也有内容，但**它不是一个应用数据目录**：里面既没有 `clipboard.db`，
+    /// 也没有便携版程序目录下的 `data/clipboard.db`。
+    ///
+    /// 【为什么必须与 `EmptySource` 分开，且必须真的拒绝】
+    /// 迁移只在"数据目录"上成立。用户点「选择其它目录…」时很容易停在上层（例如
+    /// `下载\`、解压出来的外层目录），此时源里确实有内容——真正属于用户的数据只是
+    /// 其中最深处的一小块，其余是无关文件。旧实现会**照常迁移**，把整棵目录树复制进
+    /// 应用数据目录：无关文件夹、甚至私钥与机密文档都被搬进应用数据目录，而真正的数据
+    /// 落进应用**不读**的嵌套位置，报告却是 `Migrated`、"迁移完成"。
+    ///
+    /// 因此这一类不是"少迁一点"，而是"这次操作从根上不成立"，必须在复制任何字节之前
+    /// 拒绝。它与另外两类共同构成三态，处置完全不同：
+    ///
+    /// - `SourceMissing`：路径不存在 → 去检查盘/移动硬盘/网络位置，或重选；
+    /// - `EmptySource`：路径对了但目录是空的 → 确实没有可迁数据；
+    /// - `NotADataDirectory`：路径对了、也有内容，但**选错了层** → 往下进入一层再选。
+    NotADataDirectory,
     /// 源目录就是目标目录的祖先（迁移会把目标卷进源内，造成自复制）。
     SourceIsAncestorOfTarget,
     /// 源目录位于目标目录内部（迁移目标是自己的子目录，同样会造成自复制）。
@@ -231,6 +254,7 @@ impl SkipReason {
             SkipReason::SourceMissing => "source_missing",
             SkipReason::NotADirectory => "not_a_directory",
             SkipReason::EmptySource => "empty_source",
+            SkipReason::NotADataDirectory => "not_a_data_directory",
             SkipReason::SourceIsAncestorOfTarget => "source_is_ancestor_of_target",
             SkipReason::SourceInsideTarget => "source_inside_target",
         }
@@ -344,6 +368,14 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
 ///
 /// 本函数**不返回致命错误**：失败只回报 [`MigrationOutcome::Failed`]，调用方据此提示
 /// 用户"源目录完好、未做任何改动"。
+///
+/// 【"选错层"必须在复制之前拦住】归一化（[`resolve_source_dir`]）定位失败时按设计
+/// **原样返回用户所选路径**（绝不猜测），但这不等于"可以照常迁移"：定位失败恰恰是
+/// "这个目录不是数据目录"的证据。若在此处放行，`merge_into` 会把**整棵目录树**复制进
+/// 应用数据目录——用户资产（无关文件夹、私钥、机密文档）被搬进应用数据目录，而真正的
+/// 数据落进应用不读的嵌套位置，报告却是 `Migrated`。因此归一化之后、任何写操作之前，
+/// 必须先确认归一化结果确实是一个数据目录（含 `clipboard.db`，或便携版的
+/// `data/clipboard.db`）；不是就如实回报 [`SkipReason::NotADataDirectory`]。
 pub fn migrate_from_source_dir(
     source: &Path,
     target: &Path,
@@ -353,7 +385,52 @@ pub fn migrate_from_source_dir(
     // 这在便携版上是常态（见 `resolve_source_dir`）。先在那里归一化，再做真正的
     // 迁移；契约完全一致，只是源路径被定位到了正确的那一层。
     let resolved = resolve_source_dir(source);
+
+    // ---- 前置拦截：归一化结果必须真的是一个数据目录 ----
+    // 三态的顺序在这里是刻意的，先判"存在/是目录"再判"是不是数据目录"：
+    //   * 路径不存在    -> SourceMissing（去检查盘/路径）
+    //   * 存在但是文件  -> NotADirectory（选错了对象）
+    //   * 是目录但为空  -> EmptySource（路径对了，确实没数据）
+    //   * 有内容但没库  -> NotADataDirectory（**本次修复**：选错了层，去往下选一层）
+    // 反过来先判"有没有库"会把不存在与空目录都误报成 NotADataDirectory，让用户拿不到
+    // 正确诊断。空目录与"有内容但非数据目录"必须分开：前者没有可迁内容，后者是选错层。
+    if !resolved.exists() {
+        return MigrationOutcome::Skipped(SkipReason::SourceMissing);
+    }
+    if !resolved.is_dir() {
+        return MigrationOutcome::Skipped(SkipReason::NotADirectory);
+    }
+    if !is_data_directory(&resolved) {
+        if dir_has_any_entry(&resolved) {
+            return MigrationOutcome::Skipped(SkipReason::NotADataDirectory);
+        }
+        return MigrationOutcome::Skipped(SkipReason::EmptySource);
+    }
+
     migrate_from_inner(resolved.as_path(), target, allow_takeover)
+}
+
+/// 判定 `dir` 是否是一个应用数据目录：直接含 `clipboard.db`，或含便携版的
+/// `data/clipboard.db`。
+///
+/// 与 [`locate_data_dir`] 的定位规则 1–2 同一判据（只读探测）。之所以单独成一个函数
+/// 而不直接复用定位结果，是因为调用方需要区分"归一化没找到"与"归一化找到了但源本身
+/// 不是数据目录"这两种情形，而定位函数把两者都折叠成了 `None`。
+fn is_data_directory(dir: &Path) -> bool {
+    dir.join(DB_FILE).is_file() || dir.join(PORTABLE_DATA_DIR).join(DB_FILE).is_file()
+}
+
+/// `dir` 里是否有任何条目（含文件、目录与符号链接）。只读 `read_dir`，不跟随链接、
+/// 不创建也不修改任何东西。
+///
+/// 用途是把"空目录"与"有内容但不是数据目录"分开诊断；读不到目录时按"非空"处理，
+/// 让更保守的 `NotADataDirectory` 生效（宁可多说一句"请往下选一层"，也不要错误地
+/// 告诉用户"这里没数据"）。
+fn dir_has_any_entry(dir: &Path) -> bool {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => true,
+    }
 }
 
 /// 把用户手选的源路径**归一化**到真正的数据目录。
@@ -395,8 +472,10 @@ pub fn migrate_from_source_dir(
 /// 【为什么是"恰好一个子目录"而不是递归搜索】递归全树搜索会沿 `attachments/` 之类的
 /// 兄弟目录乱钻，可能定位到备份副本甚至无关目录。限制为"唯一的子目录"使下探方向没有
 /// 歧义：只有一个候选时不存在选错的可能。歧义（多个子目录）时定位失败，退回用户原选
-/// 路径——**绝不猜测**，让后续的 `EmptySource` / `SourceMissing` 如实回报，用户再往下
-/// 选一层即可。
+/// 路径——**绝不猜测**。定位失败**不等于可以照常迁移**：退回原路径之后，
+/// [`migrate_from_source_dir`] 会按"这里不是数据目录"拦下本次迁移，如实回报
+/// [`SkipReason::NotADataDirectory`]（空目录则是 `EmptySource`、
+/// 路径不存在则是 `SourceMissing`），用户再往下选一层即可。
 ///
 /// 本函数**只读**（`is_file` / `is_dir` / `read_dir` 探测），不创建、不修改任何路径。
 pub fn resolve_source_dir(source: &Path) -> PathBuf {
@@ -2318,6 +2397,166 @@ mod tests {
         }
     }
 
+    /// **缺陷回归（本次修复的核心）**：用户把**上层目录**选成源时，迁移必须被拒绝，
+    /// 且目标数据目录里**不得出现任何无关文件**。
+    ///
+    /// 修复前实测行为（仓库外探针）：源 = `下载\`（内含便携包 + 无关目录 + `id_rsa`
+    /// + `公司合同\secret.pdf`）→ 回报 `Migrated`、`delivered_files=6`；目标里出现
+    /// `id_rsa`、`公司合同/secret.pdf`、`unrelated-folder/`、`TieZ_0.3.3-portable/`，
+    /// 而目标**根层没有** `clipboard.db`（真正的数据落在应用不读的嵌套位置）。界面据此
+    /// 显示"迁移完成"，用户以为迁成功了。
+    ///
+    /// 本测试把"用户资产不得进入应用数据目录"写成断言：**一个无关文件都不许进目标**。
+    #[test]
+    fn refuses_parent_directory_and_never_copies_unrelated_files_into_target() {
+        let root = tmp("parent-as-source");
+        let target = root.join("appdata").join(CURRENT_IDENTIFIER);
+
+        // 源 = 上层目录（用户真实场景：把「下载」整层选进来）
+        let downloads = root.join("Downloads");
+        // 里面有真正属于应用的便携数据（两层同名目录 + data/clipboard.db）
+        let inner = downloads
+            .join("TieZ_0.3.3-portable")
+            .join("TieZ_0.3.3-portable");
+        let data = inner.join(PORTABLE_DATA_DIR);
+        seed_legacy(&data);
+        fs::write(inner.join("tiez-app.exe"), b"MZ fake exe").unwrap();
+        // 以及**必须一个都不许进目标**的无关内容
+        fs::write(downloads.join("id_rsa"), b"PRIVATE KEY").unwrap();
+        fs::create_dir_all(downloads.join("unrelated-folder")).unwrap();
+        fs::write(downloads.join("unrelated-folder/x.bin"), b"unrelated").unwrap();
+        fs::create_dir_all(downloads.join("公司合同")).unwrap();
+        fs::write(downloads.join("公司合同/secret.pdf"), b"secret").unwrap();
+
+        let source_before = scan_tree(&downloads).unwrap();
+        let outcome = migrate_from_source_dir(&downloads, &target, true);
+
+        // ① 必须被拒绝，且原因码是新增的 NotADataDirectory（不是"空"、不是"不存在"）
+        assert_eq!(
+            outcome_as_reason(&outcome),
+            Some(SkipReason::NotADataDirectory),
+            "选到上层目录必须回报 NotADataDirectory，实际 {:?}",
+            outcome
+        );
+
+        // ② 核心断言：目标数据目录**一个无关文件都没有**（修复前这里全是 true）
+        for forbidden in ["id_rsa", "unrelated-folder", "公司合同"] {
+            assert!(
+                !target.join(forbidden).exists(),
+                "无关文件 {:?} 绝不能被复制进应用数据目录",
+                forbidden
+            );
+        }
+        // 目标里也不得出现源目录的任何成员（包括便携包目录）
+        for entry in fs::read_dir(&downloads).unwrap().flatten() {
+            let name = entry.file_name();
+            assert!(
+                !target.join(&name).exists(),
+                "源目录成员 {:?} 不得出现在目标数据目录里",
+                name
+            );
+        }
+        // ③ 整个目标目录不存在（本次迁移没有产生任何写操作）
+        assert!(
+            !target.exists(),
+            "被拒绝的迁移不得创建目标目录，实际内容: {:?}",
+            scan_tree(&target).unwrap_or_default()
+        );
+        // ④ 不得残留暂存目录
+        assert!(!staging_dir(&target).exists(), "不得残留暂存目录");
+        // ⑤ 源目录逐项未变（只读契约）
+        assert_eq!(scan_tree(&downloads).unwrap(), source_before, "源必须一字未改");
+
+        // ⑥ 对照：往下选一层（内层程序目录）后，同一个源树里的数据仍能正常迁移，
+        //    证明拦截没有把正确的选法一起挡掉。
+        let outcome = migrate_from_source_dir(&inner, &target, true);
+        assert!(
+            matches!(outcome, MigrationOutcome::Migrated { .. }),
+            "选中真正的便携程序目录应能迁移，实际 {:?}",
+            outcome
+        );
+        assert!(
+            target.join(DB_FILE).is_file(),
+            "目标根层必须有 clipboard.db，否则应用读不到数据"
+        );
+        assert!(
+            !target.join("id_rsa").exists() && !target.join("公司合同").exists(),
+            "即使迁移成功，无关文件也不得进入目标"
+        );
+    }
+
+    /// 三态必须互相可区分，且**有内容但不是数据目录**这一类不得被误报成其他两类。
+    ///
+    /// 修复前：这一类回报 `Migrated`（整树复制 + 谎报成功）——本测试在修复前必红。
+    #[test]
+    fn three_states_are_distinguished_missing_empty_and_not_a_data_directory() {
+        let root = tmp("three-states");
+        let target = root.join("com.tieznext");
+
+        // ① 不存在
+        assert_eq!(
+            outcome_as_reason(&migrate_from_source_dir(
+                &root.join("D-not-plugged"),
+                &target,
+                true
+            )),
+            Some(SkipReason::SourceMissing)
+        );
+
+        // ② 存在但是空目录
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            outcome_as_reason(&migrate_from_source_dir(&empty, &target, true)),
+            Some(SkipReason::EmptySource)
+        );
+
+        // ③ 存在、有内容，但不是数据目录（多个子目录 -> 归一化必然定位失败）
+        let content = root.join("a-plain-folder");
+        fs::create_dir_all(content.join("sub-one")).unwrap();
+        fs::create_dir_all(content.join("sub-two")).unwrap();
+        fs::write(content.join("sub-one/notes.txt"), b"hi").unwrap();
+        fs::write(content.join("readme.txt"), b"hi").unwrap();
+        assert_eq!(
+            outcome_as_reason(&migrate_from_source_dir(&content, &target, true)),
+            Some(SkipReason::NotADataDirectory),
+            "有内容但不是数据目录必须回报 NotADataDirectory"
+        );
+        assert!(!target.exists(), "三类拒绝都不得创建目标");
+
+        // ④ 有内容但只有**唯一**子目录（归一化会下探，但下探后仍不是数据目录）
+        let single = root.join("single-subdir-no-db");
+        fs::create_dir_all(single.join("only-child")).unwrap();
+        fs::write(single.join("only-child/notes.txt"), b"hi").unwrap();
+        assert_eq!(
+            outcome_as_reason(&migrate_from_source_dir(&single, &target, true)),
+            Some(SkipReason::NotADataDirectory)
+        );
+
+        // ⑤ 对照：目录里就是数据（含 clipboard.db）时必须照常迁移，不得被拦截误伤
+        let real = root.join("real-data");
+        seed_legacy(&real);
+        let real_target = root.join("real-target");
+        assert!(
+            matches!(
+                migrate_from_source_dir(&real, &real_target, false),
+                MigrationOutcome::Migrated { .. }
+            ),
+            "真正的数据目录必须仍能迁移"
+        );
+    }
+
+    /// 新增原因码必须带稳定机器码——界面按 `legacy_migrate_notice_<code>` 查词条，
+    /// 码写错就会把内部键名或裸码甩给用户。
+    #[test]
+    fn not_a_data_directory_has_stable_code_for_locale_lookup() {
+        assert_eq!(
+            SkipReason::NotADataDirectory.code(),
+            "not_a_data_directory",
+            "界面会拼接 legacy_migrate_notice_<code> 查三语文案，码必须与词条一致"
+        );
+    }
+
     /// 只读检查必须能读完源目录全部文件，且读完不改动源。
     #[test]
     fn read_only_check_reads_every_file_and_changes_nothing() {
@@ -2345,6 +2584,10 @@ mod tests {
         assert_eq!(SkipReason::SourceMissing.code(), "source_missing");
         assert_eq!(SkipReason::NotADirectory.code(), "not_a_directory");
         assert_eq!(SkipReason::EmptySource.code(), "empty_source");
+        assert_eq!(
+            SkipReason::NotADataDirectory.code(),
+            "not_a_data_directory"
+        );
         assert_eq!(
             SkipReason::SourceIsAncestorOfTarget.code(),
             "source_is_ancestor_of_target"
