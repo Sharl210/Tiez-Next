@@ -560,6 +560,7 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                                 type="button"
                                 className="btn-icon"
                                 onClick={() => props.setPrivacyKindsOpen(!props.privacyKindsOpen)}
+                                title={props.t('tooltip_collapse_section')}
                                 style={{ width: '24px', height: '24px' }}
                             >
                                 {props.privacyKindsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -609,6 +610,7 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                                 type="button"
                                 className="btn-icon"
                                 onClick={() => props.setPrivacyRulesOpen(!props.privacyRulesOpen)}
+                                title={props.t('tooltip_collapse_section')}
                                 style={{ width: '24px', height: '24px' }}
                             >
                                 {props.privacyRulesOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -641,6 +643,7 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                                 type="button"
                                 className="btn-icon"
                                 onClick={() => setMaskSettingsOpen(!maskSettingsOpen)}
+                                title={props.t('tooltip_collapse_section')}
                                 style={{ width: '24px', height: '24px' }}
                             >
                                 {maskSettingsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}

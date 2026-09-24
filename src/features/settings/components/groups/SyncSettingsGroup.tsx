@@ -74,7 +74,7 @@ const SyncSettingsGroup = ({
                             backgroundColor: mqttStatus === 'connected' ? '#4CAF50' : mqttStatus === 'connecting' ? '#FF9800' : '#F44336',
                             display: 'inline-block'
                         }}
-                        title={mqttStatus === 'connected' ? "Connected" : mqttStatus === 'connecting' ? "Connecting..." : "Disconnected"}
+                        title={mqttStatus === 'connected' ? t('tooltip_mqtt_connected') : mqttStatus === 'connecting' ? t('tooltip_mqtt_connecting') : t('tooltip_mqtt_disconnected')}
                     />
                 )}
             </div>

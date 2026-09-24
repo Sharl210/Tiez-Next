@@ -37,6 +37,16 @@ export default defineConfig({
       input: {
         main: path.resolve(HERE, "index.html"),
         cssvars: path.resolve(HERE, "src/cssvars.html"),
+        // 第三个入口：MCP 压暗量测台（挂真实 McpSettingsGroup，逐层量计算样式）
+        mcpdim: path.resolve(HERE, "src/mcpdim.html"),
+        // 第四个入口：坍缩量测台（挂真实 ClipboardItem，按内容类型量**真实布局高度**
+        // 与操作按钮矩阵）。由 collapse.mjs 驱动。
+        //
+        // 之所以要单独一个入口：`.history-item` 的可见高度取决于内容类型分支
+        // （图片 / 视频缩略图 / 文件卡 / 富文本三条预览路径 / 纯文本截断）与
+        // `.content-preview` 的 `-webkit-box` + `overflow:hidden` 组合，
+        // 类名与文案全对也可能量到 0 高。这里把每种类型各挂一份，逐条量。
+        collapse: path.resolve(HERE, "src/collapse.html"),
       },
     },
   },

@@ -1095,7 +1095,16 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                         <Plus size={12} />
                                     </span>
                                 ) : null}
-                                <X size={12} className="action-icon clear" onClick={() => setTagSearch('')} />
+                                { /* 与左侧 `create` 同构：`title` 挂在 `<span>` 上而不是图标上。
+                                    lucide 图标不收 `title` prop；且 SVG 上的 title 元素
+                                    不保证产生原生悬浮提示，挂在容器上才可靠。 */}
+                                <span
+                                    className="action-icon clear"
+                                    title={t('tooltip_clear_search')}
+                                    onClick={() => setTagSearch('')}
+                                >
+                                    <X size={12} />
+                                </span>
                             </div>
                         ) : null}
                     </div>
@@ -1293,13 +1302,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                         <button
                             type="button"
                             className={`toggle-btn btn-icon ${viewMode === 'list' ? 'active' : ''}`}
-                            title="列表视图"
+                            title={t('list_view')}
                             onClick={() => setViewMode('list')}
                         ><List size={14} /></button>
                         <button
                             type="button"
                             className={`toggle-btn btn-icon ${viewMode === 'grid' ? 'active' : ''}`}
-                            title="卡片视图"
+                            title={t('grid_view')}
                             onClick={() => setViewMode('grid')}
                         ><LayoutGrid size={14} /></button>
                     </div>
@@ -1365,7 +1374,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                             )}
                                         </div>
                                         {!isManageMode && (
-                                            <button className="del-btn" title="删除" onClick={(e) => {
+                                            <button className="del-btn" title={t('delete')} onClick={(e) => {
                                                 e.stopPropagation();
                                                 setItemDeleteConfirmation({ show: true, id: item.id });
                                             }}>

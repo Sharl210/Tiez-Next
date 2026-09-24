@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Download, RefreshCw, X, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { runtimeT } from "../lib/runtimeLocale";
 import "./UpdateDialog.css"; // Import the custom styles
 
 interface UpdateDialogProps {
@@ -56,6 +57,7 @@ const UpdateDialog: React.FC<UpdateDialogProps> = ({
               <button 
                 onClick={onClose}
                 className="update-close-btn"
+                title={runtimeT("tooltip_close_dialog")}
               >
                 <X size={16} />
               </button>

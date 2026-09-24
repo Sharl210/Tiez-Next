@@ -102,7 +102,7 @@ const AppHeader = ({
     <div className="header-top">
       <div className="header-leading">
         {(showSettings || showTagManager || showEmojiPanel) && (
-          <button className="btn-icon window-no-drag" onClick={onBack}>
+          <button className="btn-icon window-no-drag" onClick={onBack} title={t('tooltip_back')}>
             <ChevronLeft size={18} />
           </button>
         )}
@@ -155,7 +155,7 @@ const AppHeader = ({
         {fileServerEnabled && (
           <button
             className={`btn-icon header-chat-btn ${chatMode && showSettings ? 'active' : ''}`}
-            title="Chat"
+            title={t('tooltip_chat')}
             onClick={onToggleChat}
           >
             <MessageSquare size={16} />

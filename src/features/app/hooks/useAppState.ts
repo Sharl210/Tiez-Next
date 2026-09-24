@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { DEFAULT_THEME } from "../../../shared/config/themes";
 import { createAllCollapsedGroups } from "../../../shared/config/settingsGroups";
+import { setRuntimeLocale } from "../../../shared/lib/runtimeLocale";
 import type { ClipboardEntry, Locale } from "../../../shared/types";
 import type {
   AppState,
@@ -97,6 +98,10 @@ export const useAppState = (): AppState => {
   const [showHotkeyHint, setShowHotkeyHint] = useState(false);
   const [showAutoCloseHint, setShowAutoCloseHint] = useState(false);
   const [language, setLanguage] = useState<Locale>("zh");
+  // 把语言同步给模块级镜像：`UpdateDialog` / `Announcement` 这类没有 `t` prop 的
+  // 最外层共享组件靠它取当前语言，否则它们的悬浮说明会写死一种语言。
+  // 必须在函数体内（渲染期）赋值，effect 会晚一拍，导致这些文案滞后一次渲染。
+  setRuntimeLocale(language);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [isWindowPinned, setIsWindowPinned] = useState(false);
   const [showSearchBox, setShowSearchBox] = useState(true);

@@ -89,6 +89,7 @@ const SettingsFooter = ({
                             </div>
                             <button
                                 onClick={() => setPendingUpdate(null)}
+                                title={t('tooltip_close_dialog')}
                                 style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}
                             >
                                 <X size={18} />

@@ -156,6 +156,8 @@ fn main() {
             app::commands::open_file_location,
             app::commands::set_data_path,
             app::commands::toggle_autostart,
+            app::commands::system_checklist::get_system_checklist,
+            app::commands::system_checklist::ack_system_checklist_item,
             app::commands::is_autostart_enabled,
             // 「粘贴方案是否真的生效」的只读查询：未提权时如实报告，不再静默改用户设置。
             app::commands::get_paste_method_status,

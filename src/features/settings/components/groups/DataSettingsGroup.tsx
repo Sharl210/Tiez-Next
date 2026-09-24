@@ -15,6 +15,7 @@ import { formatBytes } from "../../lib/formatBytes";
 import { backendErrorText as backupErrorText } from "../../lib/backendError";
 import { useMigrationProgress } from "../../hooks/useMigrationProgress";
 import MigrationProgressPanel from "../MigrationProgressPanel";
+import SystemChecklistPanel from "../SystemChecklistPanel";
 
 interface DataSettingsGroupProps {
     t: (key: string) => string;
@@ -852,6 +853,16 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                           静止的 0% 与"卡死"无法区分，而"等待重启接管"这类阶段本就没有总量。
                         */}
                         <MigrationProgressPanel progress={migrationProgress} t={t} />
+
+                        {/*
+                          需要用户手动处理的系统级设置。
+
+                          放在迁移流程之后是有意的：用户点完迁移、看到"重启后自动完成接管"，
+                          紧接着就该知道**还有哪些事是应用做不到的**。这些项（防火墙放行、
+                          提权、任务管理器里的启动项开关）应用无法代做，只能列成清单让他
+                          逐条处理 —— 这里不做一次性弹窗，因为它每次都要实时重新检查。
+                        */}
+                        <SystemChecklistPanel t={t} />
 
                         {legacyDirs.map((dir) => (
                             <div

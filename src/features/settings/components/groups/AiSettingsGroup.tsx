@@ -125,12 +125,13 @@ const AiSettingsGroup = ({
                                         {profile.enableThinking && <div className="ai-profile-sub" style={{ fontSize: '9px', opacity: 0.7 }}>Thinking Mode Enabled</div>}
                                     </div>
                                     <div style={{ display: 'flex', gap: '4px', marginLeft: '8px' }}>
-                                        <button className="btn-icon" onClick={() => checkModelStatus(profile)} title="Check Connection">
+                                        {/* 同一排三个图标按钮：文案必须三个都有，否则用户只能靠猜区分它们 */}
+                                        <button className="btn-icon" onClick={() => checkModelStatus(profile)} title={t('tooltip_check_connection')}>
                                             <RotateCcw size={12} className={profileStatuses[profile.id] === 'loading' ? 'animate-spin' : ''} />
                                         </button>
-                                        <button className="btn-icon" onClick={() => setEditingProfile(profile)}><Edit2 size={12} /></button>
+                                        <button className="btn-icon" onClick={() => setEditingProfile(profile)} title={t('tooltip_edit_profile')}><Edit2 size={12} /></button>
                                         {!['lc_flash_v1', 'lc_think_v1', 'lc_think_2601_v1'].includes(profile.id) && (
-                                            <button className="btn-icon" onClick={() => handleDeleteProfile(profile.id)} style={{ color: '#f44336' }}><Trash2 size={12} /></button>
+                                            <button className="btn-icon" onClick={() => handleDeleteProfile(profile.id)} title={t('tooltip_delete_profile')} style={{ color: '#f44336' }}><Trash2 size={12} /></button>
                                         )}
                                     </div>
                                 </div>

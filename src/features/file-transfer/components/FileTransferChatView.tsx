@@ -763,7 +763,7 @@ const FileTransferChatView = ({
                 <div className="wt-composer">
                     <button
                         className="wt-btn wt-btn-add"
-                        title="Send File"
+                        title={t('tooltip_send_file')}
                         onClick={async () => {
                             try {
                                 const selected = await open({
@@ -820,7 +820,7 @@ const FileTransferChatView = ({
                             <button
                                 className="wt-btn-icon"
                                 onClick={() => setShowFullScreen(true)}
-                                title="Full Screen Edit"
+                                title={t('tooltip_fullscreen_edit')}
                                 style={{ borderRadius: '8px' }}
                             >
                                 <Maximize2 size={16} />
@@ -828,7 +828,7 @@ const FileTransferChatView = ({
                         )}
                     </div>
 
-                    <button onClick={send} className="wt-btn send">
+                    <button onClick={send} className="wt-btn send" title={t('tooltip_send_message')}>
                         <Send size={18} />
                     </button>
                 </div>
@@ -847,7 +847,7 @@ const FileTransferChatView = ({
                             <button
                                 onClick={() => setShowFullScreen(false)}
                                 className="wt-overlay-icon-btn"
-                                title="Minimize"
+                                title={t('tooltip_minimize')}
                             >
                                 <Minimize2 size={16} />
                             </button>

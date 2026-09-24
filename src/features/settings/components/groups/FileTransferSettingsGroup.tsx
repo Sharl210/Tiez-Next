@@ -160,6 +160,7 @@ const FileTransferSettingsGroup = ({
                                     <button
                                         onClick={() => setShowAutoCloseHint(!showAutoCloseHint)}
                                         className="hint-icon-btn"
+                                        title={t('tooltip_auto_close_hint')}
                                         style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', opacity: showAutoCloseHint ? 1 : 0.6 }}
                                     >
                                         <HelpCircle size={12} />

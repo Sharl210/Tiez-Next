@@ -5,6 +5,7 @@ pub mod history_cmd;
 pub mod hotkey_cmd;
 pub mod settings_cmd;
 pub mod system_cmd;
+pub mod system_checklist;
 pub mod tag_color_cmd;
 pub mod ui_cmd;
 

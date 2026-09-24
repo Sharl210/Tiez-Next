@@ -1413,6 +1413,7 @@ const ClipboardItem = ({
                                     e.stopPropagation();
                                     onTagDelete(tag);
                                 }}
+                                title={t('remove_tag')}
                                 style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', opacity: 0.72, cursor: 'pointer', display: 'flex' }}
                             >
                                 <X size={8} />
@@ -1521,6 +1522,7 @@ const ClipboardItem = ({
                                 onTagAdd();
                             }}
                             className="btn-icon"
+                            title={t('add_tag')}
                             style={{ padding: '2px', height: '16px', width: '16px' }}
                         >
                             <Plus size={10} />
@@ -2033,6 +2035,7 @@ const ClipboardItem = ({
                             className="drag-handle"
                             onPointerDown={(e) => dragControls.start(e)}
                             onClick={(e) => e.stopPropagation()}
+                            title={t('tooltip_drag_handle')}
                             style={{
                                 cursor: 'grab',
                                 opacity: 0.5,
@@ -2083,7 +2086,7 @@ const ClipboardItem = ({
                                     e.stopPropagation();
                                     onEditNote(e);
                                 }}
-                                title="编辑备注"
+                                title={t('edit_item_note_label')}
                             >
                                 <StickyNote size={12} />
                             </button>
@@ -2105,7 +2108,7 @@ const ClipboardItem = ({
                         <button
                             className={`btn-icon ${item.tags && item.tags.length > 0 ? "active" : ""}`}
                             onClick={onToggleTagEditor}
-                            title="Tags"
+                            title={t('tags')}
                         >
                             <Tag size={12} />
                         </button>

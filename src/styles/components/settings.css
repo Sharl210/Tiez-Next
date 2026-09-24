@@ -31,7 +31,25 @@
   border-radius: var(--panel-radius);
   overflow: visible !important;
   position: relative;
-  backdrop-filter: saturate(120%);
+  /*
+   * 【不要在这里加 backdrop-filter —— 它会整片压暗分组内容】
+   *
+   * 这里原先是 `backdrop-filter: saturate(120%)`。看着无害，实际是"设置页
+   * 发闷、发暗"的主因，而且与主题无关（六个主题全都命中）：
+   *
+   *   1. `backdrop-filter` 处理的是元素**背后**的内容，不是元素自己。
+   *      `.settings-group` 是个整页大的容器，于是它背后的桌面/窗口底色被
+   *      整体重新调色一遍，视觉上就是"盖了一层灰罩子"。
+   *   2. 在 retro 下尤其明显：它的 `--bg-panel` 是**实心** `#f3f3f3`，本不该
+   *      有任何透色，却仍然发闷 —— 唯一来源就是这个 backdrop-filter。
+   *      用户反馈「MCP 那块压暗还是有」正是此处（它是设置页里最长的分组）。
+   *   3. 另外五个主题的 `--bg-panel` 本身半透明（acrylic 低到 0.34），
+   *      与 backdrop-filter 叠加后更闷。
+   *
+   * 用**真实组件量测**确认过：改前六主题的 `.settings-group` 计算值都是
+   * `saturate(1.2)`。需要"玻璃感"的是弹窗/浮层这类小面积元素（见 `modal.css`），
+   * 不是整页分组容器。
+   */
 }
 
 .group-header {
@@ -1238,4 +1256,85 @@ body.theme-acrylic .settings-view select.search-input option {
   background: var(--segment-active-background);
   color: var(--segment-active-color);
   box-shadow: var(--segment-active-shadow);
+}
+
+/* ---------------------------------------------------------------------------
+ * 系统级设置清单（需要用户手动处理的三项）
+ *
+ * 三种状态用视觉区分，避免"无法确认"被看成"待处理"：
+ *   .is-pending  —— 已确认未满足，需要用户做事
+ *   .is-unknown  —— 探测不可用（中性色，不催办）
+ *   .system-check-allok —— 全部满足
+ * ------------------------------------------------------------------------- */
+.system-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.system-check-row {
+  border: var(--data-panel-border);
+  border-radius: var(--data-panel-radius);
+  background: var(--bg-element);
+  padding: 8px 10px;
+}
+
+/* 「无法确认」用中性色 + 虚线边，与「待处理」的实心强调区分开 */
+.system-check-row.is-unknown {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.system-check-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.system-check-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.system-check-state {
+  font-size: 10px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.system-check-howto {
+  /* 说明段落最长可达三行，行距给足；下外边距也留开，
+     否则紧跟其后的探测细节与按钮会显得挤在一起（量测时观察到"轻微压线"）。 */
+  margin: 5px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+/* 探测细节原文：等宽、可换行，长路径不撑破容器 */
+.system-check-detail {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--content-font-family, monospace);
+  font-size: 10px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.system-check-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.system-check-allok,
+.system-check-loading {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.system-check-error {
+  font-size: 11px;
+  color: var(--danger-color, #c05050);
 }

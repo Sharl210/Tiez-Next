@@ -138,15 +138,33 @@ export const isBodyEditable = (contentType: string): boolean =>
   EDITABLE_BODY_TYPES.includes(contentType);
 
 /**
- * R11: whether this entry gets the note-only editor on the main page.
+ * R11: whether this entry gets a note editor on the main page.
  *
- * The predicate is deliberately "binary" rather than `!isBodyEditable`: an unforeseen
- * future content type must keep the current behaviour (no edit entry at all) instead of
- * silently acquiring an editor whose write path has not been reviewed. `note` is entry
- * metadata, so `update_entry_note` accepts it for these rows — unlike body edits.
+ * # 为什么判据是"可编辑正文类型的补集"，而不是另一个白名单
+ *
+ * 原实现是 `BINARY_CONTENT_TYPES.includes(contentType)` —— 一个只含
+ * `["image","file","video"]` 的白名单。于是**凡是不在这两个清单里的类型都拿不到备注入口**：
+ * `emoji_sync`、以及后端将来新增的任何类型，用户在界面上**看不到「编辑备注」**。
+ *
+ * 用真实组件量测（`tools/visual-harness/collapse.mjs`）实测到：
+ *
+ *   emoji_sync    → 编辑备注 = 无   ← 与"每一个条目都要支持编辑备注"矛盾
+ *   unknown_type  → 编辑备注 = 无
+ *
+ * 而备注**是条目元数据**（`note` 列），与 `content` 列里放的是文本还是路径**无关** ——
+ * 后端 `update_entry_note` 对所有行都接受。所以拿"正文可不可编辑"去推"备注可不可编辑"
+ * 本身就是错的判据。
+ *
+ * ⇒ 改为「**除已知可编辑正文的类型外，一律可编辑备注**」：
+ *   - `text` / `code` / `url` / `rich_text` 走完整的正文编辑入口，不需要备注专用入口
+ *   - **其余全部**（含 image/file/video，以及尚未预见的类型）都拿备注入口
+ *
+ * 原注释担心"未预见的类型会静默获得一个未经审查的写路径"—— 该担心对**正文编辑**成立
+ * （`isBodyEditable` 仍是白名单，保持不变），但对**备注**不成立：备注的写路径是唯一的
+ * `update_entry_note`，与内容类型无关，不存在"未审查的写路径"。
  */
 export const isNoteEditable = (contentType: string): boolean =>
-  BINARY_CONTENT_TYPES.includes(contentType);
+  !EDITABLE_BODY_TYPES.includes(contentType);
 
 /**
  * R10: `rich_text` is editable, but saving downgrades it to plain text and drops

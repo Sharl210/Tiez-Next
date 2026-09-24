@@ -50,3 +50,6 @@ tools/visual-harness/dist/
 # 开发过程文件（计划、子代理交付报告）——不属于产品，不入库
 plans/
 docs/css-variable-fix-report.md
+
+# 代理的临时扫描脚本目录（不入库）
+.tmp-scan/

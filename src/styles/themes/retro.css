@@ -91,7 +91,22 @@ body.theme-retro {
 
   --data-panel-border: 2px solid var(--border-dark);
   --data-panel-radius: 0;
-  --data-panel-shadow: inset 3px 3px 0 rgba(0, 0, 0, 0.05);
+  /*
+   * 【内阴影 = 面板内部的一层灰，去掉】
+   *
+   * 原值 `inset 3px 3px 0 rgba(0, 0, 0, 0.05)` 是 retro 主题**独有**的
+   * （另外五个主题都把它设成 `none`）。它在 `.data-panel` 的**内部左上角**
+   * 铺一块 5% 黑的实心方块，让面板看起来"凹进去一块、发灰"。
+   *
+   * 用户反馈的「MCP 压暗」有两处来源，这是第二处：MCP 分组里有两个
+   * `.data-panel`（端点地址框、局域网地址框），正好都在视觉焦点上。
+   * 第一处是 `.settings-group` 上的 `backdrop-filter`（见 `settings.css`）。
+   *
+   * 去掉后，`.data-panel` 与其他面板一致 —— 面板的层次由 retro 自己的
+   * **实心边框**（`2px solid var(--border-dark)`）和按钮的硬阴影承担，
+   * 不靠一层半透明内阴影。这两个才是 retro 的像素风语言。
+   */
+  --data-panel-shadow: none;
   --data-panel-hover-background: #ffffff;
 
   --range-track-border: 2px solid var(--border-dark);

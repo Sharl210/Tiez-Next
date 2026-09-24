@@ -60,6 +60,39 @@
   -webkit-box-orient: vertical;
   margin-top: 0;
   padding-top: 0;
+  /*
+   * 【最小高度兜底 —— 防止"预览坍缩"】
+   *
+   * 上面是 `-webkit-box` + `-webkit-line-clamp: 4` 的四行截断。它的高度**完全由内容
+   * 撑开**，于是当内容**没有固有高度**时，整个预览盒会塌成 0——而 DOM、类名、文案
+   * **全都完全正确**，只有 `getBoundingClientRect()` 能看见。用真实组件量测（
+   * `tools/visual-harness/collapse.mjs`）实测到的坍缩值：
+   *
+   *   - `image_missing`（图片加载失败）→ preview.h = **0**
+   *   - `image`（图片未解码完）        → preview.h = **3**
+   *   - `rich_empty`（富文本内容为空） → preview.h = **4**
+   *   - `rich_img_only`（只有一张图）  → preview.h = 22.19
+   *
+   * 前三者在界面上就是"这条记录**看起来是空的**"——用户会以为数据丢了。
+   *
+   * `min-height: 1lh` 让预览至少占**一行**（`lh` 单位跟随 `--content-line-height`，
+   * 字体大小变化时自动适配）。这不影响正常内容：它们本来就超过一行。
+   */
+  min-height: 1lh;
+}
+
+/*
+ * 正文编辑器弹窗的高度下限。
+ *
+ * `entry-body-editor-dialog`（同时带 `confirm-dialog`）是 flex 居中盒，高度由内容撑开。
+ * 内容为空时（实测 `rich_empty`）对话框会缩到只剩内边距，用户在"打开一个空内容的
+ * 编辑器"时会看到一个几乎不可操作的小窗。给一个下限保证始终可操作。
+ *
+ * 注意类名取自 `ClipboardItem.tsx` 的实际用法
+ * （`className="confirm-dialog entry-body-editor-dialog"`），不要凭想象命名。
+ */
+.entry-body-editor-dialog {
+  min-height: 180px;
 }
 
 .content-preview-shell {

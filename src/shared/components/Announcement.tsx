@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Megaphone } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { runtimeT } from '../lib/runtimeLocale';
 import type { Announcement } from "../types";
 
 interface AnnouncementProps {
@@ -92,7 +93,7 @@ export const AnnouncementSystem: React.FC<AnnouncementProps> = ({ announcements,
             <div
                 className="ticker-fixed-close"
                 onClick={() => onDismiss(current.id)}
-                title="Dismiss"
+                title={runtimeT("tooltip_dismiss_notice")}
             >
                 <X size={16} />
             </div>

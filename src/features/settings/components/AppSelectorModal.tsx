@@ -36,7 +36,7 @@ const AppSelectorModal = ({ show, installedApps, theme, colorMode, t, onClose, o
                 >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                         <h3 className="modal-title">{t('select_app_title')}</h3>
-                        <button className="btn-icon" onClick={onClose} style={{ border: 'none', background: 'transparent', boxShadow: 'none' }}>
+                        <button className="btn-icon" onClick={onClose} title={t('tooltip_close_dialog')} style={{ border: 'none', background: 'transparent', boxShadow: 'none' }}>
                             <X size={18} />
                         </button>
                     </div>

@@ -31,6 +31,37 @@ const CHAT_HISTORY = [
 
 export const invoke = async (cmd: string) => {
   switch (cmd) {
+    // MCP 状态：`McpSettingsGroup` 会读 `status.running` / `status.endpoint` 等字段，
+    // 缺这条会渲染出 `TypeError: ... reading 'running'` 盖在量测区域上，
+    // 干扰截图取色（本文件曾缺它）。
+    // 系统级设置清单：返回"一项满足、一项待处理、一项无法确认"三种状态，
+    // 好让验证台能同时量到三种呈现（否则只会渲染出其中一种，漏掉另两种的样式问题）。
+    case "get_system_checklist": return [
+      { id: "firewall", satisfied: false, probeOk: true, detail: "Action: Block", ack: false },
+      { id: "uac", satisfied: false, probeOk: false, detail: "UAC 探测仅支持 Windows", ack: false },
+      { id: "startup_approved", satisfied: true, probeOk: true, detail: "首字节 = 0x02", ack: false },
+    ];
+    case "ack_system_checklist_item": return null;
+    case "get_mcp_status": return {
+      running: true,
+      enabled: true,
+      port: 23123,
+      endpoint: "http://127.0.0.1:23123/mcp",
+      lanEndpoint: "http://192.168.1.20:23123/mcp",
+      requireToken: false,
+      allowWrite: true,
+      allowLan: false,
+      autostart: false,
+      token: "mock-token-0000",
+      uptimeSec: 3600,
+    };
+    case "set_mcp_server_enabled": return true;
+    case "set_mcp_port": return true;
+    case "set_mcp_require_token": return true;
+    case "set_mcp_allow_write": return true;
+    case "set_mcp_allow_lan": return true;
+    case "set_mcp_autostart": return true;
+    case "regenerate_mcp_token": return "mock-token-1111";
     case "get_auto_backup_config": return CONFIG;
     case "get_chat_history": return CHAT_HISTORY;
     case "get_app_logo": return "";
