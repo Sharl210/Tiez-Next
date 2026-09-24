@@ -6,6 +6,7 @@ body.theme-retro {
   --bg-content: #dcdcdc;
   --bg-toolbar: #dcdcdc;
   --bg-panel: #f3f3f3;
+  --bg-panel-rgb: 243, 243, 243;
   --bg-input: #ffffff;
   --bg-element: #f3f3f3;
   --bg-button: #e0e0e0;
@@ -244,6 +245,8 @@ body.theme-retro {
     --bg-content: #181818;
     --bg-toolbar: #1f1f1f;
     --bg-panel: #262626;
+  --bg-panel-rgb: 38, 38, 38;
+    --bg-panel-rgb: 38, 38, 38;
     --bg-element: #2c2c2c;
     --bg-button: #383838;
     --bg-input: #202020;

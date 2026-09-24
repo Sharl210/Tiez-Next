@@ -20,6 +20,7 @@ import CloudSyncSettingsGroup, { type CloudSyncStatusPayload } from "./groups/Cl
 import DefaultAppsSettingsGroup from "./groups/DefaultAppsSettingsGroup";
 import McpSettingsGroup from "./groups/McpSettingsGroup";
 import DataSettingsGroup from "./groups/DataSettingsGroup";
+import AutoBackupSettingsGroup from "./groups/AutoBackupSettingsGroup";
 import FileTransferSettingsGroup from "./groups/FileTransferSettingsGroup";
 import AiSettingsGroup from "./groups/AiSettingsGroup";
 import SettingsFooter from "./SettingsFooter";
@@ -761,6 +762,22 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 collapsed={collapsedGroups['data']}
                 onToggle={() => toggleGroup('data')}
                 dataPath={dataPath}
+            />
+
+            {/*
+              自动备份（容灾）：与「数据管理」并列的独立分组。
+
+              为什么不分进数据管理：那一组里的「备份与恢复」讲的是**用户自己手动导出**
+              的 zip（自选路径、不受份数约束），而这里讲的是应用自己的**自动容灾保险**
+              （定时 + 启动备份，同一专用目录、受份数与轮换约束）。两者目录不同、约束
+              不同、用户心智也不同，共处一屏且都叫"备份"会让人分不清改的是哪一批。
+            */}
+            <AutoBackupSettingsGroup
+                t={t}
+                collapsed={collapsedGroups['auto_backup']}
+                onToggle={() => toggleGroup('auto_backup')}
+                LabelWithHint={LabelWithHint}
+                theme={theme}
             />
 
             {/* MCP Service Settings */}

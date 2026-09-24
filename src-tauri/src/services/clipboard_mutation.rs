@@ -324,14 +324,6 @@ pub fn apply_entry_delete(
     repo.delete(id, data_dir)
 }
 
-/// 清空历史。
-pub fn apply_history_clear(
-    repo: &impl ClipboardRepository,
-    data_dir: Option<&Path>,
-) -> Result<(), String> {
-    repo.clear(data_dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,7 @@ body.theme-mica {
   --bg-content: transparent;
   --bg-toolbar: transparent;
   --bg-panel: rgba(255, 255, 255, 0.48);
+  --bg-panel-rgb: 255, 255, 255;
   --bg-input: rgba(255, 255, 255, 0.74);
   --bg-element: rgba(255, 255, 255, 0.62);
   --bg-button: rgba(255, 255, 255, 0.46);
@@ -138,6 +139,8 @@ body.theme-mica #root > * {
   body.theme-mica:not(.light-mode) {
     --bg-window: rgba(24, 24, 24, calc(0.82 * var(--surface-opacity-scale, 1)));
     --bg-panel: rgba(36, 36, 36, 0.52);
+  --bg-panel-rgb: 36, 36, 36;
+    --bg-panel-rgb: 36, 36, 36;
     --bg-input: rgba(255, 255, 255, 0.12);
     --bg-element: rgba(45, 45, 45, 0.65);
     --bg-button: rgba(255, 255, 255, 0.05);

@@ -6,6 +6,7 @@ body.theme-sticky-note {
   --bg-content: linear-gradient(180deg, #fff9cf 0%, #fff3b0 100%);
   --bg-toolbar: rgba(255, 242, 167, 0.92);
   --bg-panel: rgba(255, 249, 211, 0.9);
+  --bg-panel-rgb: 255, 249, 211;
   --bg-input: rgba(255, 255, 255, 0.74);
   --bg-element: #fffde7;
   --bg-button: rgba(255, 255, 255, 0.3);
@@ -169,6 +170,8 @@ body.theme-sticky-note {
     --bg-content: linear-gradient(180deg, #303035 0%, #26262a 100%);
     --bg-toolbar: rgba(28, 28, 30, 0.94);
     --bg-panel: rgba(47, 47, 51, 0.9);
+  --bg-panel-rgb: 47, 47, 51;
+    --bg-panel-rgb: 47, 47, 51;
     --bg-input: rgba(255, 255, 255, 0.08);
     --bg-element: #3a3a3c;
     --bg-button: rgba(255, 255, 255, 0.06);

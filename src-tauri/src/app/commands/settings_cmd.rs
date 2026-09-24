@@ -464,6 +464,96 @@ pub async fn cloud_sync_now(
     crate::services::cloud_sync::cloud_sync_now(app_handle).await
 }
 
+/// 查询"本机是否曾经可能把凭据随云同步快照上传过"，即**要不要向用户提示**。
+///
+/// # 为什么是只读查询 + 单独一个确认命令，而不是一个"查完顺便标记"的命令
+///
+/// 提示的送达与否不该由"前端调过一次只读查询"决定：渲染失败、用户没看见就被关掉、
+/// 窗口崩了，都会让标记白白落下，而**看不见的安全告知等于没有告知**。因此拆成两步：
+/// 本命令只读；真正落标记只在用户点了"知道了"（或主动跳去改设置）时发生。
+///
+/// 代价是前端必须真的把标记写下去（`mark_credential_exposure_notice_seen`）。宁可在
+/// 极端情况下重复提示一次，也不要静默丢掉一次。
+#[tauri::command]
+pub fn get_credential_exposure_notice(
+    state: State<'_, DbState>,
+) -> AppResult<crate::services::cloud_sync::CredentialExposureNotice> {
+    crate::services::cloud_sync::assess_credential_exposure_from_repo(&state.settings_repo)
+}
+
+/// 记下"这条告知已经展示给用户了"，此后不再提示。
+#[tauri::command]
+pub fn mark_credential_exposure_notice_seen(
+    state: State<'_, DbState>,
+) -> AppResult<()> {
+    crate::services::cloud_sync::mark_credential_exposure_acknowledged(&state.settings_repo)
+}
+
+/// 重置设置时**必须原样保留**的设置键前缀。
+///
+/// # 为什么 `mcp.*` 不能被重置抹掉
+///
+/// `reset_settings` 的动作是"清空 settings 表 → 重新种入出厂默认值"，而
+/// [`crate::database::seed_defaults`] 里**一个 `mcp.*` 键都没有**。于是重置会：
+///
+/// 1. 删掉 `mcp.token`（用户已经配进 MCP 客户端的唯一凭据）；
+/// 2. 删掉 `mcp.allow_write` / `mcp.require_token` / `mcp.allow_lan` / `mcp.port` /
+///    `mcp.autostart`，让这些键回落到 `services::mcp::store` 的出厂默认值；
+/// 3. **不通知正在运行的服务实例**：`push_allow_write_to_running_service` /
+///    `push_require_token_to_running_service` 都不在这里被调用，令牌也不会重新生成。
+///
+/// 第 3 条是最危险的一条：重置之后**数据库里是一套姿态，正在跑的服务是另一套**。
+/// 用户点完"重置设置"当场看不到任何变化（服务仍按旧姿态服务），直到下次重启应用才
+/// 突然发现 MCP 的端口/写权限/鉴权全变了——这是"惊喜式"的姿态翻转。
+///
+/// # 为什么选择"保留键"而不是"重置后强制推送运行态 + 重新生成令牌"
+///
+/// 两条路都能解决"库与运行态不一致"，但代价不同：
+///
+/// * **重新生成令牌会静默打断用户已配置的每一个 MCP 客户端**。用户按设置界面的提示
+///   把入口与令牌写进了 IDE/客户端配置，令牌一换，那些客户端只会开始连不上，而
+///   "重置设置"这个按钮的语义里**没有任何一处**暗示它会动 MCP。
+/// * 强制推送运行态还需要重启服务（端口与监听地址在 bind 时就定了），而"重置设置"是
+///   同步命令，做不了这件事——那就会退回"重置后要重启才一致"，正是要消除的东西。
+/// * 保留键让数据库与运行态**根本不需要对齐**：`mcp.*` 一行没动，运行中的服务读到的
+///   仍是同一套值，不存在需要推送的差异。
+///
+/// 因此这里选"保留"。代价是重置不再把 MCP 恢复出厂——但出厂姿态本身是**用户已经做过
+/// 的选择**，不该被另一个按钮顺手推翻。
+const PRESERVED_PREFIXES_ON_RESET: &[&str] = &["mcp."];
+
+/// 快照所有需要跨过 `clear()` 保留下来的设置键值。
+///
+/// 抽成独立函数是为了让它可被单元测试直接驱动：命令函数需要 `AppHandle`，单测里构造
+/// 不出来，而"保留逻辑是否真的生效"正是这条修复的全部内容。
+fn snapshot_preserved_settings(
+    repo: &impl SettingsRepository,
+) -> AppResult<Vec<(String, String)>> {
+    let all = repo.get_all().map_err(AppError::from)?;
+    let mut kept: Vec<(String, String)> = all
+        .into_iter()
+        .filter(|(k, _)| {
+            PRESERVED_PREFIXES_ON_RESET
+                .iter()
+                .any(|p| k.starts_with(p))
+        })
+        .collect();
+    // `HashMap` 的迭代顺序不稳定；排序让"到底保留了哪几条"可复现、可断言。
+    kept.sort();
+    Ok(kept)
+}
+
+/// 把快照写回设置表。与 [`snapshot_preserved_settings`] 配对，同样抽出来以便单测。
+fn restore_preserved_settings(
+    repo: &impl SettingsRepository,
+    kept: &[(String, String)],
+) -> AppResult<()> {
+    for (key, value) in kept {
+        repo.set(key, value).map_err(AppError::from)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn reset_settings(
     app: AppHandle,
@@ -472,11 +562,19 @@ pub fn reset_settings(
 ) -> AppResult<()> {
     use crate::database::seed_defaults;
 
+    // 先取快照再清库：`clear()` 会把 `mcp.token` 一起删掉，而它是用户已经配进
+    // MCP 客户端的凭据——重新生成一个等价的随机串**不可能**与原值相同。
+    let preserved = snapshot_preserved_settings(&state.settings_repo)?;
+
     state.settings_repo.clear().map_err(AppError::from)?;
     {
         let conn = state.conn.lock().unwrap();
         seed_defaults(&conn).map_err(AppError::from)?;
     }
+
+    // 放在 `seed_defaults` 之后回填：那个函数用的是 `INSERT OR IGNORE`，两者不会互相
+    // 覆盖，但先种默认再回填让"保留值优先"这件事只依赖一处顺序。
+    restore_preserved_settings(&state.settings_repo, &preserved)?;
 
     let machine_id = crate::app::system::get_machine_id();
     let new_id = format!("{}-0000-0000-0000-000000000000", machine_id);
@@ -591,4 +689,246 @@ pub fn set_follow_mouse(
         .settings_repo
         .set("app.follow_mouse", &enabled.to_string())
         .map_err(AppError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::repository::settings_repo::SqliteSettingsRepository;
+    use std::sync::{Arc, Mutex};
+
+    /// 造一个只有 `settings` 表的内存库，接上真实的 `SqliteSettingsRepository`。
+    ///
+    /// 用真仓储而不是假实现：这条修复要证明的正是"真读写路径下 `mcp.*` 会活下来"，
+    /// 换成一个记录调用的假仓储就把被测对象换掉了。
+    fn repo() -> (Arc<Mutex<rusqlite::Connection>>, SqliteSettingsRepository) {
+        let conn = Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().expect("内存库应可创建"),
+        ));
+        conn.lock()
+            .expect("连接锁可用")
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("settings 表应可创建");
+        let repo = SqliteSettingsRepository::new(conn.clone());
+        (conn, repo)
+    }
+
+    /// 命令层走的是**真实读取路径**：真实 `SqliteSettingsRepository` → `get_all()` →
+    /// 判定。`cloud_sync.rs` 里的测试喂的是手搓 HashMap，证明不了"从库里真读对了键"。
+    ///
+    /// 这一组同时覆盖用户要求的两条主断言：**确实可能受影响必须提示**、
+    /// **肯定没受影响不得提示**，以及**一次性**（落标记后不再提示）。
+    #[test]
+    fn credential_exposure_notice_reads_the_real_settings_table() {
+        use crate::services::cloud_sync::{
+            assess_credential_exposure_from_repo, mark_credential_exposure_acknowledged,
+            ExposureEvidence, CREDENTIAL_EXPOSURE_ACK_KEY,
+        };
+
+        let (_conn, repo) = repo();
+
+        // ① 空表（等价于"从未配置过云同步"）⇒ 不得提示。
+        let notice = assess_credential_exposure_from_repo(&repo).expect("读取设置应成功");
+        assert!(
+            !notice.should_notify,
+            "从未配置过云同步的机器不得看到这条安全警告"
+        );
+        assert_eq!(notice.evidence, ExposureEvidence::NotConfigured);
+
+        // ② 模拟"配好并成功推送过设置快照"⇒ 必须提示，且依据是最强的那一档。
+        repo.set("cloud_sync_enabled", "true").unwrap();
+        repo.set("cloud_sync_webdav_last_snapshot_push_at", "1760000000000")
+            .unwrap();
+        // 三个被外流的键里放一个，验证"文案材料"这条路真的通到了命令层。
+        repo.set("mqtt_username", "mqtt-user-a").unwrap();
+
+        let notice = assess_credential_exposure_from_repo(&repo).expect("读取设置应成功");
+        assert!(
+            notice.should_notify,
+            "推送过设置快照的机器必须被告知：那 3 项凭据已经在它自己的云端存储里了"
+        );
+        assert_eq!(notice.evidence, ExposureEvidence::ConfirmedSyncHistory);
+        assert_eq!(notice.stored_credential_keys, vec!["mqtt_username".to_string()]);
+
+        // ③ 用户点过"知道了"⇒ 此后不再提示，但判定依据不被改写。
+        mark_credential_exposure_acknowledged(&repo).expect("标记应可写入");
+        assert_eq!(
+            repo.get(CREDENTIAL_EXPOSURE_ACK_KEY).unwrap().as_deref(),
+            Some("true"),
+            "标记必须真的落到设置表（否则下一次启动会重复提示）"
+        );
+
+        let notice = assess_credential_exposure_from_repo(&repo).expect("读取设置应成功");
+        assert!(!notice.should_notify, "提示过一次后不得再提示");
+        assert!(notice.acknowledged);
+        assert_eq!(
+            notice.evidence,
+            ExposureEvidence::ConfirmedSyncHistory,
+            "标记只影响是否提示，不得改变判定依据"
+        );
+    }
+
+    /// 复现 `reset_settings` 的动作序列（快照 → 清空 → 种默认 → 回填）。
+    ///
+    /// 不直接调用命令函数：它需要 `AppHandle`（还要求一个活的 Tauri 环境）。这里把
+    /// 命令体内**真正决定结果的四步**照原样执行一遍，因此"退回旧行为会变红"这件事
+    /// 是可证的——旧的命令体里就没有第 4 步。
+    fn reset_with_preservation(
+        repo: &impl SettingsRepository,
+        conn: &Arc<Mutex<rusqlite::Connection>>,
+    ) -> AppResult<Vec<(String, String)>> {
+        let preserved = snapshot_preserved_settings(repo)?;
+        repo.clear().map_err(AppError::from)?;
+        {
+            let guard = conn.lock().unwrap();
+            crate::database::seed_defaults(&guard).map_err(AppError::from)?;
+        }
+        restore_preserved_settings(repo, &preserved)?;
+        Ok(preserved)
+    }
+
+    /// 反向对照用的**旧行为**：清空 + 种默认，不做任何保留。
+    fn reset_without_preservation(
+        repo: &impl SettingsRepository,
+        conn: &Arc<Mutex<rusqlite::Connection>>,
+    ) {
+        repo.clear().unwrap();
+        let guard = conn.lock().unwrap();
+        crate::database::seed_defaults(&guard).unwrap();
+    }
+
+    /// 用户已经配好 MCP 的常见状态：令牌 + 一串非默认姿态。
+    fn seed_configured_mcp(repo: &impl SettingsRepository) {
+        repo.set("mcp.token", "configured-token-abc").unwrap();
+        repo.set("mcp.allow_write", "false").unwrap();
+        repo.set("mcp.require_token", "true").unwrap();
+        repo.set("mcp.allow_lan", "true").unwrap();
+        repo.set("mcp.port", "34567").unwrap();
+        repo.set("mcp.autostart", "false").unwrap();
+        repo.set("mcp.enabled", "true").unwrap();
+        // 一个普通设置，用来证明重置**确实**把非 mcp 的设置清了（保留下沉为"全保留"）。
+        repo.set("app.theme", "dark").unwrap();
+        repo.set("app.persistent", "true").unwrap();
+    }
+
+    /// 重置设置必须原样保留 `mcp.*`（含令牌与安全姿态）。
+    ///
+    /// 【这条为什么重要】`seed_defaults` 里一个 `mcp.*` 键都没有，因此清库会让这些键
+    /// 整体回落到 `store.rs` 的出厂默认值：`mcp.token` 直接消失（用户已配进 MCP 客户端
+    /// 的凭据没了）、`mcp.require_token` 回落到 `false`（免鉴权）、`mcp.allow_lan` 回落
+    /// 到 `false`。用户点一下"重置设置"就把 MCP 的安全姿态换了一套，而按钮上没有任何
+    /// 提示。
+    #[test]
+    fn reset_settings_preserves_every_mcp_key() {
+        let (conn, repo) = repo();
+        seed_configured_mcp(&repo);
+        let before: Vec<(String, String)> = {
+            let mut v: Vec<(String, String)> = repo
+                .get_all()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("mcp."))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(before.len(), 7, "前置：应有 7 个 mcp.* 键");
+
+        reset_with_preservation(&repo, &conn).expect("重置应成功");
+
+        let after: Vec<(String, String)> = {
+            let mut v: Vec<(String, String)> = repo
+                .get_all()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("mcp."))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            after, before,
+            "mcp.* 必须在重置前后**逐键逐值**相同（含令牌）"
+        );
+        assert_eq!(
+            repo.get("mcp.token").unwrap().as_deref(),
+            Some("configured-token-abc"),
+            "令牌若被换掉，用户已配置的每个 MCP 客户端都会静默失联"
+        );
+        assert_eq!(
+            repo.get("mcp.require_token").unwrap().as_deref(),
+            Some("true"),
+            "鉴权姿态不该被重置悄悄关掉"
+        );
+
+        // 对照：普通设置确实被重置了（保留下沉为"什么都不清"是另一种缺陷）。
+        assert_eq!(
+            repo.get("app.theme").unwrap().as_deref(),
+            Some("mica"),
+            "非 mcp 设置应回到出厂默认值"
+        );
+    }
+
+    /// **反向对照**：退回旧行为（不保留）时，上一条断言必须变红。
+    ///
+    /// 这条测试存在的意义是证明上一条真的在守着这条修复，而不是在守一个恒真命题——
+    /// 如果 `seed_defaults` 将来加了 `mcp.*` 默认值，这里会红，提醒复核者换一种造数据
+    /// 的方式，而不是让两条测试一起变成空转。
+    #[test]
+    fn without_preservation_the_mcp_keys_are_wiped_and_the_guard_would_fail() {
+        let (conn, repo) = repo();
+        seed_configured_mcp(&repo);
+
+        reset_without_preservation(&repo, &conn);
+
+        assert!(
+            repo.get("mcp.token").unwrap().is_none(),
+            "旧行为下令牌必然消失——这正是要修的缺陷；它仍然消失说明测试夹具没能复现缺陷"
+        );
+        assert_eq!(
+            repo.get("mcp.allow_lan").unwrap(),
+            None,
+            "旧行为下局域网开关回落默认（仅本机）"
+        );
+        assert_eq!(
+            repo.get("mcp.require_token").unwrap(),
+            None,
+            "旧行为下令牌校验回落默认（免鉴权）"
+        );
+    }
+
+    /// 保留的是**前缀**而不是逐键列举：将来新增 `mcp.*` 键会自动被覆盖。
+    ///
+    /// 逐键列举有一个安静的失效模式——新增键漏登记不会有编译错误或测试失败，而
+    /// `mcp.*` 正是一个还在增长的族（`allow_lan`、`autostart` 都是后来加的）。
+    #[test]
+    fn preservation_covers_unknown_future_mcp_keys() {
+        let (conn, repo) = repo();
+        repo.set("mcp.some_future_switch", "on").unwrap();
+
+        reset_with_preservation(&repo, &conn).expect("重置应成功");
+
+        assert_eq!(
+            repo.get("mcp.some_future_switch").unwrap().as_deref(),
+            Some("on"),
+            "前缀保留必须覆盖将来新增的 mcp.* 键"
+        );
+    }
+
+    /// 快照函数本身：只挑 `mcp.*`，且顺序稳定。
+    #[test]
+    fn snapshot_only_keeps_the_protected_prefixes() {
+        let (_conn, repo) = repo();
+        seed_configured_mcp(&repo);
+
+        let kept = snapshot_preserved_settings(&repo).unwrap();
+
+        assert!(kept.iter().all(|(k, _)| k.starts_with("mcp.")));
+        assert_eq!(kept.len(), 7);
+        let mut sorted = kept.clone();
+        sorted.sort();
+        assert_eq!(kept, sorted, "顺序必须稳定可复现");
+    }
 }

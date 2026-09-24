@@ -30,6 +30,7 @@ export const useAppState = (): AppState => {
     file_transfer: true,
     default_apps: true,
     data: true,
+    auto_backup: true,
     mcp: true
   });
   const [history, setHistory] = useState<ClipboardEntry[]>([]);

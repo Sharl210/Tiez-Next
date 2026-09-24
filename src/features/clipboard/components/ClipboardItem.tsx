@@ -2171,7 +2171,13 @@ const ClipboardItem = ({
                 {item.content_type === "image" ? (
                     <div style={{ position: 'relative' }}>
                         {item.is_external && item.file_preview_exists === false ? (
-                            <div className="image-preview error-placeholder" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-secondary)', color: 'var(--text-secondary)', height: '100px', fontSize: '12px' }}>
+                            // 图片已失效时的占位块。底色用 `--bg-input`：与条目里其它
+                            // "需要从卡片底上再抬起一档"的内嵌表面（`.video-file-card`、
+                            // 标签芯片）同一令牌，因此占位块在六套主题下都跟随主题。
+                            // 原先写的是从未定义的 `--bg-secondary`，整条 background 被
+                            // 丢弃，占位块一直是透明的——而这个块平时看不见（只在图片
+                            // 文件丢失时出现），所以没人察觉。
+                            <div className="image-preview error-placeholder" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-input)', color: 'var(--text-secondary)', height: '100px', fontSize: '12px' }}>
                                 <ImageOff size={24} style={{ marginBottom: '8px', opacity: 0.5 }} />
                                 <span>{t('image_deleted') || 'Image Deleted'}</span>
                             </div>

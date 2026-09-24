@@ -12,6 +12,7 @@ body.theme-sakura {
   --bg-content: transparent;
   --bg-toolbar: rgba(255, 255, 255, 0.3);
   --bg-panel: rgba(255, 245, 248, 0.45);
+  --bg-panel-rgb: 255, 245, 248;
   --bg-input: rgba(255, 255, 255, 0.6);
   --bg-element: rgba(255, 235, 240, 0.5);
   --bg-button: rgba(255, 255, 255, 0.5);
@@ -210,6 +211,7 @@ body.theme-sakura #root > * {
     --bg-content: transparent;
     --bg-toolbar: rgba(255, 255, 255, 0.03);
     --bg-panel: rgba(48, 34, 40, 0.5);
+    --bg-panel-rgb: 48, 34, 40;
     --bg-input: rgba(255, 255, 255, 0.08);
     --bg-element: rgba(65, 45, 52, 0.45);
     --bg-button: rgba(255, 255, 255, 0.06);
@@ -268,6 +270,7 @@ body.dark-mode.theme-sakura {
   --bg-content: transparent;
   --bg-toolbar: transparent;
   --bg-panel: rgba(40, 28, 33, 0.55);
+  --bg-panel-rgb: 40, 28, 33;
   --bg-input: rgba(255, 255, 255, 0.06);
   --bg-element: rgba(55, 38, 44, 0.5);
   --bg-button: rgba(255, 255, 255, 0.04);

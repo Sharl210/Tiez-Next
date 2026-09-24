@@ -596,11 +596,25 @@ fn summarize_args(value: &Value) -> String {
     }
 }
 
-/// 按 `inputSchema` 做最小必要校验。
+/// 按 `inputSchema` 校验一次调用的参数。
 ///
-/// 只校验 `required` 与顶层类型：完整 JSON Schema 校验需要引入额外依赖，而这些
-/// 工具的 schema 都很窄，"必填 + 类型"已经能挡掉绝大多数误用。**未校验的部分
-/// 在报告里如实标注**，不假装做了全量校验。
+/// # 覆盖范围
+///
+/// `required` 存在性、顶层 `type`、`enum`、`minimum` / `maximum`、
+/// `minItems` / `maxItems`、以及数组元素的 `items`。这是仓库里实际用到的那部分
+/// JSON Schema——**不是全量校验**（未覆盖 `pattern` / `format` / `oneOf` /
+/// 嵌套对象属性等），没做的部分如实写在这里，不假装做了。
+///
+/// # 为什么这层值得做，而不是"让各工具自己检查"
+///
+/// 工具实现里的参数读取（`str_arg` / `usize_arg` 等）**已经**会挡住错误类型，但它们的
+/// 报错发生在**执行阶段**：`invoke` 已经开始跑，可能已经落了库、发了事件，才因为一个
+/// 参数越界而返回失败。校验层放在执行之前，越界参数连工具入口都进不去。
+///
+/// # 为什么每条错误都报出"违反了哪一条"
+///
+/// 只回一句"参数不合法"会让调用方（尤其是 AI）无法自查：它不知道是类型错、还是越界、
+/// 还是枚举值不在集合里，只能盲试。因此每条错误都带上**参数名 + 约束名 + 实际值**。
 fn validate_args(spec: &tools::ToolSpec, args: &Value) -> Result<(), String> {
     let required = spec
         .input_schema
@@ -628,32 +642,145 @@ fn validate_args(spec: &tools::ToolSpec, args: &Value) -> Result<(), String> {
         }
     }
 
-    // 已声明的参数若给了值，检查顶层 JSON 类型是否与 schema 一致。
+    // 已声明的参数若给了值，逐条核对类型与约束。
     if let Some(props) = props {
         for (key, schema) in props {
             let Some(given) = args.get(key) else { continue };
-            if given.is_null() {
-                // `null` 只在 schema 允许时视为类型合法；否则交给下面的类型检查
-                // 报错，避免"传了 null 却被当作没传"这种静默语义。
-                if type_allows_null(schema) {
-                    continue;
-                }
-            }
-            let expected = schema.get("type");
-            let ok = match expected {
-                Some(Value::String(t)) => type_matches(t, given),
-                Some(Value::Array(types)) => types
-                    .iter()
-                    .filter_map(|t| t.as_str())
-                    .any(|t| type_matches(t, given)),
-                _ => true,
-            };
-            if !ok {
-                return Err(format!("参数 `{}` 类型不符", key));
-            }
+            validate_value(key, schema, given)?;
         }
     }
     Ok(())
+}
+
+/// 校验单个参数值：类型 → 枚举 → 数值边界 → 数组长度与元素类型。
+///
+/// 拆成独立函数是为了让每条约束都能被**单独驱动**：测试可以直接构造
+/// `(schema, value)` 断言"是 `enum` 这条拒绝的"，而不必先绕过类型检查才能走到
+/// 枚举检查——那种测试只能断言"失败了"，说不出是哪一条失败。
+fn validate_value(key: &str, schema: &Value, given: &Value) -> Result<(), String> {
+    // `null` 只在 schema 允许时视为合法；否则继续往下走，由类型检查给出准确报错
+    // （"类型不符"比"缺少参数"更贴近事实：参数确实传了）。
+    if given.is_null() && type_allows_null(schema) {
+        return Ok(());
+    }
+
+    // ---- 1. 顶层类型 ----
+    let expected = schema.get("type");
+    let type_ok = match expected {
+        Some(Value::String(t)) => type_matches(t, given),
+        Some(Value::Array(types)) => types
+            .iter()
+            .filter_map(|t| t.as_str())
+            .any(|t| type_matches(t, given)),
+        _ => true,
+    };
+    if !type_ok {
+        let want = match expected {
+            Some(Value::String(t)) => t.clone(),
+            Some(Value::Array(ts)) => ts
+                .iter()
+                .filter_map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(" | "),
+            _ => "任意".to_string(),
+        };
+        return Err(format!(
+            "参数 `{}` 类型不符：期望 {}，实际 {}",
+            key,
+            want,
+            json_type_name(given)
+        ));
+    }
+
+    // ---- 2. `enum`：取值必须在集合内 ----
+    //
+    // 这条是"结构性误用"最有效的拦截：例如把 `contentType` 写成 `"txt"`（正确是
+    // `"text"`）时，类型检查完全放行，只有实现在下游白名单里默默回退到默认值——
+    // 调用方看到"成功"，拿到的却不是它要的类型。
+    if let Some(Value::Array(allowed)) = schema.get("enum") {
+        if !allowed.iter().any(|a| a == given) {
+            let list = allowed
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "参数 `{}` 取值不在允许集合内：实际 {}，允许 {}",
+                key,
+                given,
+                list
+            ));
+        }
+    }
+
+    // ---- 3. `minimum` / `maximum` ----
+    //
+    // 只对数值生效。**必须排除 `null`**：`null` 既不是数字也不是越界，把它交给这两条
+    // 会得到一个"必须 >= 1，实际 null"这种毫无意义的报错。
+    if let Some(n) = given.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
+            if n < min {
+                return Err(format!(
+                    "参数 `{}` 小于最小值：{} < {}",
+                    key, n, min
+                ));
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
+            if n > max {
+                return Err(format!(
+                    "参数 `{}` 大于最大值：{} > {}",
+                    key, n, max
+                ));
+            }
+        }
+    }
+
+    // ---- 4. `minItems` / `maxItems` 与元素 `items` ----
+    if let Some(items) = given.as_array() {
+        if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
+            if (items.len() as u64) < min {
+                return Err(format!(
+                    "参数 `{}` 元素过少：{} < {}",
+                    key,
+                    items.len(),
+                    min
+                ));
+            }
+        }
+        if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+            if (items.len() as u64) > max {
+                return Err(format!(
+                    "参数 `{}` 元素过多：{} > {}",
+                    key,
+                    items.len(),
+                    max
+                ));
+            }
+        }
+        // 元素类型：逐个定位到**第几个**元素，否则一个 200 元素的列表报"元素类型不符"
+        // 等于没报。
+        if let Some(item_schema) = schema.get("items") {
+            for (idx, item) in items.iter().enumerate() {
+                validate_value(&format!("{}[{}]", key, idx), item_schema, item)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// JSON 值的类型名，仅用于报错文案。
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// schema 的 `type` 是否允许 `null`（可能是 `"null"`，也可能是 `["string","null"]`）。
@@ -1150,14 +1277,45 @@ mod tests {
 
     #[tokio::test]
     async fn binds_to_loopback_only_with_fallback() {
-        let (first, port_a) = bind_local_listener(0).await.unwrap();
-        assert_eq!(port_a, crate::services::mcp::store::DEFAULT_PORT);
-        let addr = first.local_addr().unwrap();
-        assert!(addr.ip().is_loopback(), "只能绑回环地址，实际 {}", addr.ip());
+        // 【这条测试原先假设默认端口是空闲的，因此在"本机恰好跑着 MCP 服务"或
+        // 端口被别的东西占着时必然失败——而那种失败与代码是否正确毫无关系。】
+        //
+        // 实测撞到过：开发机上 23123 被占，该测试断言 `port_a == DEFAULT_PORT`
+        // 直接失败，看起来像回归，实际是环境。断言要验的是**行为**（先试默认端口、
+        // 被占则回退），不是"这台机器上默认端口一定空着"，所以先把默认端口占住，
+        // 再验证回退链。
+        let holder = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let taken = holder.local_addr().unwrap().port();
 
         // 首选端口被占用时应回退到下一个可用端口，而不是失败。
-        let (second, port_b) = bind_local_listener(port_a).await.unwrap();
-        assert_ne!(port_a, port_b);
+        let (second, port_b) = bind_local_listener(taken).await.unwrap();
+        assert_ne!(port_b, taken, "被占用的端口不该被返回");
+        assert!(port_b > taken, "回退应当向后找，实际 {} -> {}", taken, port_b);
+        let addr = second.local_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "只能绑回环地址，实际 {}", addr.ip());
+
+        // 默认端口空闲时必须命中它——这是"0 表示用默认端口"的语义。
+        // 端口被占的情况下这条断言不成立，所以先确认它空闲。
+        let default_free = tokio::net::TcpListener::bind(("127.0.0.1", crate::services::mcp::store::DEFAULT_PORT))
+            .await
+            .is_ok();
+        if default_free {
+            let (first, port_a) = bind_local_listener(0).await.unwrap();
+            assert_eq!(
+                port_a,
+                crate::services::mcp::store::DEFAULT_PORT,
+                "首选端口空闲时应当命中默认端口"
+            );
+            let addr = first.local_addr().unwrap();
+            assert!(addr.ip().is_loopback(), "只能绑回环地址，实际 {}", addr.ip());
+        } else {
+            eprintln!(
+                "跳过默认端口断言：{} 已被占用（环境问题，非代码缺陷）",
+                crate::services::mcp::store::DEFAULT_PORT
+            );
+        }
         assert!(second.local_addr().unwrap().ip().is_loopback());
     }
 
@@ -1252,6 +1410,242 @@ mod tests {
             "validate_args 应接受显式 null 的 color：{:?}",
             validate_args(&spec, &json!({"name": "x", "color": null}))
         );
+    }
+
+    // ---------------- 参数校验：每条约束都要能指出"是哪一条拒绝的" ----------------
+    //
+    // 【这组测试的写法要求】不断言 `is_err()` 就完事，而要断言错误文案里出现**违反的
+    // 那一条约束名**（"不在允许集合内" / "小于最小值" / …）。否则一条"类型检查先报错"
+    // 的实现也能让这些测试全绿，而它根本没实现 enum/minimum 检查。
+    //
+    // 每条约束都配一个"合法值必须通过"的对照，避免把规则写得过严（拒绝一切）。
+
+    /// `enum`：取值不在集合内必须被拒，且错误要指出"不在允许集合内"。
+    #[test]
+    fn enum_violation_is_rejected_with_the_constraint_named() {
+        let schema = json!({"type": "string", "enum": ["text", "image", "file"]});
+        // 合法值通过——这条同时挡住"把 enum 写成永远拒绝"的过严实现。
+        assert!(validate_value("contentType", &schema, &json!("text")).is_ok());
+        let err = validate_value("contentType", &schema, &json!("txt"))
+            .expect_err("txt 不在 enum 内，必须被拒");
+        assert!(
+            err.contains("不在允许集合内"),
+            "错误必须指出违反的是 enum 约束，实际：{}",
+            err
+        );
+        assert!(err.contains("contentType"), "错误必须带参数名：{}", err);
+        assert!(err.contains("text"), "错误应列出允许值，便于自查：{}", err);
+    }
+
+    /// `minimum`：低于下界必须被拒，且错误要指出"小于最小值"。
+    #[test]
+    fn minimum_violation_is_rejected_with_the_constraint_named() {
+        let schema = json!({"type": "integer", "minimum": 1});
+        assert!(validate_value("limit", &schema, &json!(1)).is_ok(), "边界值本身必须合法");
+        let err = validate_value("limit", &schema, &json!(0)).expect_err("0 < 1 必须被拒");
+        assert!(err.contains("小于最小值"), "必须指出是 minimum 这条：{}", err);
+        assert!(err.contains("limit"), "{}", err);
+    }
+
+    /// `maximum`：高于上界必须被拒。
+    #[test]
+    fn maximum_violation_is_rejected_with_the_constraint_named() {
+        let schema = json!({"type": "integer", "minimum": 1, "maximum": 500});
+        assert!(validate_value("limit", &schema, &json!(500)).is_ok(), "上界本身必须合法");
+        let err = validate_value("limit", &schema, &json!(501)).expect_err("501 > 500 必须被拒");
+        assert!(err.contains("大于最大值"), "必须指出是 maximum 这条：{}", err);
+    }
+
+    /// 数值边界**不得**把 `null` / 字符串误判成越界。
+    ///
+    /// 【为什么单列一条】`as_f64()` 对 `null` 返回 `None`，看起来天然安全；但若实现写成
+    /// `unwrap_or(0.0)`，`null` 就会变成 `0.0` 并被 `minimum: 1` 拒掉——而"参数没传"和
+    /// "参数非法"是两件不同的事，报错文案会把人引向错误方向。
+    #[test]
+    fn numeric_bounds_do_not_misfire_on_null_or_strings() {
+        // 允许 null 的 schema：null 必须原样通过，不能被当成 0 去比大小。
+        let nullable = json!({"type": ["integer", "null"], "minimum": 1});
+        assert!(
+            validate_value("limit", &nullable, &json!(null)).is_ok(),
+            "schema 允许 null 时，null 不应被拿去和 minimum 比较"
+        );
+        // 类型不符的报错必须是"类型不符"，而不是"小于最小值"——后者会把排查引偏。
+        let strict = json!({"type": "integer", "minimum": 1});
+        let err = validate_value("limit", &strict, &json!("abc")).expect_err("字符串不是整数");
+        assert!(err.contains("类型不符"), "应先报类型问题：{}", err);
+        assert!(!err.contains("最小值"), "不该用边界报错掩盖类型错：{}", err);
+    }
+
+    /// `minItems` / `maxItems`：数组长度越界必须被拒。
+    #[test]
+    fn array_length_bounds_are_rejected_with_the_constraint_named() {
+        let schema = json!({"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 3});
+        assert!(validate_value("ids", &schema, &json!([1])).is_ok());
+        assert!(validate_value("ids", &schema, &json!([1, 2, 3])).is_ok());
+        let err = validate_value("ids", &schema, &json!([])).expect_err("空数组低于 minItems");
+        assert!(err.contains("元素过少"), "必须指出 minItems：{}", err);
+        let err =
+            validate_value("ids", &schema, &json!([1, 2, 3, 4])).expect_err("4 个超过 maxItems");
+        assert!(err.contains("元素过多"), "必须指出 maxItems：{}", err);
+    }
+
+    /// `items`：元素类型不符必须被拒，且**定位到第几个元素**。
+    ///
+    /// 【为什么必须带下标】一个 200 元素的列表报"元素类型不符"等于没报——调用方不知道
+    /// 改哪里。错误里带 `ids[2]` 才能直接定位。
+    #[test]
+    fn element_type_violation_names_the_offending_index() {
+        let schema = json!({"type": "array", "items": {"type": "integer"}});
+        assert!(validate_value("ids", &schema, &json!([1, 2])).is_ok());
+        let err =
+            validate_value("ids", &schema, &json!([1, 2, "x"])).expect_err("第 3 个不是整数");
+        assert!(
+            err.contains("ids[2]"),
+            "元素级错误必须带下标，实际：{}",
+            err
+        );
+        assert!(err.contains("类型不符"), "{}", err);
+    }
+
+    /// 嵌套数组也要被 `items` 覆盖（`reorder_pinned.orders` 是 `[[id, order], ...]`）。
+    ///
+    /// 这条是"递归校验"的证据：只做一层 `items` 检查会让 `orders: [["a", 1]]` 通过
+    /// 类型层，然后在实现里被 `as_i64()` 静默取成 `None` 而报出误导性的错误。
+    #[test]
+    fn nested_array_items_are_validated_recursively() {
+        let schema = json!({
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 2,
+                "maxItems": 2
+            }
+        });
+        assert!(validate_value("orders", &schema, &json!([[1, 2], [3, 4]])).is_ok());
+        let err = validate_value("orders", &schema, &json!([[1, 2], ["x", 4]]))
+            .expect_err("嵌套元素类型错必须被拒");
+        assert!(err.contains("orders[1][0]"), "应定位到具体下标：{}", err);
+        let err = validate_value("orders", &schema, &json!([[1]]))
+            .expect_err("内层长度不足必须被拒");
+        assert!(!err.is_empty());
+    }
+
+    /// 端到端：通过 `tools/call` 走一遍，非法值在**执行之前**就被挡下（协议错误）。
+    ///
+    /// 与上面几条纯函数测试的区别：那些驱动 `validate_value`，这条证明它**真的接在
+    /// 调用链上**——一个写好了却没被 `validate_args` 调用的校验函数，只有这条能发现。
+    #[test]
+    fn out_of_range_argument_is_rejected_before_execution() {
+        let (state, _) = test_state(true, "t");
+        let response = call(
+            &state,
+            "tools/call",
+            // `list_entries.limit` 的 schema 是 minimum 1 / maximum 500。
+            json!({"name": "list_entries", "arguments": {"limit": 9999}}),
+            json!(11),
+        );
+        let error = response.error.expect("limit=9999 应被拒");
+        assert!(
+            error.message.contains("大于最大值"),
+            "必须说明是越界，而不是别的错：{}",
+            error.message
+        );
+    }
+
+    /// 端到端：非法 `enum` 值在**执行之前**被拒。
+    ///
+    /// 用 `copy_to_clipboard` 的 `contentType` 作为载体，因为它是有真实后果的一处：
+    /// 未知类型在 `copy_content_to_system_clipboard` 里落到 `_ => copy_text_with_retry`，
+    /// **静默降级成纯文本**并返回"成功"。调用方本意是图片、拿到的是文本，且无从察觉。
+    #[test]
+    fn invalid_enum_argument_is_rejected_before_execution() {
+        let (state, _) = test_state(true, "t");
+        let response = call(
+            &state,
+            "tools/call",
+            json!({
+                "name": "copy_to_clipboard",
+                "arguments": {"id": 0, "content": "x", "contentType": "txt"}
+            }),
+            json!(12),
+        );
+        let error = response.error.expect("contentType=txt 应被拒");
+        assert!(
+            error.message.contains("不在允许集合内"),
+            "必须指出是 enum 这条：{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("contentType"),
+            "必须带参数名：{}",
+            error.message
+        );
+    }
+
+    /// 声明了 `enum` 的**每一个**参数都被真的强制（不是只给某一个立了规矩）。
+    ///
+    /// 【为什么遍历而不是挑一个】给三个 `contentType` 都加了 enum，若只有第一个真的
+    /// 生效（例如另两个拼错了键名），挑一个的测试会全绿。遍历能发现这种部分失效。
+    #[test]
+    fn every_declared_enum_in_the_catalog_is_enforced() {
+        let mut checked = 0usize;
+        for spec in tools::catalog() {
+            let Some(props) = spec.input_schema.get("properties").and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+            for (key, schema) in props {
+                let Some(allowed) = schema.get("enum").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                checked += 1;
+                let bad = json!("__definitely_not_in_enum__");
+                assert!(
+                    !allowed.contains(&bad),
+                    "测试前提：构造的非法值不应出现在 enum 内"
+                );
+                // 注意方向：**成功**才是失败。这里要断言"非法值被拒"，
+                // 因此 `is_ok()` 就意味着这条 enum 没生效。
+                assert!(
+                    validate_value(key, schema, &bad).is_err(),
+                    "{}.{} 声明了 enum，但非法值未被拒",
+                    spec.name,
+                    key
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "清单里应至少有 3 个声明 enum 的参数（3 个 contentType），实际 {}",
+            checked
+        );
+    }
+
+    /// 反向对照：**合法** `contentType` 必须通过校验。
+    ///
+    /// 与上一条配对，挡住"把 enum 写成拒绝一切"这种过严实现——那种实现也能让
+    /// "非法值被拒"的断言全绿。
+    #[test]
+    fn valid_content_type_passes_validation() {
+        let (state, _) = test_state(true, "t");
+        for ok in ["text", "code", "url", "rich_text", "image", "file", "video"] {
+            let response = call(
+                &state,
+                "tools/call",
+                json!({
+                    "name": "create_entry",
+                    "arguments": {"content": "x", "contentType": ok}
+                }),
+                json!(13),
+            );
+            assert!(
+                response.error.is_none(),
+                "contentType={} 是受支持类型，不应在校验层被拒：{:?}",
+                ok,
+                response.error
+            );
+        }
     }
 
     // ---------------- 真实 HTTP 往返（socket 层证据） ----------------

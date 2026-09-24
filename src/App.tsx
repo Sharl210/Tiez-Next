@@ -45,7 +45,9 @@ import { AnnouncementSystem } from "./shared/components/Announcement";
 import { useAnnouncements } from "./shared/hooks/useAnnouncements";
 import { useOverlays } from "./shared/hooks/useOverlays";
 import { useAutoUpdate } from "./shared/hooks/useAutoUpdate";
+import { useCredentialExposureNotice } from "./shared/hooks/useCredentialExposureNotice";
 import UpdateDialog from "./shared/components/UpdateDialog";
+import CredentialExposureDialog from "./features/settings/components/CredentialExposureDialog";
 import type { ClipboardEntry } from "./shared/types";
 import type { QuickPasteHint, VirtualClipboardListHandle } from "./features/clipboard/types";
 
@@ -808,6 +810,23 @@ const App = () => {
 
   useSettingsPanelReset({ showSettings, setCollapsedGroups, setSettingsSubpage });
 
+  // 存量凭据外流的升级告知：启动后查一次（判据全在本机设置表里，无需轮询）。
+  // 用 `settingsLoaded` 作闸门，保证查询发生在设置初始化之后、且只查一次。
+  const credentialExposure = useCredentialExposureNotice(settingsLoaded);
+
+  /**
+   * 从告知弹窗跳到"该改的地方"。
+   *
+   * 为什么展开 `sync`（MQTT）而不是 `cloud_sync`：要换的凭据是 MQTT 用户名/密码，
+   * 它们在「同步」分组里；云同步那个分组只是这条外流的来源，不是修复动作的落点。
+   * 跳过去之后用户看到的正是需要改的两个输入框。
+   */
+  const openSettingsForExposure = useCallback(() => {
+    setSettingsSubpage("home");
+    setShowSettings(true);
+    setCollapsedGroups((prev) => ({ ...prev, sync: false }));
+  }, [setCollapsedGroups, setSettingsSubpage, setShowSettings]);
+
   useTagManagerRefresh({
     showTagManager: effectiveShowTagManager,
     settingsLoaded,
@@ -1149,6 +1168,22 @@ const App = () => {
         status={updateStatus}
         onUpdate={updateStatus === "ready" ? onApplyUpdate : onStartDownload}
         onClose={closeUpdateDialog}
+      />
+
+      {/*
+        存量凭据外流的升级告知。
+
+        挂在 `UpdateDialog` 之后、同一个容器内：它是"读完就该关掉"的一次性说明，
+        与更新弹窗同一类，因此在同一层渲染、共用 `.modal-overlay` 的层级约定
+        （自身再抬一档 z-index，避免与更新弹窗叠在一起时被压住）。
+      */}
+      <CredentialExposureDialog
+        notice={credentialExposure.notice}
+        t={t}
+        language={language}
+        theme={theme}
+        onOpenSettings={openSettingsForExposure}
+        onClose={credentialExposure.dismiss}
       />
     </div >
   );

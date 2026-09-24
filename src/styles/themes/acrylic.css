@@ -6,6 +6,7 @@ body.theme-acrylic {
   --bg-content: transparent;
   --bg-toolbar: transparent;
   --bg-panel: rgba(255, 255, 255, 0.34);
+  --bg-panel-rgb: 255, 255, 255;
   --bg-input: rgba(255, 255, 255, 0.52);
   --bg-element: rgba(255, 255, 255, 0.26);
   --bg-button: rgba(255, 255, 255, 0.2);
@@ -141,6 +142,8 @@ body.theme-acrylic #root > * {
   body.theme-acrylic:not(.light-mode) {
     --bg-window: rgba(20, 20, 20, calc(0.52 * var(--surface-opacity-scale, 1)));
     --bg-panel: rgba(28, 28, 28, 0.38);
+  --bg-panel-rgb: 28, 28, 28;
+    --bg-panel-rgb: 28, 28, 28;
     --bg-input: rgba(255, 255, 255, 0.12);
     --bg-element: rgba(45, 45, 45, 0.42);
     --bg-button: rgba(255, 255, 255, 0.06);

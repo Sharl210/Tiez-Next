@@ -11,6 +11,8 @@ import {
     Trash2,
     Upload,
 } from "lucide-react";
+import { formatBytes } from "../../lib/formatBytes";
+import { backendErrorText as backupErrorText } from "../../lib/backendError";
 
 interface DataSettingsGroupProps {
     t: (key: string) => string;
@@ -135,14 +137,7 @@ interface RestoreReport {
     restartRequired: boolean;
 }
 
-/** 把字节数格式化为人类可读形式。 */
-const formatBytes = (bytes: number): string => {
-    if (!bytes) return "0 B";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-    const value = bytes / Math.pow(1024, i);
-    return `${value >= 100 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
-};
+// 字节数格式化：与自动备份的「备份列表」共用同一份实现（见 lib/formatBytes.ts）。
 
 /**
  * 取当前应用版本号。
@@ -160,55 +155,9 @@ const appVersionSafe = async (): Promise<string> => {
     }
 };
 
-/**
- * 从后端错误里取出**机器可读原因码**与明细。
- *
- * 后端把备份类错误序列化成 `{"code":..,"detail":..}` 的 JSON 串（见
- * `system_cmd::backup_err`），这样界面能把它翻成当前语言，而不是把后端的中文原文
- * 直接甩给英文/繁体用户。取不到 code 时（例如纯 IO 报错）退化为原文展示。
- */
-const parseBackendError = (e: unknown): { code: string | null; detail: string } => {
-    const raw = e instanceof Error ? e.message : String(e);
-    const tryParse = (text: string) => {
-        try {
-            const parsed = JSON.parse(text);
-            if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
-                return { code: parsed.code as string, detail: String(parsed.detail ?? parsed.code) };
-            }
-        } catch {
-            /* 不是合法 JSON */
-        }
-        return null;
-    };
-
-    // 先按"裸 JSON"解析（后端用 ~AppError.Raw~ 时就是这个形状）。
-    const direct = tryParse(raw);
-    if (direct) return direct;
-
-    // 兜底：从第一个 `{` 起再试一次。
-    //
-    // 后端有些错误变体的 Display 会加类别前缀（如 `验证错误: {...}`），一旦如此，
-    // 上面的 JSON.parse 必然失败，界面就只能把带前缀的原文（含中文）丢给用户，
-    // 多语言映射全部失效。这里主动裁掉前缀再解析，保证英文/繁用户仍看到本语言文案。
-    const brace = raw.indexOf("{");
-    if (brace > 0) {
-        const sliced = tryParse(raw.slice(brace));
-        if (sliced) return sliced;
-    }
-
-    return { code: null, detail: raw };
-};
-
-/** 备份类错误码 → 当前语言文案。未知码退化为后端明细原文。 */
-const backupErrorText = (t: (key: string) => string, e: unknown): string => {
-    const { code, detail } = parseBackendError(e);
-    if (!code) return detail;
-    const key = `backup_err_${code}`;
-    const text = t(key);
-    if (text === key) return detail;
-    // 需要明细的码（如 land_failed / io / count_mismatch）把 `{detail}` / `{e}` 填进去。
-    return text.replace("{detail}", detail).replace("{e}", detail);
-};
+// 后端错误码解析与三语文案映射已提到 `lib/backendError.ts`：自动备份的
+// 「固定数已达上限」提示要按原因码取出 `maxKeep` / `currentPinned` 两个真实数字，
+// 与这里的备份导出/导入共用同一份解析，避免两份兜底逻辑各自演化。
 
 const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGroupProps) => {
     // 迁移中心：旧标识符遗留的数据目录。加载失败不阻塞设置面板其他部分。
@@ -860,7 +809,7 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                                     fontWeight: 500,
                                                     padding: '1px 5px',
                                                     borderRadius: '3px',
-                                                    background: 'var(--bg-main)',
+                                                    background: 'var(--bg-main, var(--bg-element))',
                                                     color: 'var(--text-secondary)',
                                                     verticalAlign: 'middle',
                                                 }}

@@ -1,0 +1,350 @@
+[
+  {
+    "name": "group-auto-zh",
+    "file": "tools/visual-harness/elements/group-auto-zh.png",
+    "box": {
+      "x": 9,
+      "y": 511.5,
+      "width": 334,
+      "height": 387
+    },
+    "rows": [
+      {
+        "label": "定时备份",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 102
+        }
+      },
+      {
+        "label": "备份周期（分钟）",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 158
+        }
+      },
+      {
+        "label": "最大留存份数",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 130
+        }
+      },
+      {
+        "label": "软件启动时备份一次",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 172
+        }
+      },
+      {
+        "label": "备份列表",
+        "h": 54,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 84,
+          "h": 26,
+          "right": 330
+        }
+      }
+    ],
+    "pad": {
+      "padding": "10px 12px 12px",
+      "gap": "normal"
+    }
+  },
+  {
+    "name": "group-data-zh",
+    "file": "tools/visual-harness/elements/group-data-zh.png",
+    "box": {
+      "x": 9,
+      "y": 12,
+      "width": 334,
+      "height": 795.5
+    },
+    "rows": [
+      {
+        "label": "数据存储路径",
+        "h": 81,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 46,
+          "h": 24,
+          "right": 276
+        }
+      },
+      {
+        "label": "备份与恢复",
+        "h": 245.5,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 84,
+          "h": 26,
+          "right": 106
+        }
+      },
+      {
+        "label": "迁移中心",
+        "h": 391,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 110.5,
+          "h": 26,
+          "right": 132.5
+        }
+      }
+    ],
+    "pad": {
+      "padding": "10px 12px 12px",
+      "gap": "normal"
+    }
+  },
+  {
+    "name": "group-auto-en",
+    "file": "tools/visual-harness/elements/group-auto-en.png",
+    "box": {
+      "x": 9,
+      "y": 484,
+      "width": 334,
+      "height": 403.5
+    },
+    "rows": [
+      {
+        "label": "Scheduled backup",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 165.6
+        }
+      },
+      {
+        "label": "Backup interval (m",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 215.6
+        }
+      },
+      {
+        "label": "Maximum backups ke",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 203.8
+        }
+      },
+      {
+        "label": "Back up once when ",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 17.9,
+          "h": 18,
+          "right": 266
+        }
+      },
+      {
+        "label": "Backup list",
+        "h": 54,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 91.2,
+          "h": 26,
+          "right": 330
+        }
+      }
+    ],
+    "pad": {
+      "padding": "10px 12px 12px",
+      "gap": "normal"
+    }
+  },
+  {
+    "name": "group-auto-tw",
+    "file": "tools/visual-harness/elements/group-auto-tw.png",
+    "box": {
+      "x": 9,
+      "y": 511.5,
+      "width": 334,
+      "height": 387
+    },
+    "rows": [
+      {
+        "label": "定時備份",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 102
+        }
+      },
+      {
+        "label": "備份週期（分鐘）",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 158
+        }
+      },
+      {
+        "label": "最大留存份數",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 130
+        }
+      },
+      {
+        "label": "軟體啟動時備份一次",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 172
+        }
+      },
+      {
+        "label": "備份列表",
+        "h": 54,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 84,
+          "h": 26,
+          "right": 330
+        }
+      }
+    ],
+    "pad": {
+      "padding": "10px 12px 12px",
+      "gap": "normal"
+    }
+  },
+  {
+    "name": "group-auto-dark",
+    "file": "tools/visual-harness/elements/group-auto-dark.png",
+    "box": {
+      "x": 9,
+      "y": 511.5,
+      "width": 334,
+      "height": 387
+    },
+    "rows": [
+      {
+        "label": "定时备份",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 102
+        }
+      },
+      {
+        "label": "备份周期（分钟）",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 158
+        }
+      },
+      {
+        "label": "最大留存份数",
+        "h": 48,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 130
+        }
+      },
+      {
+        "label": "软件启动时备份一次",
+        "h": 41,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 18,
+          "h": 18,
+          "right": 172
+        }
+      },
+      {
+        "label": "备份列表",
+        "h": 54,
+        "left": 22,
+        "right": 330,
+        "ctrl": {
+          "w": 84,
+          "h": 26,
+          "right": 330
+        }
+      }
+    ],
+    "pad": {
+      "padding": "10px 12px 12px",
+      "gap": "normal"
+    }
+  },
+  {
+    "name": "modal-full-zh",
+    "file": "tools/visual-harness/elements/modal-full-zh.png",
+    "box": {
+      "x": 23.71875,
+      "y": 217.109375,
+      "width": 304.546875,
+      "height": 465.78125
+    },
+    "rows": [],
+    "pad": {
+      "padding": "16px",
+      "gap": "12px"
+    }
+  }
+]

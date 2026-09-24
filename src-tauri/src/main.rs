@@ -48,6 +48,15 @@ fn main() {
         .plugin(tauri_plugin_http::init())
         .setup(|app| {
             setup::init(app)?;
+            // 自动容灾备份服务（启动时一次 + 之后按周期）。
+            //
+            // 【为什么挂在 `main.rs` 而不是 `app/setup.rs`】`setup::init` 已经完成了
+            // `AppDataDir` 与 `DbState` 的注册，因此这里能拿到数据目录与设置库；把接线放在
+            // 调用方一侧，`setup.rs` 里那串"数据目录解析 → 日志 → 数据库 → 状态"的启动顺序
+            // 保持原样不动。
+            //
+            // 它**不阻塞启动**：整件事（含"软件刚启动自动备份一次"）都在后台线程，窗口先出来。
+            services::auto_backup::spawn_auto_backup_service(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -105,6 +114,11 @@ fn main() {
             app::commands::restart_cloud_sync_client,
             app::commands::request_cloud_sync,
             app::commands::cloud_sync_now,
+            // 存量凭据外流的升级告知：只读查询 + 用户确认后落一次性标记。
+            // 拆成两条命令是刻意的——标记只在用户真的看到并确认后才写，
+            // 避免"渲染失败但标记已落"导致告知静默丢失。
+            app::commands::get_credential_exposure_notice,
+            app::commands::mark_credential_exposure_notice_seen,
             app::commands::set_sound_enabled,
             app::commands::set_file_transfer_auto_open,
             app::commands::set_arrow_key_selection,
@@ -123,6 +137,17 @@ fn main() {
             app::commands::export_backup,
             app::commands::inspect_backup_package,
             app::commands::import_backup,
+            // 自动容灾备份（定时 + 启动）：存储/轮换/固定层。
+            // 与上面的手动导出/导入是两条不同的链：手动备份由用户选路径、不受份数与轮换
+            // 约束；这里是应用自己保管的容灾副本，同目录、受上限与轮换约束。
+            services::auto_backup::get_auto_backup_config,
+            services::auto_backup::set_auto_backup_config,
+            services::auto_backup::list_auto_backups,
+            services::auto_backup::set_auto_backup_pinned,
+            services::auto_backup::delete_auto_backup,
+            services::auto_backup::restore_auto_backup,
+            services::auto_backup::run_auto_backup_now,
+            services::auto_backup::open_auto_backup_folder,
             app::commands::open_file_with_default_app,
             app::commands::open_file_location,
             app::commands::set_data_path,

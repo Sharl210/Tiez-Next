@@ -209,9 +209,9 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                                             width: '90px',
                                             padding: '4px 8px',
                                             borderRadius: '4px',
-                                            border: '1px solid var(--border-color)',
-                                            background: 'var(--input-bg)',
-                                            color: 'var(--text-color)',
+                                            border: '1px solid var(--line-soft)',
+                                            background: 'var(--bg-input)',
+                                            color: 'var(--text-primary)',
                                             fontSize: '14px'
                                         }}
                                     />
@@ -396,9 +396,9 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                             style={{
                                 padding: '4px 8px',
                                 borderRadius: '4px',
-                                border: '1px solid var(--border-color)',
-                                background: 'var(--input-bg)',
-                                color: 'var(--text-color)',
+                                border: '1px solid var(--line-soft)',
+                                background: 'var(--bg-input)',
+                                color: 'var(--text-primary)',
                                 fontSize: '14px',
                                 minWidth: '140px'
                             }}

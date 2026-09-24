@@ -1,5 +1,5 @@
 use crate::app::commands::file_cmd::{image_ext_from_mime, save_emoji_favorite_bytes_to_dir};
-use crate::database::DbState;
+use crate::database::{is_sensitive_key, DbState};
 use crate::domain::models::ClipboardEntry;
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
@@ -508,7 +508,264 @@ fn is_cloud_clipboard_content_type(content_type: &str) -> bool {
     )
 }
 
-fn is_setting_sync_eligible(key: &str) -> bool {
+// =============================================================================
+// 【存量风险：一次已经发生过的凭据外流，以及"要不要告诉用户"的判据】
+//
+// 事实链（全部由本仓代码可证，不依赖任何猜测）：
+//
+// 1. 本函数的排除表一度只列了 `SENSITIVE_KEYS` 5 项里的 2 项
+//    （`cloud_sync_api_key` / `cloud_sync_webdav_password`），另外 3 项——
+//    `mqtt_password`、`mqtt_username`、`ai_profiles`——是**放行**的。
+// 2. `collect_syncable_settings`（本文件）在**每次快照推送**时把放行的设置整体
+//    放进 `WebDavSettingsSnapshot.settings` 并上传到用户自己的 WebDAV 空间；
+//    同时 `apply_synced_settings` 用同一个判据，因此那 3 项也能被远端快照写回本机。
+// 3. 快照推送的周期是 `cloud_sync_snapshot_interval_min`（默认 720 分钟），
+//    而 `should_push_webdav_snapshot` 在"从未推送过"（记录为 0）时**立即**返回 true。
+//
+// 因此：**只要云同步曾经成功推送过一次快照，那 3 项就已经在用户的云端存储里了**，
+// 无论它们当时是什么内容。修复只能阻止将来的上传，不能撤回已上传的内容——这就是
+// "升级告知"要处理的东西。
+//
+// 下面这组函数**只读本机可观察的事实**，不做任何网络请求，也不猜测云端有什么。
+// =============================================================================
+
+/// 诊断结果：这台机器是否**曾经可能**发生过那次外流。
+///
+/// 为什么要返回一个结构体而不是 `bool`：告知文案与测试都需要区分"判定的依据是什么"。
+/// 一个裸 bool 会让"因为完全没配过云同步所以不提示"和"因为早就提示过所以不提示"
+/// 在日志与测试里无法区分，而这正是最容易写错的两处。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialExposureNotice {
+    /// 是否需要向用户提示。**只有 `evidence != NotConfigured` 且尚未提示过时为 true。**
+    pub should_notify: bool,
+    /// 判定依据（见 `ExposureEvidence`）。
+    pub evidence: ExposureEvidence,
+    /// 本次是否已被标记为"提示过"（标记由调用方的 `mark` 参数控制）。
+    pub acknowledged: bool,
+    /// 那 3 个键里，**当前**在本机仍然存在的有哪些。
+    ///
+    /// 【它不是判据，只是文案材料】一个被外流的键用户后来删掉了，仍然算外流；
+    /// 反之，本机现在有值也不代表当初就被上传过。因此它绝不参与 `should_notify` 的
+    /// 判定——这条边界由 `stored_credential_keys_never_drive_the_decision` 钉住。
+    pub stored_credential_keys: Vec<String>,
+}
+
+/// 判定依据。按"证据强度"从强到弱排列，`NotConfigured` 是**唯一**不提示的一档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExposureEvidence {
+    /// 本机留有明确的"确实推送过快照"痕迹（见 `CREDENTIAL_EXPOSURE_EVIDENCE_KEYS`）。
+    /// **最强的一档**：上传动作自己写下的记录，与"当前配置成什么样"无关。
+    ConfirmedSyncHistory,
+    /// 配置过（开关开过，或留了服务器地址），但本机看不到任何"确实推送过"的记录。
+    /// **仍然提示**：用户可能在关闭、清空或恢复备份之前已经同步过一次。
+    ConfiguredOnly,
+    /// 既没有配置痕迹、也没有上传痕迹：本地开关为假、服务器地址为空。
+    /// 说明 `get_config` 在过去任何时刻都不可能产出 `enabled` 的配置，
+    /// 因此**不存在**"曾经推送过快照"的路径。这是唯一安全的不提示档。
+    NotConfigured,
+}
+
+/// 判定为"确实推送过快照"的本机痕迹键。
+///
+/// 【为什么是这四个而不是那几个"更像"的计数键】
+///
+/// 只有**由真实上传动作**写入的键才能证明上传发生过。逐个核对本仓的写入点：
+///
+/// * `cloud_sync_webdav_last_snapshot_push_at` —— 写在
+///   `upload_webdav_settings_snapshot(...)` **返回 Ok 之后**的那几行里。它就是我们要的
+///   最强的证据：设置快照上传成功过。
+/// * `cloud_sync_settings_applied_at` —— 写在 `pull_remote_settings_snapshot*` 应用远端
+///   设置快照之后。它证明"**这台**机器收到过别台机器的设置快照"，而外流的方向正是
+///   源机器上传、别的机器收到；因此它同样是外流的证据。
+/// * `cloud_sync_webdav_local_seq` / `cloud_sync_cursor` —— 分别由上传 op 批次与
+///   同步主循环末尾写入。它们是**弱证据**（本身只表示"跑过一次同步"），但都在
+///   "曾经配过且跑过"这一侧，加上不会把 `NotConfigured` 误判成"配过"。
+///
+/// 【为什么不能只看 `cloud_sync_settings_applied_at` 这一个】
+///
+/// 它只覆盖"有第二台机器拉到了快照"这一种情形。单机用户（或另一台机器还没开机）
+/// 推送成功了却没有任何人拉取，本机就只剩 `..._push_at`。只取一个键会**漏判**这批人，
+/// 而漏判的代价是"该被告知的人没被告知"。多取几个键只会把"配过但没同步过"的用户
+/// 多算进来一次（可接受，见 `ConfiguredOnly`），不会把"完全没配过"的人误算进来。
+///
+/// 【为什么不复用备份的 `CLOUD_SYNC_RESET_KEYS`（`services/backup/import.rs`）】
+///
+/// 那份清单是"恢复备份后必须重置"的键，它的成员会随备份语义变化（例如某个键将来
+/// 不再由备份管理就会被删掉）。把安全判据挂在别人的重置清单上，等于让一次无关的
+/// 备份改动静默改掉判定结果。两者**当前部分重叠是巧合，不是契约**。
+pub(crate) const CREDENTIAL_EXPOSURE_EVIDENCE_KEYS: &[&str] = &[
+    CLOUD_SYNC_WEBDAV_LAST_SNAPSHOT_PUSH_AT_KEY,
+    "cloud_sync_settings_applied_at",
+    CLOUD_SYNC_WEBDAV_LOCAL_SEQ_KEY,
+    "cloud_sync_cursor",
+];
+
+/// 被外流过的三个键的**展示顺序**。
+///
+/// 顺序取自 `database::SENSITIVE_KEYS` 的语义分组（MQTT 凭据在前，AI 配置在后），
+/// 与实际内容无关；测试按集合比较，不依赖这里的顺序。
+pub(crate) const CREDENTIAL_EXPOSURE_SUBJECT_KEYS: &[&str] = &[
+    "mqtt_password",
+    "mqtt_username",
+    "ai_profiles",
+];
+
+/// 一次性标记键：提示过一次就不再提示。
+///
+/// 取 `security.` 前缀而不是往 `app.*` 里加一条：本键回答的是"一条安全告知发过没有"，
+/// 与外观/行为偏好无关。
+///
+/// **它必须同时被两道"不得云同步"的判据挡住**，否则这条安全告知可以被远端静默吞掉：
+///
+/// * `is_setting_sync_eligible` 里的 `security.` **整族前缀排除**（本文件）；
+/// * MCP 的 `set_setting` 拒写清单（`services/mcp/mod.rs`），挡住"本机 agent 顺手改掉它"。
+///
+/// 【我最初写错的地方，留在这里当教训】第一版注释断言"不在白名单里，默认拒绝"——
+/// **那是错的**：`is_setting_sync_eligible` 是**排除法**（`!matches!(...)`），
+/// 未列出的键默认**放行**。于是这个标记键会被上传、也能被远端快照写回，
+/// 一个被篡改的远端就能把它改成 `true` 来让用户永远看不到这条告知。
+/// 这正是本文件反复在讲的同一个失效模式（"枚举式排除会随着新键悄悄失效"），
+/// 我自己又踩了一次；`acknowledgement_key_cannot_be_synced_from_the_cloud` 现在把它钉住。
+pub(crate) const CREDENTIAL_EXPOSURE_ACK_KEY: &str =
+    "security.credential_exposure_2026_notice_ack";
+
+/// 安全类设置的**整族前缀**：一律不参与云同步（按前缀，不逐键列举）。
+///
+/// 理由与 `mcp.*`、`auto_backup.*` 两个前缀完全相同：这组键描述的是"**这台机器**的安全
+/// 处置状态"，而不是用户的跨机器偏好；而云同步会把远端写回的键持久化到本机，
+/// 于是远端能改写本机的安全状态。
+pub(crate) const SECURITY_SETTING_KEY_PREFIX: &str = "security.";
+
+/// 纯判定：把"本机可观察的事实"映射成诊断结果。**不碰数据库，不碰网络。**
+///
+/// 抽成纯函数是刻意的：命令函数需要 `State<DbState>`，单测里造不出来；而这里全部
+/// 需要被钉住的边界（配过 vs 没配过、有痕迹 vs 没痕迹、已提示 vs 未提示）都是纯粹
+/// 的输入→输出关系。把判定留在纯函数里，"确实可能受影响必须提示 / 肯定没受影响
+/// 不得提示"这两条才能真正被逐格断言。
+pub(crate) fn credential_exposure_notice(
+    cloud_sync_enabled: bool,
+    cloud_sync_server_configured: bool,
+    any_sync_evidence: bool,
+    already_acknowledged: bool,
+    stored_credential_keys: &[String],
+) -> CredentialExposureNotice {
+    // 【判定顺序：先看"动作痕迹"，再看"配置"】
+    //
+    // 顺序是这条判据里最容易写错的一处，因此显式写出来并有两格测试钉住
+    // （`confirmed_snapshot_push_always_prompts` 与
+    // `never_configured_cloud_sync_never_prompts`）：
+    //
+    // 若先把"开关关且地址空"判成 `NotConfigured`，那么**"配过、同步成功过、之后把开关
+    // 关掉并把地址清空"**的机器（换云盘、迁移账号、清理界面时都很常见）会被判成
+    // "从未配置过"而**不提示**——而它恰恰是最确定已经外流过的一批。痕迹键是上传动作
+    // 留下的，它比任何"当前配置"都更接近事实，所以它优先。
+    let evidence = if any_sync_evidence {
+        ExposureEvidence::ConfirmedSyncHistory
+    } else if cloud_sync_enabled || cloud_sync_server_configured {
+        ExposureEvidence::ConfiguredOnly
+    } else {
+        ExposureEvidence::NotConfigured
+    };
+
+    let should_notify = matches!(
+        evidence,
+        ExposureEvidence::ConfiguredOnly | ExposureEvidence::ConfirmedSyncHistory
+    ) && !already_acknowledged;
+
+    CredentialExposureNotice {
+        should_notify,
+        evidence,
+        acknowledged: already_acknowledged,
+        stored_credential_keys: stored_credential_keys.to_vec(),
+    }
+}
+
+/// 从"全部设置"这张表里算出诊断。**纯函数**（没有数据库、没有 Tauri）。
+pub(crate) fn credential_exposure_notice_from_map(
+    settings: &HashMap<String, String>,
+) -> CredentialExposureNotice {
+    let get = |key: &str| {
+        settings
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let enabled = get("cloud_sync_enabled").eq_ignore_ascii_case("true");
+    // 两个地址键任一非空即算"配置过"：`get_config` 用 `cloud_sync_server` 作为基地址，
+    // 而界面真正写的是 `cloud_sync_webdav_url`，两个都留着。
+    let server_configured =
+        !get("cloud_sync_server").is_empty() || !get("cloud_sync_webdav_url").is_empty();
+
+    // 痕迹键都是毫秒/序号整数，"非零"即"写过"。解析失败按"没写过"处理：
+    // 宁可漏判一档（CodeOnly 仍然提示），也不把垃圾值当成证据。
+    let any_evidence = CREDENTIAL_EXPOSURE_EVIDENCE_KEYS.iter().any(|key| {
+        get(key)
+            .parse::<i64>()
+            .map(|v| v > 0)
+            .unwrap_or(false)
+    });
+
+    let acknowledged = get(CREDENTIAL_EXPOSURE_ACK_KEY).eq_ignore_ascii_case("true");
+
+    let stored: Vec<String> = CREDENTIAL_EXPOSURE_SUBJECT_KEYS
+        .iter()
+        .filter(|key| !get(key).is_empty())
+        .map(|key| (*key).to_string())
+        .collect();
+
+    credential_exposure_notice(
+        enabled,
+        server_configured,
+        any_evidence,
+        acknowledged,
+        &stored,
+    )
+}
+
+/// 从真实的设置仓储读出诊断（命令层与单测共用这一条读取路径）。
+///
+/// 【为什么这一层要存在，而不是在命令里 `get_all()` 一把】命令函数需要
+/// `State<DbState>`（活的 Tauri 环境），单测里造不出来。把"读哪些键、怎么比"放在这一层，
+/// 测试就能用**真实的内存 SQLite + 真实 `SqliteSettingsRepository`** 走完整条读取路径；
+/// 换成一个记录调用的假仓储就会把被测对象换掉——本仓已经踩过这个坑
+/// （见 `settings_cmd.rs` 里 `reset_settings_preserves_every_mcp_key` 的注释）。
+pub(crate) fn assess_credential_exposure_from_repo(
+    repo: &impl SettingsRepository,
+) -> AppResult<CredentialExposureNotice> {
+    let all = repo.get_all().map_err(AppError::from)?;
+    Ok(credential_exposure_notice_from_map(&all))
+}
+
+/// 落下"已经提示过"的一次性标记。
+///
+/// 【为什么这里不做"先查再写"的判断】是否该写由调用方按 `notice.should_notify` 决定；
+/// 本函数只负责把一个布尔写进去，写失败向上抛（命令层据此告诉前端"没记上"，
+/// 于是下一次启动还会提示一次——重复一次无害，静默丢失一次有害）。
+pub(crate) fn mark_credential_exposure_acknowledged(
+    repo: &impl SettingsRepository,
+) -> AppResult<()> {
+    repo.set(CREDENTIAL_EXPOSURE_ACK_KEY, "true")
+        .map_err(AppError::from)
+}
+
+pub(crate) fn is_setting_sync_eligible(key: &str) -> bool {
+    // 【凭据类一律排除，且与加密侧共用同一个判据】
+    //
+    // `is_sensitive_key` 是"要不要加密存储"的判据，它命中的那批键正是最不该离开本机的
+    // 一批。此前这里**没有**这道检查，而排除表只列出了 5 个敏感键里的 2 个
+    // （`cloud_sync_api_key` / `cloud_sync_webdav_password`），于是
+    // `mqtt_password`、`mqtt_username`、`ai_profiles` 三项会**上传到云端**，
+    // 并且会被远端快照**写回本机**（`apply_synced_settings` 用同一个判据放行）。
+    //
+    // 用 `is_sensitive_key` 而不是往排除表里再补三行：SENSITIVE_KEYS 是"凭据"这件事的
+    // 唯一定义处，往这里抄一份就是第二个定义，将来新增凭据键必然只改一处、另一处静默漏掉
+    // ——本函数上方的两段注释正是在讲同一个失效模式（前缀排除优于逐键列举）。
+    if is_sensitive_key(key) {
+        return false;
+    }
     // 【整族排除 MCP 设置】按前缀而不是逐键列举。
     //
     // 这些键里含有 `mcp.token`（访问令牌）与 `mcp.allow_write`、`mcp.allow_lan`
@@ -519,6 +776,46 @@ fn is_setting_sync_eligible(key: &str) -> bool {
     // 逐键列举在这里是错的：`mcp.*` 会继续增长，新增一个键就会静默重新打开这个口子，
     // 而漏掉一个键不会有任何编译错误或测试失败。按前缀排除没有这个失效模式。
     if key.starts_with("mcp.") {
+        return false;
+    }
+    // 【整族排除自动容灾备份设置】同样按前缀。
+    //
+    // 这组键（`auto_backup.enabled` / `interval_minutes` / `max_keep` / `backup_on_startup`）
+    // 描述的是"**这台机器**怎么保管自己的容灾副本"：多久存一份、最多留几份。它有三个
+    // 不该跨机器同步的理由：
+    //
+    // 1. **它是本机状态，不是用户偏好**。用户要求"自动备份路径独立于手动备份"、且与数据
+    //    目录同级——换句话说这套副本天生属于这台机器。把它同步出去，等于让另一台机器的
+    //    份数上限决定这台机器的留存策略。
+    // 2. **远端能改写本机留存策略**。云同步会把远端写回的设置落进本地 settings 并持久化。
+    //    一个被篡改（或只是另一台机器上被改过）的远端快照就能把 `max_keep` 从 200 变成 1：
+    //    下一次轮换会把本机几乎所有容灾副本删掉。这是**用户从未在"这台"机器上做过的选择**。
+    // 3. **方向与 mcp.\* 同理**：这两个前缀都保护"本机的安全/自保姿态不被远端改写"。
+    //
+    // 用前缀而不是逐键列举：这四个键将来会增长（例如新增"仅在有变更时备份"），逐键列举
+    // 漏一个不会有编译错误或测试失败，前缀排除没有这个失效模式。
+    if key.starts_with(crate::services::auto_backup::config::KEY_PREFIX) {
+        return false;
+    }
+    // 【整族排除安全处置状态】——`security.*`，同样按前缀。
+    //
+    // 这一族回答的是"**这台机器**对某件安全事件的处置到了哪一步"，`security.*` 命名空间
+    // 就是为它开的。当前成员是"存量凭据外流的告知是否已经展示过"这一个标记。
+    //
+    // 【为什么它必须被排除，而不是"顺手同步一下也无所谓"】
+    //
+    // `apply_synced_settings` 会把远端快照里的键写进本机并持久化。只要这个标记键在
+    // 同步范围内，一个被篡改的（或只是另一台机器上被点过"知道了"的）远端快照就能把它
+    // 写成 `true`，于是**这台机器的用户永远看不到那条凭据外流的告知**——而告知的全部
+    // 意义就是让本人知道并换掉密码。安全告知的送达状态必须只由本机决定。
+    //
+    // 【这里是本任务真实踩过的坑，逐字记下来】
+    //
+    // 我第一版把这个标记当作"不在白名单里，因此默认拒绝"。**错**：本函数是排除法
+    // （末尾 `!matches!(...)`），未列出的键默认**放行**。写这段注释时，作者本人刚在
+    // 同一条推理上翻过一次车——所以这里用**前缀**而不是再加一行 `| "security.xxx"`：
+    // 逐键列举漏一个不会有编译错误，前缀不会漏。
+    if key.starts_with(SECURITY_SETTING_KEY_PREFIX) {
         return false;
     }
     !matches!(
@@ -3509,6 +3806,63 @@ mod tests {
         assert!(is_setting_sync_eligible("app.language"));
     }
 
+    /// 自动容灾备份的四个设置键**一律不参与云同步**。
+    ///
+    /// 最具破坏性的一条是 `max_keep`：云同步会把远端写回的设置落进本地并持久化，于是远端
+    /// 把它改成 1 之后，本机下一次轮换就会把几乎所有容灾副本删掉——而用户从未在**这台**
+    /// 机器上做过这个选择。`interval_minutes` 同理会把 30 分钟变成 1440。
+    #[test]
+    fn auto_backup_settings_never_sync_from_the_cloud() {
+        for key in [
+            "auto_backup.enabled",
+            "auto_backup.interval_minutes",
+            "auto_backup.max_keep",
+            "auto_backup.backup_on_startup",
+        ] {
+            assert!(
+                !is_setting_sync_eligible(key),
+                "{key} 参与云同步会让远端快照改写本机的容灾留存策略"
+            );
+        }
+    }
+
+    /// 前缀排除要覆盖**将来新增**的自动备份键（枚举式排除会随版本悄悄失效）。
+    #[test]
+    fn unknown_auto_backup_keys_are_also_excluded() {
+        assert!(!is_setting_sync_eligible("auto_backup.some_future_switch"));
+    }
+
+    /// **凭据类键一律不参与云同步**——逐项钉住 `database::SENSITIVE_KEYS`。
+    ///
+    /// 【为什么这条必须存在，且必须逐项断言】
+    ///
+    /// 本轮实测发现的缺口：`SENSITIVE_KEYS` 有 5 项，而本函数的排除表只列了其中 2 项
+    /// （`cloud_sync_api_key` / `cloud_sync_webdav_password`）。剩下三项——
+    /// `mqtt_password`、`mqtt_username`、`ai_profiles`——既会被
+    /// `collect_syncable_settings` 放进上传快照，也会被 `apply_synced_settings` 放行写回
+    /// 本机。也就是说：**MQTT 密码会离开这台机器，并且能被远端覆盖**。
+    ///
+    /// 逐项列举 5 个键而不是只测一个前缀：这道保护的正确性来源是"它覆盖了
+    /// `SENSITIVE_KEYS` 的**全部**成员"。若将来往 `SENSITIVE_KEYS` 加第 6 项，
+    /// 由于 `is_setting_sync_eligible` 直接调用 `is_sensitive_key`，本测试会**自动**
+    /// 覆盖到新键——这正是"两个定义合一"带来的收益。
+    #[test]
+    fn credential_keys_never_sync_to_the_cloud() {
+        for key in crate::database::SENSITIVE_KEYS {
+            assert!(
+                !is_setting_sync_eligible(key),
+                "{key} 是凭据（database::SENSITIVE_KEYS 成员），参与云同步会让它离开本机                 并且能被远端快照覆盖"
+            );
+        }
+    }
+
+    /// 大小写变体同样要被挡住（`is_sensitive_key` 用 `eq_ignore_ascii_case`）。
+    #[test]
+    fn credential_keys_are_excluded_case_insensitively() {
+        assert!(!is_setting_sync_eligible("MQTT_PASSWORD"));
+        assert!(!is_setting_sync_eligible("Mqtt_Password"));
+    }
+
     use super::{
         is_setting_sync_eligible, normalize_item_for_sync, rewrite_rich_html_resources_for_sync,
         CloudSyncItem, RICH_IMAGE_FALLBACK_PREFIX, RICH_IMAGE_FALLBACK_SUFFIX,
@@ -3516,6 +3870,204 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // =====================================================================
+    // 存量凭据外流的"升级告知"判据
+    //
+    // 这一组测试要钉住的方向有**两个**，缺一不可：
+    //
+    // * **该提示的必须提示**：配置过云同步的用户，哪怕本机已经看不到任何"确实推过"的
+    //   记录（关掉了、清空过、从备份恢复过），也必须被告知。少提示一个人的代价是
+    //   "他的 MQTT 密码还被别人知道着，而他一无所知"。
+    // * **不该提示的绝不能提示**：从未配置过云同步的用户，任何情况下都不得看到这条
+    //   警告。多提示所有人的代价是这条警告变成噪音，连真正受影响的人也不会再读。
+    //
+    // 因此每个 case 都同时断言 `should_notify` 与 `evidence`：只看 bool 的话，
+    // "因为没配过所以不提示"和"因为提示过了所以不提示"会混成一个结果，
+    // 而这正是最容易写错的地方。
+    // =====================================================================
+
+    use super::{
+        credential_exposure_notice, credential_exposure_notice_from_map,
+        CREDENTIAL_EXPOSURE_ACK_KEY, CREDENTIAL_EXPOSURE_EVIDENCE_KEYS,
+        CREDENTIAL_EXPOSURE_SUBJECT_KEYS,
+    };
+
+    /// 造一份"从未配置过云同步"的设置表（只含出厂默认值）。
+    fn settings_never_configured() -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        map.insert("cloud_sync_enabled".to_string(), "false".to_string());
+        map.insert("cloud_sync_server".to_string(), String::new());
+        map.insert("cloud_sync_webdav_url".to_string(), String::new());
+        for key in CREDENTIAL_EXPOSURE_EVIDENCE_KEYS {
+            // 出厂默认：痕迹键全是 0。
+            map.insert((*key).to_string(), "0".to_string());
+        }
+        map.insert("mqtt_password".to_string(), String::new());
+        map.insert("mqtt_username".to_string(), String::new());
+        map.insert("ai_profiles".to_string(), String::new());
+        map
+    }
+
+    /// **肯定没受影响 ⇒ 不得提示。**
+    ///
+    /// 反方向：把 `credential_exposure_notice` 改成恒真（或在 `NotConfigured` 分支
+    /// 返回 `ConfiguredOnly`），本测试第一行就变红——实测见任务报告。
+    #[test]
+    fn never_configured_cloud_sync_never_prompts() {
+        let map = settings_never_configured();
+        let notice = credential_exposure_notice_from_map(&map);
+        assert!(
+            !notice.should_notify,
+            "从未配置过云同步的机器不得看到这条安全警告（否则它会变成对所有用户的噪音）"
+        );
+        assert_eq!(notice.evidence, super::ExposureEvidence::NotConfigured);
+        // 出厂默认下三个键都是空的，文案材料也应当为空。
+        assert!(notice.stored_credential_keys.is_empty());
+    }
+
+    /// **确实可能受影响 ⇒ 必须提示**（本机留有"确实推送过设置快照"的记录）。
+    #[test]
+    fn confirmed_snapshot_push_always_prompts() {
+        let mut map = settings_never_configured();
+        map.insert(
+            "cloud_sync_webdav_last_snapshot_push_at".to_string(),
+            "1760000000000".to_string(),
+        );
+        let notice = credential_exposure_notice_from_map(&map);
+        assert!(
+            notice.should_notify,
+            "推送过设置快照的机器必须被告知：那 3 项凭据已经在它自己的云端存储里了"
+        );
+        assert_eq!(
+            notice.evidence,
+            super::ExposureEvidence::ConfirmedSyncHistory
+        );
+    }
+
+    /// **配过但本机已无痕迹 ⇒ 仍然提示。**
+    ///
+    /// 这一格是"判据太窄就会漏判"的具体形状：用户配好云同步、同步成功、随后**关掉并
+    /// 清空了痕迹**（或从不含痕迹键的旧备份恢复）。只看痕迹键的判据会在这里放行，
+    /// 而那正是最需要被告知的一批人。
+    #[test]
+    fn configured_but_no_trace_still_prompts() {
+        for (enabled, server) in [(true, ""), (false, "https://dav.example.com/dav")] {
+            let mut map = settings_never_configured();
+            map.insert("cloud_sync_enabled".to_string(), enabled.to_string());
+            map.insert("cloud_sync_server".to_string(), server.to_string());
+            let notice = credential_exposure_notice_from_map(&map);
+            assert!(
+                notice.should_notify,
+                "配置过云同步（enabled={enabled}, server={server:?}）就必须提示，\
+                 因为本机看不到的那段历史里可能已经推过一次快照"
+            );
+            assert_eq!(notice.evidence, super::ExposureEvidence::ConfiguredOnly);
+        }
+    }
+
+    /// **【关键一格】被外流的键"本机还有没有值"不参与判定。**
+    ///
+    /// 用户后来把 MQTT 密码删了，不代表它没被上传过；本机现在有值，也不代表当初上传过。
+    /// 这条断言把"那不是判据、只是文案材料"从注释变成会红的测试：谁要是把
+    /// `stored_credential_keys` 接进 `should_notify`，这里立刻失败。
+    #[test]
+    fn stored_credential_keys_never_drive_the_decision() {
+        for stored in [vec![], vec!["mqtt_password".to_string()], vec![
+            "mqtt_password".to_string(),
+            "mqtt_username".to_string(),
+            "ai_profiles".to_string(),
+        ]] {
+            // 从未配置过：即使本机三个键都有值，也不得提示。
+            assert!(
+                !credential_exposure_notice(false, false, false, false, &stored).should_notify,
+                "本机存着凭据 ≠ 用云同步传过它（stored={stored:?}）"
+            );
+            // 配置过：即使三个键都已被删空，也必须提示。
+            assert!(
+                credential_exposure_notice(false, true, false, false, &stored).should_notify,
+                "用户删掉了本机的凭据，不代表它没有被上传过（stored={stored:?}）"
+            );
+        }
+    }
+
+    /// **一次性**：提示过之后不再提示，且判据本身仍然成立。
+    ///
+    /// 反方向：去掉 `already_acknowledged` 这一项（把 `should_notify` 写成只看
+    /// evidence），本测试变红。
+    #[test]
+    fn acknowledged_notice_never_prompts_again() {
+        let mut map = settings_never_configured();
+        map.insert(
+            "cloud_sync_webdav_last_snapshot_push_at".to_string(),
+            "1760000000000".to_string(),
+        );
+
+        let first = credential_exposure_notice_from_map(&map);
+        assert!(first.should_notify, "前置：首次应当提示");
+        assert!(!first.acknowledged);
+
+        // 复现命令层的动作：写入一次性标记。
+        map.insert(CREDENTIAL_EXPOSURE_ACK_KEY.to_string(), "true".to_string());
+
+        let second = credential_exposure_notice_from_map(&map);
+        assert!(!second.should_notify, "已经提示过一次，不得再提示");
+        assert!(second.acknowledged);
+        assert_eq!(
+            second.evidence,
+            super::ExposureEvidence::ConfirmedSyncHistory,
+            "标记只影响是否提示，不得改变判定依据（否则无法区分两件事）"
+        );
+    }
+
+    /// 标记键本身**不得**参与云同步——否则一个被篡改的远端快照就能把用户的告知
+    /// 静默吞掉（`apply_synced_settings` 只放行 `is_setting_sync_eligible` 的键）。
+    #[test]
+    fn acknowledgement_key_cannot_be_synced_from_the_cloud() {
+        assert!(!is_setting_sync_eligible(CREDENTIAL_EXPOSURE_ACK_KEY));
+    }
+
+    /// 外流对象清单必须**恰好**是 `SENSITIVE_KEYS` 里曾经漏掉的那三个。
+    ///
+    /// 这条把"要对用户说清是哪三项"与"当时真正的缺口是哪三项"绑在一起：将来若有人
+    /// 顺手往清单里加第四项（或漏掉一项），文案就会开始说错话，这里会红。
+    #[test]
+    fn exposure_subject_keys_are_exactly_the_three_that_leaked() {
+        let subjects: std::collections::HashSet<&str> =
+            CREDENTIAL_EXPOSURE_SUBJECT_KEYS.iter().copied().collect();
+        let expected: std::collections::HashSet<&str> =
+            ["mqtt_password", "mqtt_username", "ai_profiles"]
+                .into_iter()
+                .collect();
+        assert_eq!(subjects, expected);
+
+        // 与真实来源核对：这三个键现在都已经是凭据（会被加密），也都不再参与同步。
+        for key in CREDENTIAL_EXPOSURE_SUBJECT_KEYS {
+            assert!(
+                crate::database::is_sensitive_key(key),
+                "{key} 应当是 database::SENSITIVE_KEYS 的成员"
+            );
+            assert!(
+                !is_setting_sync_eligible(key),
+                "{key} 已经修复，不得再参与云同步"
+            );
+        }
+    }
+
+    /// 痕迹键必须是**由上传动作写入**的那几个，而不是随手挑的。
+    ///
+    /// 本测试用真实的写入点作为证据来源：`..._push_at` 就写在
+    /// `upload_webdav_settings_snapshot` 成功返回之后。这里断言它在清单里，
+    /// 并断言清单不会长到把 `cloud_sync_enabled` 这种"用户偏好"键也吃进来
+    /// （那会让判据退化成"开关一开就提示"，从而漏掉"配过又关掉"以外的语义）。
+    #[test]
+    fn evidence_keys_are_the_upload_written_ones() {
+        assert!(CREDENTIAL_EXPOSURE_EVIDENCE_KEYS
+            .contains(&"cloud_sync_webdav_last_snapshot_push_at"));
+        assert!(CREDENTIAL_EXPOSURE_EVIDENCE_KEYS.contains(&"cloud_sync_settings_applied_at"));
+        assert!(!CREDENTIAL_EXPOSURE_EVIDENCE_KEYS.contains(&"cloud_sync_enabled"));
+        assert!(!CREDENTIAL_EXPOSURE_EVIDENCE_KEYS.contains(&"app.anon_id"));
+    }
 
     const TEST_PNG_BYTES: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,

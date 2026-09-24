@@ -17,7 +17,12 @@ pub struct DbState {
     pub tag_repo: SqliteTagRepository,
 }
 
-const SENSITIVE_KEYS: &[&str] = &[
+/// 需要加密存储的键 = **凭据类**的唯一定义处。
+///
+/// `pub(crate)`：云同步的 `is_setting_sync_eligible` 直接引用它（凭据一律不得离开本机），
+/// 测试也逐项遍历它。**不要再往别处抄一份清单**——本仓库已经踩过一次"两处定义只改一处"
+/// 的坑（云同步的排除表漏了这里的 3 项，导致 MQTT 密码可被上传且可被远端覆盖）。
+pub(crate) const SENSITIVE_KEYS: &[&str] = &[
     "mqtt_password",
     "mqtt_username",
     "ai_profiles",

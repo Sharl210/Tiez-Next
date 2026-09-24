@@ -76,10 +76,10 @@ const SettingsFooter = ({
                         maxWidth: '320px',
                         width: '100%',
                         padding: '16px',
-                        background: 'var(--bg-secondary)',
+                        background: 'var(--bg-panel)',
                         borderRadius: '16px',
                         boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
-                        border: '1px solid var(--border-color)',
+                        border: 'var(--panel-border)',
                         animation: 'modalSlideUp 0.3s ease-out'
                     }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>

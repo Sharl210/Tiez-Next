@@ -1,0 +1,446 @@
+[
+  {
+    "name": "groups-352-zh",
+    "file": "tools/visual-harness/shots/groups-352-zh.png",
+    "errors": [
+      "Failed to load resource: the server responded with a status of 404 (Not Found)"
+    ],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 900
+      },
+      "groups": [
+        {
+          "title": "数据管理",
+          "rect": {
+            "w": 334,
+            "h": 795.5
+          },
+          "items": 3
+        },
+        {
+          "title": "自动容灾备份",
+          "rect": {
+            "w": 334,
+            "h": 387
+          },
+          "items": 5
+        }
+      ],
+      "switches": [
+        {
+          "w": 44,
+          "h": 22
+        },
+        {
+          "w": 44,
+          "h": 22
+        }
+      ],
+      "autoMaxKeepRect": {
+        "w": 90,
+        "h": 29
+      },
+      "autoMaxKeepBorder": "1px",
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": null,
+      "rowCount": 0,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "groups-250-zh-min",
+    "file": "tools/visual-harness/shots/groups-250-zh-min.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 250,
+        "h": 900
+      },
+      "groups": [
+        {
+          "title": "数据管理",
+          "rect": {
+            "w": 232,
+            "h": 1559.8
+          },
+          "items": 3
+        },
+        {
+          "title": "自动容灾备份",
+          "rect": {
+            "w": 232,
+            "h": 433.5
+          },
+          "items": 5
+        }
+      ],
+      "switches": [
+        {
+          "w": 44,
+          "h": 22
+        },
+        {
+          "w": 44,
+          "h": 22
+        }
+      ],
+      "autoMaxKeepRect": {
+        "w": 90,
+        "h": 29
+      },
+      "autoMaxKeepBorder": "1px",
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": null,
+      "rowCount": 0,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "groups-352-zh-dark",
+    "file": "tools/visual-harness/shots/groups-352-zh-dark.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 900
+      },
+      "groups": [
+        {
+          "title": "数据管理",
+          "rect": {
+            "w": 334,
+            "h": 795.5
+          },
+          "items": 3
+        },
+        {
+          "title": "自动容灾备份",
+          "rect": {
+            "w": 334,
+            "h": 387
+          },
+          "items": 5
+        }
+      ],
+      "switches": [
+        {
+          "w": 44,
+          "h": 22
+        },
+        {
+          "w": 44,
+          "h": 22
+        }
+      ],
+      "autoMaxKeepRect": {
+        "w": 90,
+        "h": 29
+      },
+      "autoMaxKeepBorder": "1px",
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": null,
+      "rowCount": 0,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "groups-352-en",
+    "file": "tools/visual-harness/shots/groups-352-en.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 900
+      },
+      "groups": [
+        {
+          "title": "Data Management",
+          "rect": {
+            "w": 334,
+            "h": 990
+          },
+          "items": 3
+        },
+        {
+          "title": "Automatic disaster-recovery backups",
+          "rect": {
+            "w": 334,
+            "h": 403.5
+          },
+          "items": 5
+        }
+      ],
+      "switches": [
+        {
+          "w": 44,
+          "h": 22
+        },
+        {
+          "w": 44,
+          "h": 22
+        }
+      ],
+      "autoMaxKeepRect": {
+        "w": 90,
+        "h": 29
+      },
+      "autoMaxKeepBorder": "1px",
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": null,
+      "rowCount": 0,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "groups-352-tw",
+    "file": "tools/visual-harness/shots/groups-352-tw.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 900
+      },
+      "groups": [
+        {
+          "title": "資料管理",
+          "rect": {
+            "w": 334,
+            "h": 810.5
+          },
+          "items": 3
+        },
+        {
+          "title": "自動容災備份",
+          "rect": {
+            "w": 334,
+            "h": 387
+          },
+          "items": 5
+        }
+      ],
+      "switches": [
+        {
+          "w": 44,
+          "h": 22
+        },
+        {
+          "w": 44,
+          "h": 22
+        }
+      ],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": null,
+      "rowCount": 0,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "modal-352-zh",
+    "file": "tools/visual-harness/shots/modal-352-zh.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": true,
+      "menuRect": {
+        "w": 152,
+        "h": 106.8
+      },
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "modal-600-zh-wide",
+    "file": "tools/visual-harness/shots/modal-600-zh-wide.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 600,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": true,
+      "menuRect": {
+        "w": 152,
+        "h": 106.8
+      },
+      "modalRect": {
+        "w": 537.7,
+        "h": 414.2
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "menu-352-zh",
+    "file": "tools/visual-harness/shots/menu-352-zh.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": true,
+      "menuRect": {
+        "w": 152,
+        "h": 106.8
+      },
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "menu-pinned-352-zh",
+    "file": "tools/visual-harness/shots/menu-pinned-352-zh.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": true,
+      "menuRect": {
+        "w": 152,
+        "h": 106.8
+      },
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "confirm-delete-352-zh",
+    "file": "tools/visual-harness/shots/confirm-delete-352-zh.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "confirm-restore-352-zh",
+    "file": "tools/visual-harness/shots/confirm-restore-352-zh.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": false,
+      "menuRect": null,
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  },
+  {
+    "name": "modal-352-zh-dark",
+    "file": "tools/visual-harness/shots/modal-352-zh-dark.png",
+    "errors": [],
+    "probe": {
+      "viewport": {
+        "w": 352,
+        "h": 760
+      },
+      "groups": [],
+      "switches": [],
+      "autoMaxKeepRect": null,
+      "autoMaxKeepBorder": null,
+      "dataInputRect": null,
+      "dataInputBorder": null,
+      "hasMenu": true,
+      "menuRect": {
+        "w": 152,
+        "h": 106.8
+      },
+      "modalRect": {
+        "w": 304.5,
+        "h": 465.8
+      },
+      "rowCount": 4,
+      "untranslatedKeys": []
+    }
+  }
+]

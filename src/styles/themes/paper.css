@@ -6,6 +6,7 @@ body.theme-paper {
   --bg-content: #fdf6e3;
   --bg-toolbar: rgba(244, 236, 216, 0.95);
   --bg-panel: rgba(255, 253, 247, 0.7);
+  --bg-panel-rgb: 255, 253, 247;
   --bg-input: #ffffff;
   --bg-element: #f9f3e4;
   --bg-button: rgba(139, 90, 43, 0.08);
@@ -147,6 +148,8 @@ body.theme-paper::before {
     --bg-content: #32302f;
     --bg-toolbar: rgba(40, 40, 40, 0.95);
     --bg-panel: rgba(50, 48, 47, 0.8);
+  --bg-panel-rgb: 50, 48, 47;
+    --bg-panel-rgb: 50, 48, 47;
     --bg-input: #1d2021;
     --bg-element: #3c3836;
     --bg-button: rgba(213, 196, 161, 0.1);

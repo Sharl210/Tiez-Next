@@ -34,6 +34,20 @@
   --wt-bubble-radius: 16px;
   --wt-avatar-radius: 50%;
   --wt-panel-radius: 12px;
+  /* 对端头像的哈希配色：`FileTransferChatView.getAvatarConfig` 按 sender_id 的哈希
+     从这 8 个槽位里选一个当 `background`。它们**不会被运行时写入**，只在这里定义；
+     这 8 行原先存在于本文件，在一次样式重写里连同 `--wt-received-bubble-*` 一起被
+     删掉，而使用点留了下来 —— 于是每个对端头像都变成"背景色为空"的透明方块
+     （PC 侧头像因为走 `--wt-own-avatar-background` 而正常，掩盖了这个问题）。
+     数值与颜色与原始版本逐字一致，不是重新配色。 */
+  --wt-peer-gradient-1: linear-gradient(135deg, #ff5f6d 0%, #ffc371 100%);
+  --wt-peer-gradient-2: linear-gradient(135deg, #2193b0 0%, #6dd5ed 100%);
+  --wt-peer-gradient-3: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+  --wt-peer-gradient-4: linear-gradient(135deg, #8e2de2 0%, #4a00e0 100%);
+  --wt-peer-gradient-5: linear-gradient(135deg, #f953c6 0%, #b91d73 100%);
+  --wt-peer-gradient-6: linear-gradient(135deg, #ee0979 0%, #ff6a00 100%);
+  --wt-peer-gradient-7: linear-gradient(135deg, #00c6ff 0%, #0072ff 100%);
+  --wt-peer-gradient-8: linear-gradient(135deg, #f7971e 0%, #ffd200 100%);
 }
 
 /* Base View Layout */

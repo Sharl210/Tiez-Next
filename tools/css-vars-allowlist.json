@@ -1,0 +1,96 @@
+{
+  "$comment": [
+    "CSS 变量缺失检查（tools/check-css-vars.mjs）的显式白名单。",
+    "",
+    "## 什么时候可以写进这个文件",
+    "",
+    "只有当**每一个**使用点都写成 `var(--name, <项目里真实存在的语义令牌>)` 时才可以。",
+    "这种写法的语义是「优先读新名字，读不到就用已知正确的旧令牌」——它是别名/迁移写法，",
+    "不是缺陷：变量缺失时样式仍然生效，只是走了兜底那一支。",
+    "",
+    "如果某个使用点写的是 `var(--name)`（无 fallback），或者写成 `rgba(var(--name), a)`",
+    "（变量在颜色函数里，fallback 救不回来），那么变量缺失会让**整条声明被静默丢弃**。",
+    "那正是本仓库 38 处缺陷的成因，因此这类使用点**不允许**被白名单豁免——",
+    "检查脚本会把它判为 illegalAllow 并失败，必须补真实定义或改用项目既有令牌。",
+    "",
+    "## 白名单还会被反向校验",
+    "",
+    "白名单里已经不再被引用的条目会被报为 stale 并失败，避免豁免长期残留、",
+    "把「曾经合法」当成「现在合法」。",
+    "",
+    "## 另外两件不需要写进这里的事",
+    "",
+    "1. 由运行时注入的变量（`style.setProperty`、React style 对象里的 `--x` 键、",
+    "   组件内 `<style>` 模板字符串）由脚本自动识别，不需要登记。",
+    "2. 若某个变量将来在 :root 里补上了真实定义，它的白名单条目会立刻变成 stale，",
+    "   脚本会提示删除。"
+  ],
+  "vars": [
+    {
+      "name": "--bg-main",
+      "reason": "别名，非缺陷。使用点全部写成 var(--bg-main, var(--bg-element))，兜底是项目既有语义令牌 --bg-element（卡片/内嵌表面底色），因此缺变量时样式照常生效。它出现在 BackupListModal / DataSettingsGroup 的中性徽标上，语义就是「与卡片底同色的一小块」——没有为新名字补定义的必要，就地映射会改动那两处被排除的文件。",
+      "sites": [
+        "src/features/settings/components/BackupListModal.tsx:428",
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:812"
+      ]
+    },
+    {
+      "name": "--border-color",
+      "reason": "别名，非缺陷。所有使用点都带 fallback（rgba(128,128,128,0.25/0.3/0.35)），是一条中性灰描边，在六套主题下都可见且已与相邻控件视觉一致。注意调用方自己在括号外拼了 `1px solid`，所以这里不能换成项目里已含宽度与样式的 --line-soft/--panel-border，否则会变成 `1px solid 1px solid ...` 而整条失效——这恰恰是本次要避免的那类静默丢弃。",
+      "sites": [
+        "src/features/settings/components/BackupListModal.tsx:396",
+        "src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:235",
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:792",
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:860",
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:893",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:70",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:269",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:287",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:301",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:390",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:543",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:577"
+      ]
+    },
+    {
+      "name": "--bg-hover",
+      "reason": "别名，非缺陷。两个使用点都写成 var(--bg-hover, rgba(128,128,128,0.12 或 0.14))，兜底是一条中性灰悬停底，在两处（标签指派模式切换、标签候选行）都可见且已经与相邻悬停态一致。当时考虑过改用 --bg-input 与全项目其它悬停态统一，但那会改变这两处的真实观感（中性灰 -> 主题色表面），属于重新设计而不是「让本该生效的样式生效」，因此不做；两处语义也不同（一个中性图标按钮、一个列表行）。",
+      "sites": [
+        "src/styles/components/tag-assign.css:51",
+        "src/styles/components/tags.css:157"
+      ]
+    },
+    {
+      "name": "--scrollbar-overlay-width",
+      "reason": "别名，非缺陷，但值得注意。两个使用点都写成 var(--scrollbar-overlay-width, 10px)，所以布局一直按 10px 生效。项目的滚动条宽度是逐主题令牌 --scrollbar-size（mica/acrylic/便签 8px、纸/retro 10px、樱花 6px），也就是说在 mica 下这里给滚动条多让了 2px、樱花下多让 4px——观感无碍（虚拟列表右侧本就留了内边距），改成 --scrollbar-size 会让横向占位变化，从而挪动既有像素。按「不改设计」的要求保留原样并在此登记；若将来要统一，应作为一次显式的视觉调整来做，而不是夹在缺陷修复里。",
+      "sites": [
+        "src/styles/components/layout.css:198",
+        "src/styles/components/layout.css:199"
+      ]
+    },
+    {
+      "name": "--tags-border-color",
+      "reason": "别名，非缺陷。唯一使用点写成 var(--tags-border-color, rgba(128,128,128,0.24))，兜底的中性灰描边一直生效，「新建标签」的虚线芯片在六套主题下都可见。项目里同族的 --tag-chip-border 语义更贴（实体芯片描边），但两者颜色与粗细不同：换过去会让这个虚线占位芯片的描边颜色随主题变化，是观感改动而非缺陷修复，因此保留原样。",
+      "sites": ["src/styles/components/tag-assign.css:108"]
+    },
+    {
+      "name": "--danger-color",
+      "reason": "别名，非缺陷。使用点全部写成 var(--danger-color, #c05050)，兜底是那个已经上线并在用红色 #c05050。它只用于「删除原版数据」这类危险按钮的图标色。项目目前没有 --danger-color 语义令牌族，只有若干处直接写死 #ff4d4f（危险菜单项）与 #c05050（危险按钮）；把这里的兜底收进令牌族属于重新设计配色，超出「让本该生效的样式生效」的范围。",
+      "sites": [
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:872",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:48",
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:100"
+      ]
+    },
+    {
+      "name": "--input-bg",
+      "reason": "别名，非缺陷。唯一使用点写成 var(--input-bg, var(--bg-input))，兜底就是项目既有语义令牌 --bg-input，缺变量时输入框底色照常生效。",
+      "sites": ["src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:236"]
+    },
+    {
+      "name": "--text-color",
+      "reason": "别名，非缺陷。唯一使用点写成 var(--text-color, var(--text-primary))，兜底就是项目既有语义令牌 --text-primary，缺变量时文字颜色照常生效。",
+      "sites": ["src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:237"]
+    }
+  ]
+}

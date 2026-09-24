@@ -1617,7 +1617,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             <style>{`
                 .themed-tag-manager {
                     display: grid;
-                    grid-template-columns: var(--tag-sidebar-width, 130px) auto 1fr;
+                    grid-template-columns: var(--tm-sidebar-width, 130px) auto 1fr;
                     height: 100%;
                     background: var(--bg-content);
                     font-family: var(--font-main, ui-monospace, monospace);
@@ -1628,7 +1628,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
                 /* Sidebar */
                 .tag-sidebar {
-                    width: var(--tag-sidebar-width, 130px);
+                    width: var(--tm-sidebar-width, 130px);
                     flex-shrink: 0;
                     display: flex;
                     flex-direction: column;
@@ -1658,7 +1658,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .action-btn { background: transparent; border: none; color: inherit; cursor: pointer; padding: 2px; opacity: 0.7; transition: opacity 0.2s; }
                 .action-btn:hover { opacity: 1; }
                 .collapse-toggle { 
-                    background: var(--bg-main); 
+                    background: var(--bg-input); 
                     border: none; 
                     color: inherit; 
                     cursor: pointer; 
@@ -1667,17 +1667,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     justify-content: center;
                     width: 28px;
                     height: 28px;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     transition: all 0.2s;
                 }
                 .collapse-toggle:hover { background: var(--border-light); color: var(--text-primary); }
                 /* 排序选择器：与 .collapse-toggle 同高，配色沿用侧栏既有令牌。
                    刻意去掉原生外观，否则在深色主题下会是一块突兀的系统控件。 */
                 .tag-sort-select {
-                    background: var(--bg-main);
+                    background: var(--bg-input);
                     color: inherit;
                     border: none;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     height: 28px;
                     padding: 0 4px;
                     font-size: 11px;
@@ -1689,7 +1689,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 }
                 .tag-sort-select:hover { opacity: 1; background: var(--border-light); }
                 .tag-sort-select:focus-visible { outline: 1px solid var(--accent-color); }
-                .tag-sort-select option { background: var(--bg-main); color: var(--text-primary); }
+                .tag-sort-select option { background: var(--bg-input); color: var(--text-primary); }
 
                 /* Tag Search Box */
                 .tag-search-box {
@@ -1704,8 +1704,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .tag-search-box .search-icon-placeholder { opacity: 0.3; color: var(--text-primary); flex-shrink: 0; }
                 .tag-search-box input {
                     width: 100%;
-                    background: var(--bg-main); 
-                    border: 1px solid var(--border); 
+                    background: var(--bg-input); 
+                    border: 1px solid var(--line-soft); 
                     outline: none;
                     font-size: 13px; 
                     font-weight: 500; 
@@ -1713,13 +1713,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     padding: 10px 12px 10px 36px;
                     flex: 1;
                     min-width: 0; 
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     transition: all 0.2s;
                 }
                 .tag-search-box input:focus {
                     border-color: var(--accent-color);
                     background: var(--bg-panel);
-                    box-shadow: 0 0 0 3px var(--accent-light);
+                    box-shadow: var(--input-focus-shadow);
                 }
                 .tag-search-box input::placeholder { color: var(--text-muted); opacity: 0.7; font-style: normal; font-size: 13px; }
                 
@@ -1739,20 +1739,20 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     cursor: pointer;
                     margin-bottom: 2px; 
                     border: 1px solid transparent;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     transition: all 0.15s;
                     position: relative;
                     overflow: hidden;
                     width: 100%;
                 }
-                .tag-item:hover { background: var(--bg-main); }
+                .tag-item:hover { background: var(--bg-input); }
                 .tag-item.active { 
-                    background: var(--accent-light); 
+                    background: var(--card-selected-background); 
                     border-color: transparent;
                     box-shadow: none;
                 }
-                .tag-item.create-hint { border: 1px dashed var(--border); opacity: 0.8; }
-                .tag-item.create-hint:hover { background: var(--bg-main); border-style: solid; }
+                .tag-item.create-hint { border: 1px dashed var(--line-soft); opacity: 0.8; }
+                .tag-item.create-hint:hover { background: var(--bg-input); border-style: solid; }
 
                 .sidebar-collapsed .tag-item { justify-content: center; padding: 10px 0; gap: 0; }
                 .sidebar-collapsed .tag-name,
@@ -1783,16 +1783,16 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 /* Inline Edit Input */
                 .inline-tag-edit {
                     flex: 1; 
-                    border: 1px solid var(--border); 
-                    background: var(--bg-main); 
+                    border: 1px solid var(--line-soft); 
+                    background: var(--bg-input); 
                     color: var(--text-primary); 
                     font-size: 13px; 
                     font-weight: 500;
                     padding: 6px 10px; 
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     min-width: 0; 
                     outline: none;
-                    box-shadow: 0 0 0 3px var(--accent-light);
+                    box-shadow: var(--input-focus-shadow);
                 }
 
                 /* B9: the hover action group is gone — rename/delete now live in the
@@ -1803,7 +1803,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     font-size: 11px; 
                     font-weight: 600; 
                     color: var(--text-secondary); 
-                    background: var(--bg-main); 
+                    background: var(--bg-input); 
                     padding: 2px 8px; 
                     border-radius: 10px;
                     min-width: auto;
@@ -1826,9 +1826,9 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .breadcrumb-marker { color: var(--accent-color); }
 
                 .sort-group { display: flex; gap: 6px; padding-left: 12px; border-left: 1px solid var(--panel-divider-color); }
-                .sort-btn { background: transparent; border: none; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: var(--radius-sm); transition: all 0.15s; }
-                .sort-btn:hover { background: var(--bg-main); color: var(--text-primary); }
-                .sort-btn.active { background: var(--accent-light); color: var(--accent-color); }
+                .sort-btn { background: transparent; border: none; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: var(--data-panel-radius); transition: all 0.15s; }
+                .sort-btn:hover { background: var(--bg-input); color: var(--text-primary); }
+                .sort-btn.active { background: var(--card-selected-background); color: var(--accent-color); }
 
                 .view-toggle {
                     display: flex;
@@ -1836,12 +1836,12 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     gap: 4px;
                     padding: 2px;
                     border: 1px solid var(--panel-divider-color);
-                    border-radius: var(--radius-sm);
-                    background: var(--bg-main);
+                    border-radius: var(--data-panel-radius);
+                    background: var(--bg-input);
                 }
                 .toggle-btn {
                     padding: 4px;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     transition: all 0.15s;
                 }
                 .toggle-btn:hover { background: var(--bg-input); }
@@ -1860,19 +1860,19 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
                 .themed-card {
                     background: var(--bg-element);
-                    border: 1px solid var(--border);
+                    border: 1px solid var(--line-soft);
                     padding: 12px; cursor: pointer;
                     position: relative;
-                    border-radius: var(--radius-md);
+                    border-radius: var(--card-radius);
                     transition: all 0.15s ease;
                 }
-                .themed-card:hover { transform: translateY(-1px); box-shadow: 0 4px 12px var(--shadow); border-color: var(--accent-color); }
+                .themed-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); border-color: var(--accent-color); }
 
                 .del-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; opacity: 0.4; transition: opacity 0.15s; }
                 .del-btn:hover { opacity: 1; color: #ff4d4f; }
 
-                .card-media { min-height: 60px; border-radius: var(--radius-sm); margin: 8px 0; overflow: hidden; background: var(--bg-main); display: flex; justify-content: center; align-items: center; }
-                .card-media img { max-width: 100%; max-height: 140px; object-fit: contain; border-radius: var(--radius-sm); }
+                .card-media { min-height: 60px; border-radius: var(--data-panel-radius); margin: 8px 0; overflow: hidden; background: var(--bg-input); display: flex; justify-content: center; align-items: center; }
+                .card-media img { max-width: 100%; max-height: 140px; object-fit: contain; border-radius: var(--data-panel-radius); }
                 
                 .card-body-text { font-size: 13px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; color: var(--text-primary); }
                 .card-footer { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--text-secondary); opacity: 0.8; }
@@ -1884,7 +1884,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                    The note is free text up to 2000 chars, so the layout must be
                    indifferent to its length — clamped to two lines here, with the full
                    text in the element title attribute. */
-                .card-note { display: flex; align-items: flex-start; gap: 4px; margin-top: 6px; padding: 4px 6px; border-radius: var(--radius-sm); background: var(--bg-main); color: var(--text-secondary); font-size: 10px; line-height: 1.35; }
+                .card-note { display: flex; align-items: flex-start; gap: 4px; margin-top: 6px; padding: 4px 6px; border-radius: var(--data-panel-radius); background: var(--bg-input); color: var(--text-secondary); font-size: 10px; line-height: 1.35; }
                 .card-note svg { flex-shrink: 0; margin-top: 2px; }
                 .card-note-text { flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; white-space: pre-wrap; }
                 /* The stacked list renders cards as a grid whose grid-template-areas
@@ -1896,7 +1896,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .stacked-layout .items-grid .card-note { font-size: 9px; }
                 .note-textarea { min-height: 56px; max-height: 140px; }
                 .edit-item-label { display: block; margin-bottom: 4px; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
-                .edit-item-body-notice { margin: 0 0 12px; padding: 8px; border-radius: var(--radius-sm); background: var(--bg-element); color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+                .edit-item-body-notice { margin: 0 0 12px; padding: 8px; border-radius: var(--data-panel-radius); background: var(--bg-element); color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
                 .edit-item-warning { display: flex; align-items: flex-start; gap: 4px; margin: 6px 0 0; color: #d08c30; font-size: 10px; line-height: 1.4; }
                 .edit-item-warning svg { flex-shrink: 0; margin-top: 2px; }
                 .edit-item-note-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--text-secondary); font-size: 10px; }
@@ -1916,11 +1916,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     display: flex;
                     align-items: center;
                     padding: 4px;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     opacity: 0.6;
                     transition: all 0.15s;
                 }
-                .card-action-btn:hover { opacity: 1; color: var(--accent-color); background: var(--bg-main); }
+                .card-action-btn:hover { opacity: 1; color: var(--accent-color); background: var(--bg-input); }
 
                 /* Overlay */
                 .modal-overlay {
@@ -1936,9 +1936,9 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .modal-overlay .confirm-dialog {
                     background: var(--bg-panel) !important;
                     padding: 24px;
-                    border: 1px solid var(--border) !important;
+                    border: 1px solid var(--line-soft) !important;
                     box-shadow: 0 20px 40px rgba(0,0,0,0.15) !important;
-                    border-radius: var(--radius-lg) !important;
+                    border-radius: var(--modal-radius) !important;
                     width: 400px;
                     max-width: 90%;
                     animation: modal-pop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -1979,12 +1979,12 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     font-size: 13px;
                     font-weight: 500;
                     cursor: pointer;
-                    background: var(--bg-main) !important;
-                    border: 1px solid var(--border) !important;
+                    background: var(--bg-input) !important;
+                    border: 1px solid var(--line-soft) !important;
                     color: var(--text-primary) !important;
                     box-shadow: none !important;
                     transition: all 0.15s;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                 }
                 .modal-overlay .confirm-dialog-button:hover {
                     background: var(--border-light) !important;
@@ -2000,7 +2000,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     border: none !important;
                 }
                 .modal-overlay .confirm-dialog-button.primary:hover {
-                    background: var(--accent-color-dark) !important;
+                    background: var(--accent-hover) !important;
                 }
 
                 /* Modern Theme Polishes for Confirm Dialog */
@@ -2067,8 +2067,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
                 .modal-input-field input {
                     width: 100%; 
-                    background: var(--bg-main);
-                    border: 1px solid var(--border);
+                    background: var(--bg-input);
+                    border: 1px solid var(--line-soft);
                     padding: 12px; 
                     color: var(--text-primary);
                     font-family: inherit; 
@@ -2076,12 +2076,12 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     font-weight: 400;
                     outline: none; 
                     margin-bottom: 20px;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                     transition: all 0.2s;
                 }
                 .modal-input-field input:focus {
                     border-color: var(--accent-color);
-                    box-shadow: 0 0 0 3px var(--accent-light);
+                    box-shadow: var(--input-focus-shadow);
                 }
                 .modal-buttons { display: flex; gap: 8px; justify-content: flex-end; }
                 .modal-buttons button {
@@ -2089,16 +2089,16 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     cursor: pointer;
                     font-size: 13px; 
                     font-weight: 500;
-                    border: 1px solid var(--border);
-                    background: var(--bg-main);
+                    border: 1px solid var(--line-soft);
+                    background: var(--bg-input);
                     color: var(--text-primary);
                     box-shadow: none;
                     transition: all 0.15s;
-                    border-radius: var(--radius-sm);
+                    border-radius: var(--data-panel-radius);
                 }
                 .modal-buttons button:active { transform: scale(0.98); }
                 .btn-save { background: var(--accent-color); color: white; border: none; }
-                .btn-save:hover { background: var(--accent-color-dark); }
+                .btn-save:hover { background: var(--accent-hover); }
                 
                 /* Modern Theme Polishes */
                 .theme-mica.themed-tag-manager,
@@ -2733,13 +2733,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .selection-indicator {
                     width: 20px;
                     height: 20px;
-                    border: 2px solid var(--border);
+                    border: 2px solid var(--line-soft);
                     border-radius: 6px;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     transition: all 0.2s;
-                    background: var(--bg-main);
+                    background: var(--bg-input);
                 }
                 .selection-indicator.checked {
                     background: var(--accent-color);
@@ -2760,10 +2760,10 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 }
 
                 .manage-mode .themed-card {
-                    border-color: var(--border);
+                    border-color: var(--line-soft);
                 }
                 .manage-mode .themed-card:hover {
-                    border-color: var(--accent-light);
+                    border-color: var(--card-selected-border-color);
                     transform: none;
                     box-shadow: none;
                 }

@@ -219,13 +219,23 @@ fn target_db_is_pristine(target: &std::path::Path) -> bool {
         return false;
     }
 
-    // 3) settings 必须与"刚装好的新版"完全一致。
-    let baseline = build_seed_settings_baseline(&probe_dir.join("baseline.db"));
-    let actual = read_settings(&probe_db);
-    let pristine = match (baseline, actual) {
-        (Some(base), Some(act)) => act == base,
-        _ => false, // 无法判定 → 按"在用"处理
-    };
+    // 3) 判定的核心是"里面有没有用户自己产生的东西"，不是"设置是否还是出厂值"。
+    //
+    // 【为什么删掉了"settings 必须与全新库完全一致"这一条】
+    //
+    // 那条判据要求用户的 settings 与刚装好的新版**逐键相等**。但应用启动与日常使用
+    // 会**主动写入**大量设置：窗口尺寸（`setup.rs` 在窗口大小变化时写
+    // `app.window_width` / `app.window_height`）、`app.anon_id`、粘贴方式等等。于是
+    // 用户只要**调整过一次窗口大小**，判定即为 false，手动迁移从此**永远**被
+    // `target_already_has_data` 挡掉——而界面只说"新版数据目录里已经有你自己的记录"，
+    // 用户看得到的记录数却是 0，完全无从理解。
+    //
+    // 判据本身也前后矛盾：这里要判断的是"这个库能不能让位"，而与设置有关的证据
+    // （`clipboard_history` / `saved_tags`）已经在上面两条查过了。设置被改过，
+    // 恰恰说明用户在**用**这个应用，但那两条已经覆盖了"有没有数据"。
+    //
+    // 保留这一条会造成"数据明明还没进来、迁移却永久拒绝"的死局，因此移除。
+    let pristine = true;
 
     let _ = std::fs::remove_dir_all(&probe_dir); // 探针目录始终清理；目标目录从未被写过
     pristine
@@ -1561,17 +1571,55 @@ mod migration_pristine_tests {
     }
 
     /// **G-2 核心回归**：0 条剪贴板记录、但用户改过设置 → 必须判定为"在用"。
+    /// 改过设置的库**仍然**算空库——判据是"有没有用户数据"，不是"设置是否还是出厂值"。
     ///
-    /// 用"与全新种子库逐键逐值比对"实现，因此这里改一个已存在的 key 即可触发。
+    /// 【这条测试曾经断言的是相反的行为，而那个行为是一个真实缺陷】
+    ///
+    /// 旧判据要求 settings 与全新库**逐键相等**。但应用启动与日常使用会主动写入设置，
+    /// 其中最平凡的是**窗口尺寸**（`setup.rs` 在窗口大小变化时写 `app.window_width` /
+    /// `app.window_height`）。于是用户只要调整过一次窗口，判定即为 false，手动迁移
+    /// 从此**永远**被 `target_already_has_data` 挡掉：旧数据一条都没进来，界面却说
+    /// "新版数据目录里已经有你自己的记录"。用户实测撞到的就是这个。
+    ///
+    /// 旧测试把那个行为写成了"绝不能判定为空库"，等于用一条断言把缺陷保护了起来——
+    /// 测试全绿，功能全坏。这里改为断言**正确**行为。
     #[test]
-    fn customized_setting_makes_target_non_pristine() {
+    fn customized_setting_still_counts_as_pristine() {
         let root = tmp_root("setting");
         let dir = seeded_dir(&root);
         assert!(target_db_is_pristine(&dir), "前提：先确认基线是空库");
 
         let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        // 模拟用户改主题——以及更平凡地，把窗口拖动一下（应用会自动写入尺寸）。
         conn.execute(
             "UPDATE settings SET value = 'definitely-not-the-default' WHERE key = 'app.theme'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('app.window_width', '1234')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            target_db_is_pristine(&dir),
+            "只改过设置（没有剪贴板记录、没有用户标签）时，这个库仍应允许被迁移接管；\
+             否则用户调整过一次窗口大小就再也迁不进旧数据了"
+        );
+    }
+
+    /// 但**有用户数据**时，改没改设置都不算空库——上面放宽判据不能把这条也放过去。
+    #[test]
+    fn settings_alone_do_not_override_real_user_data() {
+        let root = tmp_root("setting-with-data");
+        let dir = seeded_dir(&root);
+        let conn = rusqlite::Connection::open(dir.join("clipboard.db")).unwrap();
+        conn.execute(
+            "INSERT INTO clipboard_history
+                (content_type, content, source_app, timestamp, preview)
+             VALUES ('text', 'hello', 'TestApp', 1, 'hello')",
             [],
         )
         .unwrap();
@@ -1579,7 +1627,7 @@ mod migration_pristine_tests {
 
         assert!(
             !target_db_is_pristine(&dir),
-            "用户改过设置时绝不能判定为空库"
+            "有真实剪贴板记录时必须判为在用，不能被设置这一条放宽掉"
         );
     }
 

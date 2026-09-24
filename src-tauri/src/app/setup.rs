@@ -137,7 +137,194 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 数据目录重定向指针的文件名（用户显式指定数据目录时写它）。
+///
+/// 【它住在哪里】写字的是 `system_cmd::set_data_path`，位置恒为**原生漫游目录**
+/// （`app_data_dir()`）。因此读取也必须只认这一处，不另找第二个指针位置——两个指针
+/// 同时存在时无法裁决谁更新，只会让"数据到底在哪"变成猜谜。
+const DATA_DIR_REDIRECT_FILE: &str = "datapath.txt";
+
+/// 判定"这个目录里确实有本应用的数据"的标志文件。
+///
+/// 与 `migration_identifier` 的判据保持一致（同为 `clipboard.db`）：只要一个目录里
+/// 存在它，就说明用户在这里放过真实数据，任何情况下都不能把它当成空目录对待。
+const DATA_DIR_MARKER_FILE: &str = "clipboard.db";
+
+/// 数据目录的**来源**，即解析走到了哪一条分支。
+///
+/// 单独记下来是为了让"数据为什么在这里"可被日志与测试直接断言，而不是只看到一条路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataDirSource {
+    /// 用户在设置里显式指定了数据目录（`datapath.txt` 重定向）。**优先级最高**。
+    ExplicitRedirect,
+    /// 既有安装版用户：数据仍在本机漫游目录 `%APPDATA%\com.tieznext`，原地沿用。
+    LegacyRoaming,
+    /// 新安装 / 默认：数据放本机目录 `%LOCALAPPDATA%\com.tieznext`。
+    LocalDefault,
+}
+
+/// 数据目录的解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedDataDir {
+    /// 最终使用的数据目录。
+    pub path: std::path::PathBuf,
+    /// 选中它的原因。
+    pub source: DataDirSource,
+}
+
+/// 数据目录解析的**唯一决策点**（纯函数：只吃路径与布尔值，不碰磁盘、不看进程）。
+///
+/// 优先级（自上而下，先命中者胜）：
+/// 1. `datapath.txt` 的显式重定向——用户的显式选择优先于任何自动推断；
+/// 2. 漫游目录里已有 `clipboard.db`——既有安装版用户原地沿用，**绝不改换位置**；
+/// 3. 默认走本机目录 `%LOCALAPPDATA%\com.tieznext`。
+///
+/// 【为什么抽成纯函数】真正的 `resolve_data_dir` 依赖 `tauri::App`，测试里造不出来；
+/// 而"数据落在哪、为什么落在那里"恰是覆盖升级中最容易伤到用户数据的判断。抽成纯函数
+/// 后，全部分支都能在本机做真实断言（见 `setup_tests`）。
+pub(crate) fn pick_data_dir(
+    roaming: &std::path::Path,
+    local: &std::path::Path,
+    explicit_redirect: Option<&std::path::Path>,
+    roaming_has_database: bool,
+) -> ResolvedDataDir {
+    if let Some(target) = explicit_redirect {
+        return ResolvedDataDir {
+            path: target.to_path_buf(),
+            source: DataDirSource::ExplicitRedirect,
+        };
+    }
+    if roaming_has_database {
+        return ResolvedDataDir {
+            path: roaming.to_path_buf(),
+            source: DataDirSource::LegacyRoaming,
+        };
+    }
+    ResolvedDataDir {
+        path: local.to_path_buf(),
+        source: DataDirSource::LocalDefault,
+    }
+}
+
+/// 读取 `datapath.txt` 并返回**已被采纳**的重定向目标（未采纳则 `None`）。
+///
+/// 只有"文件存在、内容非空、目标路径真实存在"三条同时成立才采纳；否则返回 `None` 由
+/// 调用方回退。**不猜测、不创建**目标目录：用户写在文件里的路径若已不存在（外接盘未插、
+/// 目录被删），静默按它建一个空目录会让用户看到"数据没了"。
+fn read_explicit_redirect(roaming: &std::path::Path) -> Option<std::path::PathBuf> {
+    let redirect_file = roaming.join(DATA_DIR_REDIRECT_FILE);
+    if !redirect_file.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&redirect_file).ok()?;
+    let custom_path = content.trim();
+    if custom_path.is_empty() {
+        return None;
+    }
+    let candidate = std::path::Path::new(custom_path);
+    if !candidate.exists() {
+        return None;
+    }
+    Some(candidate.to_path_buf())
+}
+
+/// 判定 `data_dir` 是否落在程序安装目录 `program_dir` 之内。
+///
+/// 这是"数据与执行者分离"这条不变量的**运行时护栏**：只要数据目录被判定在程序目录里，
+/// 覆盖升级（整体替换安装目录）与卸载（清理安装目录）都可能连带毁掉用户数据，因此这种
+/// 局面必须在启动时就喊出来，而不是安静地接受。
+///
+/// 【为什么不直接用 `canonicalize`】启动早期两个目录都可能尚不存在，且 Windows 上大小写
+/// 与短名（8.3）会造成同一路径的不同写法。这里按路径**组件**比较（Windows 下忽略大小写），
+/// 只做"是否被包含"这一件事，不解析符号链接——保守方向是"宁可漏报也不误报"，
+/// 因为误报会让用户以为自己的数据有危险。
+///
+/// 【根目录的例外】可执行文件直接放在盘根（`C:\tiez-next.exe`）时 `program_dir` 就是
+/// `C:\`，此时"数据在 C 盘上"完全正常，不能算命中。故要求 `program_dir` 自身还有父级。
+pub(crate) fn data_dir_is_inside_program_dir(
+    data_dir: &std::path::Path,
+    program_dir: &std::path::Path,
+) -> bool {
+    // 盘根/分卷根不参与判定：否则任何本机路径都会被判成"在程序目录内"。
+    if program_dir.parent().is_none() {
+        return false;
+    }
+
+    let normalize = |p: &std::path::Path| -> Vec<String> {
+        p.components()
+            .map(|c| {
+                let s = c.as_os_str().to_string_lossy().to_string();
+                // Windows 路径大小写不敏感：同一目录的两种写法必须判成同一处。
+                if cfg!(windows) {
+                    s.to_lowercase()
+                } else {
+                    s
+                }
+            })
+            .collect()
+    };
+
+    let data_parts = normalize(data_dir);
+    let program_parts = normalize(program_dir);
+    if program_parts.is_empty() || program_parts.len() > data_parts.len() {
+        return false;
+    }
+    data_parts[..program_parts.len()] == program_parts[..]
+}
+
+/// 漫游目录是否已经装着本应用的数据。
+///
+/// 判据是**标志文件存在**，而不是"目录存在"：老版本可能在漫游目录里留下过空的目录壳或
+/// 只留了日志，那种情况下没有数据要保，不该把用户永久钉在漫游位置。
+fn roaming_holds_database(roaming: &std::path::Path) -> bool {
+    roaming.join(DATA_DIR_MARKER_FILE).exists()
+}
+
+/// 解析本轮启动要使用的数据目录。
+///
+/// ## 不变量：数据与执行者分离（覆盖升级 / 卸载都不得触碰数据）
+///
+/// 本函数**绝不把数据目录落到程序安装目录内**，也**绝不把数据目录当成可执行文件的从属
+/// 物**：
+///
+/// - **默认落点在最本机的位置**：`%LOCALAPPDATA%\com.tieznext`。剪贴板历史是本机资产，
+///   放漫游目录既无意义（换机不带内容）又会让域环境连带同步大批附件。它与安装目录
+///   （currentUser 形态为 `%LOCALAPPDATA%\Tiez-Next`）是**兄弟目录**，互不包含，因此
+///   覆盖升级只整体替换安装目录，卸载只删安装目录，数据一律不动。
+/// - **历史便携判定（`<exe 同级>/data`）已移除**，理由见本节末尾。
+/// - **既有安装版用户的兼容**：他们的数据在 `%APPDATA%\com.tieznext`。只要那里还有
+///   `clipboard.db`，本函数就**原地沿用**该目录，绝不移位——覆盖升级后老用户看到的仍是
+///   自己的数据，不需要任何迁移动作。
+/// - **用户显式指定的目录优先级最高**（`datapath.txt`），高于上面两条自动推断。
+///
+/// ## 安装流程零数据操作（已逐条审计，改动 installer 时须重新核对）
+///
+/// 生成产物 `installer.nsi` 里与"删/写数据"有关的动作只有三处，且都不在安装路径上：
+/// - `StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"`——只拼**安装目录**（`Tiez-Next`），
+///   与数据目录 `com.tieznext` 不是同一个名字，也不会嵌套；
+/// - `Section Install` 只做 `SetOutPath`/复制 exe/写 `uninstall.exe`/写注册表/建快捷方式，
+///   **没有一步碰数据目录**；
+/// - `RmDir /r "$APPDATA\${BUNDLEID}"` 与 `RmDir /r "$LOCALAPPDATA\${BUNDLEID}"` 在
+///   **卸载段**，且同时受"用户勾选删除应用数据"与"非更新模式"两个条件守卫。
+///
+/// 也就是说：**覆盖升级天然不碰数据**——这不是靠约定，而是因为数据目录根本不在安装目录
+/// 的路径之下。改动 `tauri.conf.json` 的 `installMode`（会改安装目录）或向 `Section Install`
+/// 里添加任何删除动作时，必须回头核对这条不变量。
+///
+/// ## 为什么不再有便携模式
+///
+/// 旧实现对"可执行文件同级存在 `data/` 目录"做**无条件覆盖赋值**，于是：
+/// 1. 数据被放进**程序目录内**——而 NSIS 卸载器会清理安装目录，数据随程序一起消失；
+/// 2. 它**覆盖用户已经显式指定的数据目录**，用户改过的设置重启后又被拽回程序目录；
+/// 3. 判定只看 `存在 && 是目录`，不关心是谁创建的、里面有没有东西——用户随手
+///    `mkdir data`，或把任何一个自带 `data/` 的压缩包解压进程序目录，都会静默改变
+///    数据落点。
+///
+/// 现在数据位置只由"用户显式指定"与"既有数据在哪"两条真实事实决定。老便携版留下的
+/// `<exe 同级>/data` 数据**不做自动探测**（程序无从知道用户把它放在哪个盘哪个目录），
+/// 由用户在设置页「迁移中心」手动指定目录迁移；那条路径与本函数无关，保持可用。
 fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    // 原生漫游目录：既是 v0.2.8 时代迁移的目标，也是 `datapath.txt` 指针的住址。
     let default_app_dir = app.path().app_data_dir()?;
 
     // Perform migration if needed
@@ -171,34 +358,80 @@ fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error:
         }
     });
 
-    let redirect_file = default_app_dir.join("datapath.txt");
-    let mut app_dir = if redirect_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&redirect_file) {
-            let custom_path = content.trim();
-            if !custom_path.is_empty() && std::path::Path::new(custom_path).exists() {
-                std::path::PathBuf::from(custom_path)
-            } else {
-                default_app_dir.clone()
-            }
-        } else {
-            default_app_dir.clone()
-        }
-    } else {
-        default_app_dir.clone()
-    };
+    // 本机目录：新安装的默认落点（`%LOCALAPPDATA%\com.tieznext`）。
+    // 取不到时退回漫游目录——**绝不退回程序目录**：退回程序目录就等于把数据重新塞回
+    // 安装目录内，正是本次要根除的布局。
+    let local_app_dir = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| default_app_dir.clone());
 
-    // Portable mode check
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let portable_data = exe_dir.join("data");
-            if portable_data.exists() && portable_data.is_dir() {
-                app_dir = portable_data;
-            }
+    // 程序目录只用于一项事：启动后核对"数据没被放在程序目录里"，不参与任何选择。
+    let program_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+
+    let resolved = resolve_data_dir_impl(
+        &default_app_dir,
+        &local_app_dir,
+        program_dir.as_deref(),
+    );
+
+    match resolved.source {
+        DataDirSource::ExplicitRedirect => info!(
+            ">>> [DATA_DIR] 使用用户显式指定的数据目录（datapath.txt 重定向）: {:?}",
+            resolved.path
+        ),
+        DataDirSource::LegacyRoaming => info!(
+            ">>> [DATA_DIR] 沿用既有安装版数据目录（本机漫游，含既有数据库）: {:?}",
+            resolved.path
+        ),
+        DataDirSource::LocalDefault => info!(
+            ">>> [DATA_DIR] 使用本机默认数据目录（与安装目录分离）: {:?}",
+            resolved.path
+        ),
+    }
+
+    std::fs::create_dir_all(&resolved.path)?;
+    Ok(resolved.path)
+}
+
+/// [`resolve_data_dir`] 的**可注入实现**：全部输入来自参数，不读进程状态。
+///
+/// 抽出来是为了让"数据落在哪、为什么"能被真实文件系统上的测试直接验证——包括最容易
+/// 出错、也最伤用户的那一条：**程序目录里存在 `data/` 时，数据目录是否会被拽进去**。
+/// 老实现会，现在不会（见 `setup_tests` 的反向对照）。
+fn resolve_data_dir_impl(
+    roaming: &std::path::Path,
+    local: &std::path::Path,
+    program_dir: Option<&std::path::Path>,
+) -> ResolvedDataDir {
+    let explicit_redirect = read_explicit_redirect(roaming);
+    let resolved = pick_data_dir(
+        roaming,
+        local,
+        explicit_redirect.as_deref(),
+        roaming_holds_database(roaming),
+    );
+
+    // 不变量自检：数据目录**不得**落在程序目录内。
+    //
+    // 唯一还可能命中这条的是用户自己把数据目录显式指到了程序目录里（`datapath.txt`
+    // 写了安装目录下的路径）。那不是本程序能替用户决定的事——**不静默改动用户的选择，
+    // 也不静默接受**：记一条明确的日志，让"数据会不会被卸载器带走"在排查时有据可查。
+    // 正常情况下（本机默认位置 + currentUser 安装）两者是兄弟目录，此分支永不触发。
+    if let Some(program_dir) = program_dir {
+        if data_dir_is_inside_program_dir(&resolved.path, program_dir) {
+            error!(
+                "[DATA_DIR] 警告：数据目录位于程序目录内（{:?} ⊂ {:?}）。\
+                 覆盖升级会替换程序目录、卸载会清理程序目录，此布局下数据有被一并\
+                 清除的风险。若不希望如此，请在设置中把数据目录移到程序目录之外。",
+                resolved.path, program_dir
+            );
         }
     }
 
-    std::fs::create_dir_all(&app_dir)?;
-    Ok(app_dir)
+    resolved
 }
 
 /// 标识符变更迁移的结果（结构化，供「迁移中心」界面直接展示）。
@@ -1670,5 +1903,404 @@ mod setup_tests {
             crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN
         );
         assert!(super::EDGE_DOCK_THRESHOLD < crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN);
+    }
+}
+
+/// 「数据与执行者分离」的回归测试。
+///
+/// ## 这一组测试在守什么
+///
+/// 覆盖升级会整体替换程序目录、卸载会清理程序目录。因此只要**数据目录落在程序目录内**，
+/// 用户不可再生的剪贴板历史就会随程序一起消失。这组测试锁死三件事：
+///
+/// 1. 默认情况下数据目录**不在**程序目录内；
+/// 2. 老实现那条"程序目录内有 `data/` 就把数据搬进去"的便携判定**已彻底移除**；
+/// 3. 两条兼容路径（用户显式 `datapath.txt` 重定向、既有安装版用户的漫游目录）**继续可用**。
+///
+/// 全部基于真实文件系统，且经 `resolve_data_dir_impl` 走完整条解析链——不是只看常量。
+#[cfg(test)]
+mod data_dir_separation_tests {
+    use super::{
+        data_dir_is_inside_program_dir, pick_data_dir, read_explicit_redirect,
+        resolve_data_dir_impl, DataDirSource,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// 造一个隔离的临时根目录；名字带 pid 与纳秒，避免并发测试互相踩。
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tiez-datadir-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 模拟一次"全新安装"的目录形状，返回 (漫游目录, 本机目录, 程序目录)。
+    fn fresh_install_layout(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let roaming = root.join("Roaming").join("com.tieznext");
+        let local = root.join("Local").join("com.tieznext");
+        // currentUser 形态的安装目录：%LOCALAPPDATA%\Tiez-Next（与数据目录是兄弟目录）。
+        let program = root.join("Local").join("Tiez-Next");
+        fs::create_dir_all(&program).unwrap();
+        (roaming, local, program)
+    }
+
+    /// 造一个"目录里确实有本应用数据"的标志（用真实文件，不是空目录）。
+    fn seed_database(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("clipboard.db"), b"SQLite format 3\0").unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // 1. 默认落点：数据目录不在程序目录内
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fresh_install_puts_data_outside_the_program_directory() {
+        let root = tmp("fresh");
+        let (roaming, local, program) = fresh_install_layout(&root);
+
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+
+        assert_eq!(
+            resolved.source,
+            DataDirSource::LocalDefault,
+            "全新安装且两处都没有既有数据时，应使用本机默认数据目录"
+        );
+        assert_eq!(resolved.path, local);
+        assert!(
+            !data_dir_is_inside_program_dir(&resolved.path, &program),
+            "数据目录绝不能落在程序目录内：数据={:?} 程序={:?}",
+            resolved.path,
+            program
+        );
+        // 与安装目录是兄弟：同一个父目录，但不是父子关系。
+        assert_eq!(resolved.path.parent(), program.parent());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn program_directory_is_treated_as_a_root_not_a_container() {
+        let root = tmp("program-as-root");
+
+        // 反向：数据**确实**在程序目录内时必须被认出来（护栏本身要有效）。
+        assert!(data_dir_is_inside_program_dir(
+            Path::new("/opt/Tiez-Next/data"),
+            Path::new("/opt/Tiez-Next")
+        ));
+        assert!(data_dir_is_inside_program_dir(
+            Path::new("/opt/Tiez-Next"),
+            Path::new("/opt/Tiez-Next")
+        ));
+        // 兄弟目录不算命中。
+        assert!(!data_dir_is_inside_program_dir(
+            Path::new("/opt/com.tieznext"),
+            Path::new("/opt/Tiez-Next")
+        ));
+        // 前缀相同但不同名（`Tiez-Next-old` vs `Tiez-Next`）不算命中——按路径组件比较，
+        // 不做字符串前缀匹配，否则会把无关目录误判成"数据有危险"。
+        assert!(!data_dir_is_inside_program_dir(
+            Path::new("/opt/Tiez-Next-old"),
+            Path::new("/opt/Tiez-Next")
+        ));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // 2. 便携判定已移除（本次的关键行为变更）
+    // ---------------------------------------------------------------
+
+    /// **本次改动的核心断言**：程序目录里存在 `data/` 时，数据目录**不得**变成它。
+    ///
+    /// 老实现会无条件 `app_dir = <exe 同级>/data`；改动后这条判定整体移除。
+    /// 反向对照记录：把 `resolve_data_dir_impl` 换回老实现（在解析末尾加回便携覆盖赋值），
+    /// 本测试立即失败——见报告"反向对照"一节。
+    #[test]
+    fn portable_data_dir_is_ignored_even_when_it_exists() {
+        let root = tmp("portable-ignored");
+        let (roaming, local, program) = fresh_install_layout(&root);
+
+        // 目录形状完全照搬便携包：程序目录里有一个装着实数据的 data/。
+        let portable_data = program.join("data");
+        seed_database(&portable_data);
+        assert!(portable_data.join("clipboard.db").is_file());
+
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+
+        assert_ne!(
+            resolved.path, portable_data,
+            "程序目录内的 data/ 不得再被当作数据目录（便携判定必须已移除）"
+        );
+        assert_ne!(resolved.source, DataDirSource::LegacyRoaming);
+        assert_eq!(resolved.path, local);
+        assert!(
+            !data_dir_is_inside_program_dir(&resolved.path, &program),
+            "即便程序目录里有 data/，数据目录也必须在程序目录之外"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 便携判定还会**覆盖用户已经显式指定的数据目录**——这条一并锁死。
+    ///
+    /// 用户改了数据位置、程序目录里又恰好有 `data/` 时，老实现重启后会把用户拽回程序
+    /// 目录。现在显式指定优先级最高，任何自动推断都不得推翻它。
+    #[test]
+    fn explicit_redirect_outranks_any_automatic_inference() {
+        let root = tmp("explicit-wins");
+        let (roaming, local, program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+        // 程序目录里有 data/，漫游目录里也有既有数据库——两个"自动推断"都在场。
+        seed_database(&program.join("data"));
+        seed_database(&roaming);
+
+        let chosen = root.join("ChosenByUser");
+        seed_database(&chosen);
+        fs::write(
+            roaming.join("datapath.txt"),
+            chosen.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+
+        assert_eq!(resolved.source, DataDirSource::ExplicitRedirect);
+        assert_eq!(resolved.path, chosen, "显式指定的数据目录优先级必须最高");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // 3. 兼容性：既有安装版用户的数据必须继续被读到
+    // ---------------------------------------------------------------
+
+    /// **兼容性核心**：老用户数据在 `%APPDATA%\com.tieznext`，升级后必须原地沿用。
+    ///
+    /// 这条一旦失败，用户看到的就是"升级后数据全没了"。因此它比"新默认落点"更重要：
+    /// 新落点让**新用户**受益，这条让**老用户**不受损。
+    #[test]
+    fn existing_roaming_data_is_reused_so_old_users_keep_their_data() {
+        let root = tmp("legacy-roaming");
+        let (roaming, local, program) = fresh_install_layout(&root);
+
+        // 既有安装版用户：漫游目录里有真实数据，本机目录还不存在。
+        seed_database(&roaming);
+        assert!(!local.exists());
+
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+
+        assert_eq!(
+            resolved.source,
+            DataDirSource::LegacyRoaming,
+            "漫游目录已有数据库时必须原地沿用，不得改换位置"
+        );
+        assert_eq!(resolved.path, roaming);
+        // 数据并未因为"默认落点变了"而被搬走或新建空目录。
+        assert!(roaming.join("clipboard.db").is_file());
+        assert!(!local.exists(), "沿用既有数据时不得顺手新建另一个数据目录");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 漫游目录只有空壳（没有数据库）时，应落到新默认位置——
+    /// 判据是"有没有数据"，不是"目录存不存在"。
+    #[test]
+    fn empty_roaming_shell_does_not_pin_user_to_the_roaming_location() {
+        let root = tmp("empty-roaming");
+        let (roaming, local, program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+        // 老版本可能留下的痕迹：只有日志，没有数据库。
+        fs::write(roaming.join("tiez.log"), b"old log").unwrap();
+
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+
+        assert_eq!(
+            resolved.source,
+            DataDirSource::LocalDefault,
+            "没有数据库就不是\"有数据要保\"，不该把用户永久钉在漫游位置"
+        );
+        assert_eq!(resolved.path, local);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 三者同时在场时的完整优先级：显式重定向 > 既有漫游数据 > 本机默认。
+    #[test]
+    fn priority_order_is_explicit_then_legacy_then_local_default() {
+        let root = tmp("priority");
+        let (roaming, local, program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+
+        // 最底层：什么都没有 → 本机默认。
+        assert_eq!(
+            resolve_data_dir_impl(&roaming, &local, Some(&program)).source,
+            DataDirSource::LocalDefault
+        );
+
+        // 加上既有漫游数据 → 沿用漫游。
+        seed_database(&roaming);
+        assert_eq!(
+            resolve_data_dir_impl(&roaming, &local, Some(&program)).source,
+            DataDirSource::LegacyRoaming
+        );
+
+        // 再加上显式重定向 → 重定向胜出。
+        let chosen = root.join("ChosenByUser");
+        seed_database(&chosen);
+        fs::write(
+            roaming.join("datapath.txt"),
+            chosen.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_data_dir_impl(&roaming, &local, Some(&program)).source,
+            DataDirSource::ExplicitRedirect
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // 4. `datapath.txt` 重定向机制本身仍然生效（不得因本次改动而破坏）
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redirect_file_is_honoured_when_it_points_at_a_real_directory() {
+        let root = tmp("redirect-ok");
+        let (roaming, _local, _program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+
+        let target = root.join("CustomData");
+        seed_database(&target);
+        fs::write(
+            roaming.join("datapath.txt"),
+            target.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(read_explicit_redirect(&roaming).as_deref(), Some(target.as_path()));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 指针指向的目标已不存在（外接盘未插、目录被删）时**不采纳**，回退到自动推断。
+    ///
+    /// 这条防的是"静默按一个已经不存在的路径建空目录，用户看到数据没了"：
+    /// 采纳之前先确认目标真实存在。
+    #[test]
+    fn redirect_pointing_at_a_missing_directory_is_not_adopted() {
+        let root = tmp("redirect-missing");
+        let (roaming, local, program) = fresh_install_layout(&root);
+        seed_database(&roaming);
+
+        let missing = root.join("UnpluggedDrive").join("data");
+        fs::write(
+            roaming.join("datapath.txt"),
+            missing.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(read_explicit_redirect(&roaming), None);
+        let resolved = resolve_data_dir_impl(&roaming, &local, Some(&program));
+        assert_eq!(
+            resolved.source,
+            DataDirSource::LegacyRoaming,
+            "指针失效时必须回退到既有数据，而不是按失效路径建空目录"
+        );
+        assert!(!missing.exists(), "不得按失效指针创建目录");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 空文件 / 只有空白的指针同样不采纳（旧版本可能留过空文件）。
+    #[test]
+    fn blank_redirect_file_is_not_adopted() {
+        let root = tmp("redirect-blank");
+        let (roaming, local, program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+
+        fs::write(roaming.join("datapath.txt"), b"").unwrap();
+        assert_eq!(read_explicit_redirect(&roaming), None);
+        assert_eq!(
+            resolve_data_dir_impl(&roaming, &local, Some(&program)).source,
+            DataDirSource::LocalDefault
+        );
+
+        fs::write(roaming.join("datapath.txt"), b"   \r\n  ").unwrap();
+        assert_eq!(read_explicit_redirect(&roaming), None);
+        assert_eq!(
+            resolve_data_dir_impl(&roaming, &local, Some(&program)).source,
+            DataDirSource::LocalDefault
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 指针内容前后的空白与换行必须被裁掉（用户手写文件时很常见）。
+    #[test]
+    fn redirect_file_content_is_trimmed() {
+        let root = tmp("redirect-trim");
+        let (roaming, _local, _program) = fresh_install_layout(&root);
+        fs::create_dir_all(&roaming).unwrap();
+
+        let target = root.join("CustomData");
+        seed_database(&target);
+        fs::write(
+            roaming.join("datapath.txt"),
+            format!("  {}\r\n", target.to_string_lossy()),
+        )
+        .unwrap();
+
+        assert_eq!(read_explicit_redirect(&roaming).as_deref(), Some(target.as_path()));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // 5. 决策函数自身的边界（不依赖磁盘）
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolver_never_returns_the_program_directory_by_construction() {
+        // 决策函数**根本不接收程序目录**：数据目录无法由"程序在哪"推导出来。
+        // 这是"便携判定已移除"在类型层面的体现——传不进去的东西不可能被采纳。
+        let roaming = Path::new(r"C:\Users\u\AppData\Roaming\com.tieznext");
+        let local = Path::new(r"C:\Users\u\AppData\Local\com.tieznext");
+        let program = Path::new(r"C:\Users\u\AppData\Local\Tiez-Next");
+
+        let r = pick_data_dir(roaming, local, None, false);
+        assert_eq!(r.path, Path::new(r"C:\Users\u\AppData\Local\com.tieznext"));
+        assert!(!data_dir_is_inside_program_dir(&r.path, program));
+
+        // 即便漫游目录已被判定有数据库，结果也只是漫游目录，绝不会是程序目录。
+        let r2 = pick_data_dir(roaming, local, None, true);
+        assert_ne!(r2.path, program);
+        assert!(!data_dir_is_inside_program_dir(&r2.path, program));
+    }
+
+    /// Windows 路径大小写不敏感：同一目录的两种写法必须判成"在程序目录内"，
+    /// 否则护栏会漏掉真实危险布局。
+    #[test]
+    fn containment_check_ignores_case_on_windows() {
+        let inside = data_dir_is_inside_program_dir(
+            Path::new(r"C:\Users\U\AppData\Local\TIEZ-NEXT\data"),
+            Path::new(r"C:\Users\u\appdata\local\tiez-next"),
+        );
+        if cfg!(windows) {
+            assert!(inside, "Windows 下同目录不同大小写必须判定为包含");
+        } else {
+            // Linux 上大小写敏感，两种写法确实是不同的目录，不算包含。
+            assert!(!inside);
+        }
     }
 }

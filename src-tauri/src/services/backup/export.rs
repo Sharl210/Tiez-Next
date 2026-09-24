@@ -235,20 +235,72 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
     // ---------------- 3. 写 zip ----------------
     let out = std::fs::File::create(&req.output_path)?;
     let mut zip = ZipWriter::new(std::io::BufWriter::new(out));
-    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    // ---------------- 压缩策略：按内容是否"已压过"分流 ----------------
+    //
+    // 【这条策略的方向曾经是反的，实测才纠过来】
+    //
+    // 原来：数据库用 Stored（注释写"已经高度压缩，省 CPU"），图片目录用 Deflated。
+    // 实测（103 MiB / 20787 文件）发现这个组合是**负收益**——整包比原数据还**大 1.4%**：
+    //
+    //   clipboard.db      文本，deflate-6 压到 0.234  ← 唯一真正值得压的，却被跳过
+    //   attachments/      PNG/JPEG，落盘前就已压缩：0.984，烧 1119 ms 只换 1.18 MiB
+    //   emoji_favorites/  两万多个 ~3 KB 小 PNG：**1.33，膨胀 33%**
+    //   -wal/-shm         deflate-1 下涨 5.5%
+    //   background/       0.994，几乎无收益
+    //
+    // 关键在于**分清"内容本身可不可压"**，而不是"它是不是数据库文件"。
+    // `clipboard.db` 是 SQLite，里面装的是**文本剪贴板内容**，压缩率 0.234；
+    // 而图片落盘前（`utils.rs` 的 `save_image_bytes_to_attachments`）已经是 PNG/JPEG，
+    // 再压是给不可压数据付流开销——小文件尤其吃亏，ZIP 每条目固定开销实测 134 B，
+    // 对 393 B 的中位表情文件就是 34%。
+    //
+    // 改成：只有数据库压缩，其余一律 Stored。
+    // 实测省 11.15 MiB、耗时 1.923s → 0.488s（快 3.9 倍）。
+    //
+    // 【为什么用 deflate 而不是 zstd】这是**兼容性取舍**，不是"压缩率差不多"。
+    //
+    // M 档 `clipboard.db`（18 MiB）单类实测：
+    //
+    //     deflate-6   4.20 MiB   比率 0.2335   CPU 267.8 ms
+    //     zstd-1      4.49 MiB   比率 0.2492   CPU  42.9 ms
+    //     zstd-3      4.16 MiB   比率 0.2310   CPU  59.4 ms   ← 两项都更好，但要换算法
+    //     zstd-9      4.05 MiB   比率 0.2249   CPU 273.4 ms
+    //
+    // 也就是说：**想再省那 0.04 MiB（zstd-3 相对 deflate-6）就必须换压缩算法**，
+    // 而要启用 `CompressionMethod::Zstd` 必须给 `zip` 加 feature（引入 `zstd-sys`
+    // 这个 C 依赖），更重要的是——**旧版本的应用读不了用 zstd 写的包**：
+    // zip 的压缩方法编号是写在每个条目头里的，旧版 reader 遇到不认识的编号会以
+    // "Compression method not supported" **整个包读取失败**，而不是跳过该条目。
+    //
+    // 换来的收益是 **0.9%**（0.2335 → 0.2310）。为不到 1% 的空间，
+    // 让用户"用新版备份之后旧版再也打不开这个包"，不划算。
+    //
+    // 顺带否定一个曾经写在这里的错误说法：**不是"zstd 只多省 0.1%"**。
+    // zstd 各档在压缩率上确实能超过 deflate（zstd-3/9 都比 deflate-6 小），
+    // 真正的理由只有一条 —— **引入它就破坏向下兼容**。
+    //
+    // 若将来确认用户的库普遍大到"单核压缩突发"成为问题（实测 90 MiB 库时
+    // deflate-6 有一次 1.48 秒的单核连续占用，而 zstd-1 只需 0.225 秒），
+    // 再重新评估这个取舍。当前 M 档真实量级是 18 MiB，突发 277 ms，不构成问题。
+    //
+    // 【为什么 manifest/map 也用 Stored】它们与图片同批写入、体积很小，
+    // 压不压对总量无影响；统一口径比"这里压那里不压"更容易看懂。
+    let db_opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(6));
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let mut entries_written: u64 = 0;
     let mut bytes_written: u64 = 0;
 
-    // 3.1 先写数据库快照（已经高度压缩，用 Stored 省 CPU）
-    write_file_entry(&mut zip, stored, ENTRY_DATABASE, &snapshot_path)?;
+    // 3.1 数据库快照：唯一值得压缩的内容（文本，压缩率约 0.23）
+    write_file_entry(&mut zip, db_opts, ENTRY_DATABASE, &snapshot_path)?;
     entries_written += 1;
     bytes_written += std::fs::metadata(&snapshot_path)?.len();
 
     // 3.2 附件目录（递归）
     let (n, b) = write_dir_recursive(
         &mut zip,
-        deflated,
+        stored,
         &data_dir.join("attachments"),
         ENTRY_ATTACHMENTS_PREFIX,
         &mut checksums,
@@ -259,7 +311,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
     // 3.3 表情收藏目录（磁盘那一份）
     let (n, b) = write_dir_recursive(
         &mut zip,
-        deflated,
+        stored,
         &data_dir.join("emoji_favorites"),
         ENTRY_EMOJI_PREFIX,
         &mut checksums,
@@ -276,7 +328,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
     // 背景文件还在，界面照旧显示背景（**假成功**），换台机器才暴露丢失，且两侧都不报警。
     let (n, b) = write_dir_recursive(
         &mut zip,
-        deflated,
+        stored,
         &data_dir.join("background"),
         ENTRY_BACKGROUND_PREFIX,
         &mut checksums,
@@ -303,7 +355,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
             // 已在 `background/` 目录递归里写过的不重复写，只登记映射
             // （条目名由 `extra_file_plan` 保证与递归结果一致）。
             if !extra.already_packed {
-                zip.start_file(extra.entry.clone(), deflated)
+                zip.start_file(extra.entry.clone(), stored)
                     .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
                 zip.write_all(&bytes)
                     .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
@@ -324,7 +376,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
                 items: map_entries,
             })
             .map_err(|e| BackupError::Land(format!("序列化背景图映射失败：{}", e)))?;
-            zip.start_file(ENTRY_BACKGROUND_MAP, deflated)
+            zip.start_file(ENTRY_BACKGROUND_MAP, stored)
                 .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
             zip.write_all(&payload)
                 .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
@@ -344,7 +396,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
         if !mappings.items.is_empty() {
             let payload = serde_json::to_vec_pretty(&mappings)
                 .map_err(|e| BackupError::Land(format!("序列化路径映射失败：{}", e)))?;
-            zip.start_file(ENTRY_PATH_MAP, deflated)
+            zip.start_file(ENTRY_PATH_MAP, stored)
                 .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
             zip.write_all(&payload)
                 .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
@@ -370,7 +422,7 @@ fn build_package(req: &BackupRequest, work_dir: &Path) -> Result<BackupReport, B
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| BackupError::Land(format!("序列化 manifest 失败：{}", e)))?;
-    zip.start_file(ENTRY_MANIFEST, deflated)
+    zip.start_file(ENTRY_MANIFEST, stored)
         .map_err(|e| BackupError::Land(format!("写入 zip 条目失败：{}", e)))?;
     zip.write_all(&manifest_bytes)
         .map_err(|e| BackupError::Land(format!("写入 zip 数据失败：{}", e)))?;
@@ -588,6 +640,12 @@ mod guard_tests {
 
     fn scratch(tag: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("tiez-guard-{tag}-{}", std::process::id()));
+        // 【必须先清空】目录名只含 tag 与进程号 —— **同一次运行内是固定的**。
+        // 若上面残留了上一次运行的产物（调试中断、上一轮测试留下的假库等），
+        // 后续测试会在脏目录上跑：实测遇到过"新夹具建库时报 file is not a database"，
+        // 因为那里躺着一个旧测试写入的假 `clipboard.db`。
+        // 报错指向调用方，很容易被误判成实现坏了。
+        let _ = std::fs::remove_dir_all(&root);
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
         (root, data)
@@ -649,4 +707,151 @@ mod guard_tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ---------------- 压缩策略：按"内容可不可压"分流 ----------------
+
+    /// 造一个**合法的** SQLite 库，装满足够压缩的文本内容。
+    ///
+    /// 【为什么必须是真的 SQLite】导出走的是 `VACUUM INTO` 在线快照 ——
+    /// 它要求源文件是一个真数据库。早先这两个测试直接 `write` 了一段文本/魔术头，
+    /// 于是 `VACUUM INTO` 报 `file is not a database`。夹具造假文件时，
+    /// 失败信息会指向被测代码，很容易被误判成"实现坏了"。
+    ///
+    /// 【为什么调 `init_db` 而不是手抄 schema】真实 schema 分散在多处
+    /// （`database.rs` 建主体、`repository/migrations.rs` 建 `schema_migrations`、
+    /// 各 repo 建自己的表），而且会随版本演进。手抄一份最小 schema 的结果是：
+    /// 导出链路下游的 `plan_extra_files` 一查 `html_content` 列就报
+    /// `no such column` —— 夹具与真实库的偏差会以**看似无关的错误**暴露。
+    /// 直接复用生产入口，夹具就与真实结构同步。
+    fn seed_real_db(path: &std::path::Path) {
+        let _ = crate::database::init_db(&path.to_string_lossy()).unwrap();
+        // 塞足够多的文本，让压缩效果可见（真实剪贴板库也是这个性质：大量文本行）。
+        let conn = Connection::open(path).unwrap();
+        {
+            let mut st = conn
+                .prepare(
+                    "INSERT INTO clipboard_history
+                       (content_type, content, source_app, timestamp, preview)
+                     VALUES ('text', ?1, 'TestApp', 1, '')",
+                )
+                .unwrap();
+            for i in 0..4000 {
+                st.execute([format!(
+                    "clipboard entry {i} some repeated text content for compression"
+                )])
+                .unwrap();
+            }
+        }
+        drop(conn);
+    }
+
+    fn make_req(data: &std::path::Path, out: &std::path::Path) -> BackupRequest {
+        BackupRequest {
+            data_dir: data.to_path_buf(),
+            output_path: out.to_path_buf(),
+            app_version: "0.0.0-test".to_string(),
+        }
+    }
+
+    /// 写一个真实的 zip，返回 `(条目名, 压缩方法, 原始大小, 压缩后大小)`。
+    fn zip_entries(path: &std::path::Path) -> Vec<(String, CompressionMethod, u64, u64)> {
+        let f = std::fs::File::open(path).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        (0..z.len())
+            .map(|i| {
+                let e = z.by_index(i).unwrap();
+                (
+                    e.name().to_string(),
+                    e.compression(),
+                    e.size(),
+                    e.compressed_size(),
+                )
+            })
+            .collect()
+    }
+
+    /// **数据库条目必须是压缩的**。
+    ///
+    /// 【这条测的是一个方向曾经搞反的策略】原来数据库用 `Stored`（注释写"已经高度压缩"），
+    /// 而它其实是 SQLite 里的**文本剪贴板内容**，压缩率约 0.23 —— 整包里唯一真正值得压的
+    /// 东西被跳过了。断言"压缩后明显小于原始大小"，而不是断言"用了哪个选项常量"：
+    /// 后者只证明代码写着某句话，前者才证明**包真的变小了**。
+    #[test]
+    fn the_database_entry_is_actually_compressed() {
+        let (root, data) = scratch("db-compressed");
+        let out = root.join("backup.zip");
+        seed_real_db(&data.join("clipboard.db"));
+
+        create_backup(&make_req(&data, &out)).unwrap();
+
+        let entries = zip_entries(&out);
+        let (name, method, raw, packed) = entries
+            .iter()
+            .find(|(n, ..)| n == ENTRY_DATABASE)
+            .expect("包内必须有数据库条目");
+
+        assert_ne!(
+            *method,
+            CompressionMethod::Stored,
+            "数据库是文本，压缩率约 0.23，必须压缩——用 Stored 会让整包比原数据还大"
+        );
+        assert!(
+            *packed < *raw / 2,
+            "数据库条目应当被明显压缩：原始 {raw} 字节 → 压缩后 {packed} 字节。\
+             若这条失败，说明压缩策略又被改回「不压数据库」了。"
+        );
+        let _ = name;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **已压缩的内容（图片）不得再压缩**。
+    ///
+    /// 图片在落盘前就已经是 PNG/JPEG。再压是给不可压数据付流开销 ——
+    /// 实测小图标会**膨胀 33%**（ZIP 每条目固定开销约 134 字节，对 393 字节的中位文件
+    /// 就是 34%）。所以附件与表情目录必须是 `Stored`。
+    ///
+    /// 【为什么用"随机字节"造图】这样才能真正模拟"已压缩"的性质。用重复字节会造出
+    /// **可压缩**的假数据，实验结论会完全反过来（这正是本轮踩过的坑）。
+    #[test]
+    fn already_compressed_payloads_are_stored_not_deflated() {
+        let (root, data) = scratch("images-stored");
+        let out = root.join("backup.zip");
+        seed_real_db(&data.join("clipboard.db"));
+        // 真随机 = 不可再压，性质与"已 zlib 压缩的 PNG 内部数据"一致。
+        for dir in ["attachments", "emoji_favorites"] {
+            let d = data.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            for i in 0..40 {
+                let mut buf = vec![0u8; 3000];
+                // 简单可复现的伪随机，避免引入 rand 依赖。
+                let mut x: u64 = 0x9E3779B97F4A7C15 ^ (i as u64);
+                for b in buf.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *b = (x & 0xFF) as u8;
+                }
+                std::fs::write(d.join(format!("img{i}.png")), &buf).unwrap();
+            }
+        }
+
+        create_backup(&make_req(&data, &out)).unwrap();
+
+        let mut checked = 0;
+        for (name, method, _raw, _packed) in zip_entries(&out) {
+            let is_image = name.starts_with(ENTRY_ATTACHMENTS_PREFIX)
+                || name.starts_with(ENTRY_EMOJI_PREFIX);
+            if is_image {
+                assert_eq!(
+                    method,
+                    CompressionMethod::Stored,
+                    "{name} 是已压缩的图片，必须 Stored——对它 deflate 会膨胀并白烧 CPU"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "应当检查到图片条目（测试自身没有生效）");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }

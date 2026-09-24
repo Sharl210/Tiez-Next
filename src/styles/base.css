@@ -16,6 +16,15 @@
 
   --accent-color: #2f6fed;
   --accent-color-rgb: 47, 111, 237;
+  /* 面板底色的 RGB 三元组。用途是 `rgba(var(--bg-panel-rgb), a)`：把面板底色
+     按任意透明度铺一层，得到比 --bg-panel 更淡/更透的"次级表面"（设置页的
+     内联选择行、高级规则卡片、标签管理器的堆叠卡片）。
+     为什么必须是三元组而不是直接复用 --bg-panel：`rgba(var(--bg-panel), .5)`
+     在任何主题下都是无效语法（--bg-panel 是 `rgba(...)` 整体，嵌进 rgba() 会
+     解析失败 → 整条声明被丢弃），所以只有拆成三元组才表达得出"同一底色的另一个
+     透明度"。写法与 `--accent-color-rgb` 完全一致，不引入新的命名风格。
+     各主题在自身文件里覆盖（见 themes/*.css），保证次级表面跟随主题。 */
+  --bg-panel-rgb: 255, 255, 255;
   --accent-hover: #245dce;
   --border-dark: #24364d;
   --border-light: rgba(255, 255, 255, 0.78);
@@ -233,6 +242,7 @@
     --bg-content: linear-gradient(180deg, #171d28 0%, #131720 100%);
     --bg-toolbar: rgba(20, 24, 33, 0.84);
     --bg-panel: rgba(31, 37, 49, 0.86);
+    --bg-panel-rgb: 31, 37, 49;
     --bg-input: rgba(22, 28, 39, 0.96);
     --bg-element: rgba(28, 34, 46, 0.88);
     --bg-button: rgba(31, 37, 49, 0.86);
@@ -266,6 +276,7 @@ body.dark-mode {
   --bg-content: linear-gradient(180deg, #171d28 0%, #131720 100%);
   --bg-toolbar: rgba(20, 24, 33, 0.84);
   --bg-panel: rgba(31, 37, 49, 0.86);
+  --bg-panel-rgb: 31, 37, 49;
   --bg-input: rgba(22, 28, 39, 0.96);
   --bg-element: rgba(28, 34, 46, 0.88);
   --bg-button: rgba(31, 37, 49, 0.86);

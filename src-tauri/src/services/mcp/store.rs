@@ -132,6 +132,102 @@ impl McpStore {
             .as_millis() as i64
     }
 
+    /// 一个会话态条目落库：新条目、置顶、改标签都要先走这一步。
+    ///
+    /// 会话态条目的 id 是负数（内存里的临时编号），库里不可能有这一行；`repo.save`
+    /// 在 `id == 0` 时才会分配新 id，因此这里**必须先把 id 归零**再落库，否则
+    /// SQLite 会把负 id 当成显式主键写进去——那一行的 id 会一直是负数，看起来像
+    /// "归档失败"，而且下一次负 id 分配很容易和它撞号。
+    ///
+    /// 返回库里真正分配的 id；调用方负责把这个新 id 回写到会话态（与界面
+    /// `toggle_clipboard_pin` / `update_tags` 的"id 就地改写"同语义）。
+    pub fn persist_session_entry(
+        &self,
+        entry: &ClipboardEntry,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<i64, String> {
+        let mut owned = entry.clone();
+        owned.id = 0;
+        self.repo.save(&owned, data_dir)
+    }
+
+    /// 把一个**会话态**条目的状态写回内存（`mutate` 返回值表示是否找到该 id）。
+    ///
+    /// 与 [`Self::persist_session_entry`] 配对使用：先落库拿真实 id，再改写会话态，
+    /// 顺序与界面命令一致（界面注释里明确写了"反序会导致内存与数据库不一致"）。
+    /// 本函数只做内存改写，落库由调用方先完成。
+    ///
+    /// 返回改写后的会话态条目（供调用方回读校验），找不到该 id 时返回 `None`。
+    pub fn rewrite_session_entry<F>(
+        &self,
+        snapshot: &mut [ClipboardEntry],
+        id: i64,
+        mutate: F,
+    ) -> Option<ClipboardEntry>
+    where
+        F: FnOnce(&mut ClipboardEntry),
+    {
+        let item = snapshot.iter_mut().find(|e| e.id == id)?;
+        mutate(item);
+        Some(item.clone())
+    }
+
+    /// 在条目集合里按 id 找一条（`None` 表示不在这一层）。
+    pub fn find_in(entries: &[ClipboardEntry], id: i64) -> Option<ClipboardEntry> {
+        entries.iter().find(|e| e.id == id).cloned()
+    }
+
+    // -----------------------------------------------------------------------
+    // 表情收藏清单（设置项 `app.emoji_favorites`）
+    // -----------------------------------------------------------------------
+    //
+    // 界面渲染的收藏列表来自这个设置项里的一个 **JSON 字符串数组**（见
+    // `EmojiPanel.tsx`：`favorites` 就是解析它得来的）。因此"把图片放进
+    // `emoji_favorites/` 目录"只是完成了一半——不更新这个设置项，用户切回界面
+    // 看不到刚加的表情；只更新设置项不写文件，用户看到的是一个点不开的路径。
+
+    /// 读取表情清单里的路径（解析失败按空处理，不报错）。
+    pub fn emoji_manifest(&self) -> Vec<String> {
+        self.settings_repo
+            .get("app.emoji_favorites")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_emoji_manifest(&self, paths: &[String]) -> Result<(), String> {
+        let raw = serde_json::to_string(paths).map_err(|e| e.to_string())?;
+        self.settings_repo
+            .set("app.emoji_favorites", &raw)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 把一个路径加入表情清单（已存在则不重复添加）。
+    pub fn add_to_emoji_manifest(&self, path: &str) -> Result<(), String> {
+        let mut paths = self.emoji_manifest();
+        if paths.iter().any(|p| p == path) {
+            return Ok(());
+        }
+        paths.push(path.to_string());
+        self.write_emoji_manifest(&paths)
+    }
+
+    /// 从表情清单移除一个路径，返回是否真的改动过。
+    ///
+    /// 比较**不区分大小写**：Windows 路径大小写不敏感，界面上传进来的字符串与设置项
+    /// 里存的可能是同一个路径的大小写变体；只按全等比较会留下一条删不掉的幽灵项。
+    pub fn remove_from_emoji_manifest(&self, path: &str) -> Result<bool, String> {
+        let mut paths = self.emoji_manifest();
+        let before = paths.len();
+        paths.retain(|p| !p.eq_ignore_ascii_case(path));
+        if paths.len() == before {
+            return Ok(false);
+        }
+        self.write_emoji_manifest(&paths)?;
+        Ok(true)
+    }
+
     /// 读一条完整条目（含解密后的正文、HTML、备注、标签）。
     pub fn entry(&self, id: i64) -> Result<Option<ClipboardEntry>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
