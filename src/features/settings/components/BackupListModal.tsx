@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentType } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, Loader2, Play, RefreshCw, X } from "lucide-react";
+import { Clock, CornerDownRight, FolderOpen, Loader2, Play, Power, RefreshCw, X, Zap } from "lucide-react";
 import BackupContextMenu, { type BackupMenuKind } from "./BackupContextMenu";
 import { autoBackupErrorText } from "../lib/autoBackupError";
 import { formatBytes } from "../lib/formatBytes";
@@ -92,13 +93,51 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
 
   const explain = useCallback((e: unknown) => autoBackupErrorText(t, e), [t]);
 
+  /**
+   * `onLoaded` 的「最新引用」盒子。
+   *
+   * # 为什么不能把 `onLoaded` 直接放进 `refresh` 的依赖数组
+   *
+   * 父组件（`AutoBackupSettingsGroup`）把它写成**内联箭头函数**，于是父组件每渲染
+   * 一次，这个 prop 就是一个新引用。链路是：
+   *
+   *   父渲染 → 新 onLoaded → refresh 重建 → 依赖 refresh 的两个 effect 重跑
+   *          → 再一次 invoke + setPayload + onLoaded → 父组件 setState → 父渲染 …
+   *
+   * 这不是"动画不生效"，而是**每帧都在重新请求后端**：`list_auto_backups` 会被
+   * 无休止地调用，界面上看到的就是刷新按钮在 `Loader2` 与 `RefreshCw` 之间高频切换。
+   *
+   * # 为什么改写进 ref 不会引入过期闭包
+   *
+   * 每次渲染都**无条件**执行 `onLoadedRef.current = onLoaded`。ref 是同一个可变盒子，
+   * 这次赋值发生在渲染阶段，早于任何 effect 或事件回调被调度；因此之后无论谁调用
+   * `onLoadedRef.current(...)`，拿到的都是「最近一次渲染传进来的那个函数」。
+   * `refresh` 的依赖里不再有 `onLoaded`，它的身份就与父组件的渲染次数解耦，
+   * effect 只会在 `open` 真正变化时重跑 —— 循环被打断，而回调内容始终是最新的。
+   *
+   * # 为什么不写成 `useRef(onLoaded)`
+   *
+   * `useRef(onLoaded)` 只在首次渲染取初值、之后不再更新，ref 会永远停在第一版闭包上；
+   * 父组件换了语言或上下文后，回调读到的仍是旧值 —— 那才是真正的过期闭包。
+   * 必须"每轮都赋值"，这正是 React 文档里的 *Latest ref* 模式。
+   *
+   * # 为什么不用 React 19.2 的 `useEffectEvent`
+   *
+   * 两者渲染期语义等价，但 `useEffectEvent` 的契约限定返回的函数**只能在 effect 内调用**；
+   * 而本组件的 `refresh` 既被 effect 调用，也被「刷新」按钮的 `onClick` 调用，会从
+   * 事件处理器里触发这个回调，越出契约。本仓库其他位置（如
+   * `src/shared/hooks/useClipboardEvents.ts`）也用同一套 ref 写法，保持一致。
+   */
+  const onLoadedRef = useRef(onLoaded);
+  onLoadedRef.current = onLoaded;
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await invoke<AutoBackupListPayload>("list_auto_backups");
       setPayload(data);
-      onLoaded?.(data);
+      onLoadedRef.current?.(data);
     } catch (e: unknown) {
       console.error("list_auto_backups failed:", e);
       setError(explain(e));
@@ -106,7 +145,9 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
     } finally {
       setLoading(false);
     }
-  }, [explain, onLoaded]);
+    // 依赖里只有 explain（它自己依赖 t）。onLoaded 走 ref，因此父组件的每次渲染
+    // 都不再改变 refresh 的身份 —— 这是打断上面那条循环的关键。
+  }, [explain]);
 
   // 打开时加载一次。关闭后不清空 payload：再次打开会先显示上次的内容再刷新，
   // 比白屏一闪更稳。
@@ -156,6 +197,19 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
     const key = `auto_backup_origin_${code}`;
     const text = t(key);
     return text === key ? code : text;
+  };
+
+  /**
+   * 来源码 → 图标组件（未知码返回 `undefined`，只显示文字，不会显示错误图标）。
+   *
+   * 来源标签此前只是一块浅色小方块，与旁边的真按钮在底色上只差 4% 不透明度，
+   * 连视觉模型都把它读成了按钮。除样式收紧外再配一个语义图标
+   * （定时=时钟、启动=电源、立即=闪电），用户一眼就能读出"这是一段来源说明"。
+   */
+  const ORIGIN_ICONS: Record<string, ComponentType<{ size?: number }>> = {
+    scheduled: Clock,
+    startup: Power,
+    manual: Zap,
   };
 
   /** 固定 / 取消固定。上限判定在后端，界面的职责是把原因码与真实数字讲清楚。 */
@@ -256,67 +310,64 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.9, opacity: 0 }}
-            className="modal-content"
+            className="modal-content backup-modal"
             role="dialog"
             aria-modal="true"
             aria-label={t("auto_backup_list")}
             data-backup-list-modal=""
-            style={{
-              width: "94%",
-              maxWidth: "720px",
-              gap: "12px",
-              display: "flex",
-              flexDirection: "column",
-              maxHeight: "88vh",
-            }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="backup-modal-header">
               <h3 className="modal-title">{t("auto_backup_list")}</h3>
-              <button
-                className="btn-icon"
-                onClick={onClose}
-                aria-label={t("cancel")}
-                style={{ border: "none", background: "transparent", boxShadow: "none" }}
-              >
-                <X size={18} />
+              {/* 关闭按钮与工具栏按钮同量级：仓库里没有通用弹窗关闭类，
+                  原先靠内联把 `.btn-icon` 的令牌清空，导致它比工具栏按钮更大更重、
+                  圆角还随主题在 0–999px 之间跳。这里改由 `.backup-close-btn`
+                  统一管（尺寸 26px、圆角走 `--button-radius`）。 */}
+              <button className="backup-close-btn" onClick={onClose} aria-label={t("cancel")}>
+                <X size={14} />
               </button>
             </div>
 
             {/* 条数概览 + 备份目录。目录必须明示：用户要求"和手动备份的路径不同"，
-                只靠文字说明不够，直接把真实路径摆出来。 */}
-            <div style={{ fontSize: "11px", color: "var(--text-secondary)", lineHeight: 1.6 }}>
-              <div>{subTitle}</div>
+                只靠文字说明不够，直接把真实路径摆出来。
+
+                层级：汇总行是这一屏里优先级最高的信息（份数 / 已固定 / 固定上限），
+                给最大字号与字重；目录是"去哪里找文件"的补充，低一档。
+                此前两者同为 11px / 同色 / 挤在一起，用户读不出主次。 */}
+            <div className="backup-meta">
+              <div className="backup-counts">{subTitle}</div>
               {payload?.dir && (
-                <div style={{ wordBreak: "break-all", marginTop: "2px" }}>
+                <div className="backup-dir">
                   {t("auto_backup_dir").replace("{path}", payload.dir)}
                 </div>
               )}
             </div>
 
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <div className="backup-toolbar">
               <button
-                className="btn-icon"
+                className="btn-icon backup-toolbar-btn"
+                data-backup-refresh=""
                 disabled={busy}
                 onClick={() => void refresh()}
-                style={{ width: "auto", padding: "4px 12px", fontSize: "10px", height: "26px", display: "flex", alignItems: "center", gap: "6px" }}
               >
-                {loading ? <Loader2 size={12} /> : <RefreshCw size={12} />}
+                {/* 【必须带 animate-spin】此前这里没有动画类，"刷新中"只表现为图标在
+                    Loader2 与 RefreshCw 之间来回换。配合当时存在的无限刷新循环，
+                    用户看到的正是"按钮一直在闪"。`.animate-spin` 是 `ai.css` 里
+                    既有的全局工具类。 */}
+                {loading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
                 {t("auto_backup_refresh")}
               </button>
               <button
-                className="btn-icon"
+                className="btn-icon backup-toolbar-btn"
                 disabled={busy}
                 onClick={() => void runNow()}
-                style={{ width: "auto", padding: "4px 12px", fontSize: "10px", height: "26px", display: "flex", alignItems: "center", gap: "6px" }}
               >
                 <Play size={12} />
                 {t("auto_backup_run_now")}
               </button>
               <button
-                className="btn-icon"
+                className="btn-icon backup-toolbar-btn"
                 onClick={() => invoke<string>("open_auto_backup_folder").catch(console.error)}
-                style={{ width: "auto", padding: "4px 12px", fontSize: "10px", height: "26px", display: "flex", alignItems: "center", gap: "6px" }}
               >
                 <FolderOpen size={12} />
                 {t("auto_backup_open_folder")}
@@ -325,24 +376,12 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
 
             {/* 固定数已达上限的提示、以及后端其他的非致命告警。 */}
             {error && (
-              <div
-                data-backup-list-error=""
-                style={{
-                  border: "1px solid rgba(200,80,80,0.5)",
-                  borderRadius: "6px",
-                  padding: "8px 10px",
-                  fontSize: "11px",
-                  lineHeight: 1.6,
-                }}
-              >
+              <div className="backup-error" data-backup-list-error="">
                 {error}
               </div>
             )}
             {payload?.warnings?.map((w) => (
-              <div
-                key={w}
-                style={{ fontSize: "10px", color: "var(--text-secondary)", opacity: 0.85, lineHeight: 1.5 }}
-              >
+              <div key={w} className="backup-warning">
                 {w}
               </div>
             ))}
@@ -355,108 +394,66 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
               等于引用一个不存在的类名——正是"类名看着眼熟但不存在、元素按裸元素渲染"
               那类静默失败。全局 `scrollbar.css` 已给所有元素配了滚动条外观。
             */}
-            <div
-              data-backup-list=""
-              style={{
-                overflowY: "auto",
-                maxHeight: "46vh",
-                minHeight: "60px",
-                marginInline: "-2px",
-                paddingInline: "2px",
-              }}
-            >
+            <div className="backup-list" data-backup-list="">
               {entries.length === 0 ? (
-                <div style={{ padding: "16px 0", color: "var(--text-secondary)", fontSize: "11px" }}>
+                <div className="backup-empty">
                   {loading ? t("auto_backup_loading") : t("auto_backup_empty")}
                 </div>
               ) : (
-                entries.map((entry) => (
-                  /* 右键是这条记录唯一的操作入口——与标签组的交互一致。
-                     用 `onContextMenu` 而不是常驻按钮：每行都摆三个按钮会让
-                     "这份备份多大、什么时候做的"这些真正要看的信息被挤走。 */
-                  <div
-                    key={entry.archiveName}
-                    data-backup-row={entry.archiveName}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setMenu({ x: e.clientX, y: e.clientY, entry });
-                    }}
-                    title={entry.path}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      padding: "8px 10px",
-                      marginBottom: "6px",
-                      border: `1px solid ${
-                        entry.pinned
-                          ? "rgba(64,160,96,0.55)"
-                          : "var(--border-color, rgba(128,128,128,0.25))"
-                      }`,
-                      borderRadius: "6px",
-                      background: entry.pinned ? "rgba(64,160,96,0.07)" : "transparent",
-                      cursor: "context-menu",
-                    }}
-                  >
-                    <div style={{ minWidth: 0, flex: 1 }}>
-                      {/* 时间精确到秒（后端直接给 `YYYY-MM-DD HH:MM:SS`）。 */}
-                      <div
-                        style={{
-                          fontSize: "12px",
-                          fontWeight: 600,
-                          fontVariantNumeric: "tabular-nums",
-                          marginBottom: "2px",
-                        }}
-                      >
-                        {entry.createdAtLocal}
-                      </div>
-                      <div style={{ fontSize: "10px", color: "var(--text-secondary)" }}>
-                        {formatBytes(entry.sizeBytes)}
-                      </div>
-                    </div>
-
-                    {/* 来源标签：让"为什么有的备份不在预期时间点"一眼可见。 */}
-                    <span
-                      style={{
-                        flexShrink: 0,
-                        fontSize: "9px",
-                        fontWeight: 500,
-                        padding: "1px 5px",
-                        borderRadius: "3px",
-                        background: "var(--bg-main, var(--bg-element))",
-                        color: "var(--text-secondary)",
-                        whiteSpace: "nowrap",
+                entries.map((entry) => {
+                  const OriginIcon = ORIGIN_ICONS[entry.origin];
+                  return (
+                    /* 右键是这条记录唯一的操作入口——与标签组的交互一致。
+                       用 `onContextMenu` 而不是常驻按钮：每行都摆三个按钮会让
+                       "这份备份多大、什么时候做的"这些真正要看的信息被挤走。 */
+                    <div
+                      key={entry.archiveName}
+                      data-backup-row={entry.archiveName}
+                      className={`backup-row${entry.pinned ? " pinned" : ""}`}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setMenu({ x: e.clientX, y: e.clientY, entry });
                       }}
+                      title={entry.path}
                     >
-                      {originText(entry.origin)}
-                    </span>
+                      <div className="backup-row-main">
+                        {/* 时间精确到秒（后端直接给 `YYYY-MM-DD HH:MM:SS`）。 */}
+                        <div className="backup-row-time">{entry.createdAtLocal}</div>
+                        <div className="backup-row-size">{formatBytes(entry.sizeBytes)}</div>
+                      </div>
 
-                    {/* 固定状态：一眼能看出哪些不会被轮换删掉。 */}
-                    {entry.pinned && (
-                      <span
-                        data-backup-pinned=""
-                        style={{
-                          flexShrink: 0,
-                          fontSize: "9px",
-                          fontWeight: 600,
-                          padding: "1px 5px",
-                          borderRadius: "3px",
-                          border: "1px solid rgba(64,160,96,0.6)",
-                          color: "rgb(64,160,96)",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {t("auto_backup_pinned_badge")}
+                      {/* 来源标签：让"为什么有的备份不在预期时间点"一眼可见。
+                          它是一段**说明**而不是控件——`.backup-origin-tag` 去掉了
+                          底色/描边、加了左侧竖条与语义图标、压到 16px 高与 2px 圆角，
+                          与旁边 26px 高、带 `--button-border` 描边与 `--button-radius`
+                          圆角的真按钮在多个可量测属性上明显不同。
+                          `role="note"` 让辅助技术也把它读成说明而非可操作控件。 */}
+                      <span className="backup-origin-tag" data-backup-origin={entry.origin} role="note">
+                        {OriginIcon && <OriginIcon size={9} />}
+                        {originText(entry.origin)}
                       </span>
-                    )}
-                  </div>
-                ))
+
+                      {/* 固定状态：一眼能看出哪些不会被轮换删掉。
+                          与来源标签共用同一套"小号方角标注"形态语言，
+                          靠颜色（绿=受保护）区分语义。 */}
+                      {entry.pinned && (
+                        <span className="backup-pinned-tag" data-backup-pinned="">
+                          {t("auto_backup_pinned_badge")}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })
               )}
             </div>
 
-            <div style={{ fontSize: "10px", color: "var(--text-secondary)", opacity: 0.8, lineHeight: 1.5 }}>
+            {/* 底部交互提示。它是用户唯一能学会"右键可以做什么"的地方，
+                原先的 `--text-secondary` + `opacity: .8` 在六套主题的浅色态下
+                对比度只有 2.20–3.68（AA 要求 ≥ 4.5），实测确实"几乎难以辨认"。
+                现在改由字号 + 分隔线 + 承托底表达层级，文字本身保持可读。 */}
+            <div className="backup-hint" data-backup-row-hint="">
+              <CornerDownRight size={12} />
               {t("auto_backup_row_hint")}
             </div>
           </motion.div>
@@ -533,19 +530,9 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
               时间/大小/来源作为结构化数据渲染成独立一行。这样三语都不用改词条，
               且信息以等宽数字对齐，比塞进句子里更好读。
             */}
-            <div
-              data-backup-confirm-subject=""
-              style={{
-                fontSize: "12px",
-                lineHeight: 1.7,
-                margin: "0 0 12px",
-                color: "var(--text-primary)",
-              }}
-            >
-              <div style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
-                {pending.entry.createdAtLocal}
-              </div>
-              <div style={{ color: "var(--text-secondary)" }}>
+            <div className="backup-confirm-subject" data-backup-confirm-subject="">
+              <div className="backup-confirm-subject-time">{pending.entry.createdAtLocal}</div>
+              <div className="backup-confirm-subject-meta">
                 {`${formatBytes(pending.entry.sizeBytes)} · ${originText(pending.entry.origin)}`}
               </div>
             </div>

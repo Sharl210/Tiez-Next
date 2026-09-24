@@ -1,0 +1,410 @@
+/* 「备份列表」悬浮窗（BackupListModal）。
+ *
+ * # 为什么这个弹窗需要自己的样式文件
+ *
+ * 它此前**没有样式文件**，层级与一致性全靠 TSX 里的内联 style，同一条按钮样式在
+ * 三个按钮上各抄一遍。内联样式做不出"层级"这类跨元素关系（每条声明只管自己那一个
+ * 元素），于是同一个弹窗里出现了三套互不相干的视觉语言：
+ *   - 工具栏按钮走 `.btn-icon`（令牌 `--button-*`，描边来自主题）
+ *   - 来源标签用 `--bg-main`/`--bg-element` 硬拼，底色与按钮只差 4% 不透明度
+ *   - 汇总行、目录行、底部提示是三层同字号同色的灰字
+ * 用户反馈的"割裂感"就是这三套语言并置的结果，而不是配色不好看。所以这里按
+ * **方案 A：保持现有配色与结构，只把层级和一致性做对**，把散落的内联声明收拢成语义类。
+ *
+ * # 配色来源
+ *
+ * 只用项目既有的语义令牌（`--text-primary` / `--text-secondary` / `--bg-*` /
+ * `--button-*` / `--line-*`），不新增颜色。弹窗挂 `.theme-*` 作用域类，因此这些
+ * 令牌会随主题解析，六套主题不需要各自写规则。
+ *
+ * # 关于 `--text-secondary` 的实测
+ *
+ * 底部提示原本是 `--text-secondary` + `opacity: .8`。实测它在六套主题的浅色态下
+ * 对比度只有 2.20–3.68（WCAG AA 要求正文 ≥ 4.5），用户说"接近透明、几乎难以辨认"
+ * 属实。但**去掉 opacity 也不够**：`--text-secondary` 在 acrylic / sakura 浅色态
+ * 对弹窗底色本身就只有 2.77 / 2.84 —— 这是该主题令牌与窗口底色的固有配比问题，
+ * 不是本弹窗能靠透明度解决的。因此次级文字统一改用 `--text-primary`（既有令牌，
+ * 不是新颜色），层级改为由**字号、字重与承托结构**表达，而不是靠压低对比度。
+ * 六套主题 × 明暗态的实测对比度见文件末尾注释。
+ */
+
+/* ------------------------------------------------------------------ *
+ * 骨架：弹窗容器与标题行
+ * ------------------------------------------------------------------ */
+
+/* 尺寸声明沿用原先内联写死的值（94% / 720px / 88vh），不调整布局骨架。 */
+.backup-modal {
+  width: 94%;
+  max-width: 720px;
+  max-height: 88vh;
+  gap: 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.backup-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* 关闭按钮。
+ *
+ * 核实过仓库里**不存在**通用的弹窗关闭按钮类：同类弹窗（`AppSelectorModal`）与
+ * `SettingsFooter` 的关闭按钮同样是 `.btn-icon` 外加内联覆盖。原先那种写法把
+ * `border/background/box-shadow` 三样清空，等于同时丢掉了 `.btn-icon` 的令牌尺寸，
+ * 于是按钮落到内容尺寸 30×30、图标 18px，比工具栏按钮（26px / 12px 图标）更重，
+ * 且圆角随主题在 0–999px 之间跳（retro 是 0、便签是 999px）——这正是"像系统原生
+ * 图标"的来源。
+ *
+ * 这里给它一个明确尺寸并沿用主题的按钮令牌，使它降为与工具栏按钮同一量级。
+ *
+ * 【为什么选择器要写成 `.backup-modal-header .backup-close-btn` 而不用单个类】
+ * `index.css` 的 `@import` 按字母序排列，`auto-backup.css` 排在 `buttons.css`
+ * **之前**；两者都是单类选择器（同为 0-1-0），于是 `.btn-icon` 的
+ * `background: var(--bg-button)` / `border: var(--button-border)` / `padding: 6px`
+ * 会反过来覆盖本文件。写成两级选择器（0-2-0）才稳定胜过 `.btn-icon`，
+ * 而不必去破坏 `index.css` 的字母序。 */
+.backup-modal-header .backup-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  border-radius: var(--button-radius);
+  box-shadow: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+/* `.btn-icon:hover` 是 0-2-0，这里需要 0-3-0 才能在字母序劣势下依然生效。 */
+.backup-modal-header .backup-close-btn:hover {
+  background: var(--bg-input);
+  border: none;
+  box-shadow: none;
+  color: var(--text-primary);
+}
+
+.backup-modal-header .backup-close-btn:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------ *
+ * 层级：汇总行（强） → 目录行（弱） → 底部提示（弱且被分隔）
+ * ------------------------------------------------------------------ */
+
+.backup-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  line-height: 1.6;
+}
+
+/* 汇总行：弹窗里信息优先级最高的一行（份数 / 已固定 / 固定上限），
+   因此给它最大的字号与字重，作为"层级"的第一档。 */
+.backup-counts {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 目录行：路径是"去哪里找文件"的补充信息，比汇总行低一档——
+   字号更小、字重常规、色阶更弱，靠 `--text-primary` + opacity 保持在可读区间。 */
+.backup-dir {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-primary);
+  opacity: 0.85;
+  word-break: break-all;
+}
+
+/* ------------------------------------------------------------------ *
+ * 工具栏：三个按钮统一
+ * ------------------------------------------------------------------ */
+
+.backup-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 三个按钮（刷新 / 立即备份 / 打开备份目录）此前各自抄了一遍同样的内联样式。
+   收拢到这一个类后，三者的 height / padding / font-size / gap / border-radius
+   必然一致，不会再出现"改了一个忘了另两个"。
+   视觉令牌仍走 `.btn-icon` 的 `--button-*`，与设置区块里「查看列表」按钮同源。
+
+   【为什么要带 `.backup-toolbar` 前缀】同 `.backup-close-btn` 的理由：
+   `buttons.css` 在字母序上晚于本文件，同为单类选择器时 `.btn-icon` 会赢，
+   把这里的 `padding: 4px 12px` 覆盖回 `padding: 6px`、`inline-flex` 覆盖回 `flex`。
+   两级选择器才能稳定生效，同时不破坏 `index.css` 的字母序。 */
+.backup-toolbar .backup-toolbar-btn {
+  width: auto;
+  height: 26px;
+  padding: 4px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* 刷新中的图标必须真的在转。
+ *
+ * 原先写的是 `<Loader2 size={12} />`，没有 `animate-spin`（该动画定义在
+ * `ai.css`，是全局可用的既有工具类）。于是"刷新中"只表现为图标在
+ * `Loader2` 与 `RefreshCw` 之间来回换——配合曾经的无限刷新循环，用户看到的
+ * 就是按钮在闪。补上动画后，"正在刷新"有了连续可读的视觉信号。
+ * 尊重系统的"减少动态效果"设置：那种情况下图标静止也无妨，它仍与静止态不同。 */
+@media (prefers-reduced-motion: reduce) {
+  .backup-toolbar-btn .animate-spin {
+    animation: none;
+  }
+}
+
+.backup-toolbar-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------ *
+ * 告警：错误框与警告行
+ * ------------------------------------------------------------------ */
+
+.backup-error {
+  border: 1px solid rgba(200, 80, 80, 0.5);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.backup-warning {
+  font-size: 10px;
+  color: var(--text-primary);
+  opacity: 0.85;
+  line-height: 1.5;
+}
+
+/* ------------------------------------------------------------------ *
+ * 列表与条目
+ * ------------------------------------------------------------------ */
+
+/* 刻意**不加 `custom-scrollbar`**：那个类名只在 `TagManager.tsx` 自己注入的
+   `<style>` 里定义，全局样式表里并不存在。全局 `scrollbar.css` 已给所有元素
+   配好了滚动条外观。 */
+.backup-list {
+  overflow-y: auto;
+  max-height: 46vh;
+  min-height: 60px;
+  margin-inline: -2px;
+  padding-inline: 2px;
+}
+
+.backup-empty {
+  padding: 16px 0;
+  color: var(--text-primary);
+  opacity: 0.85;
+  font-size: 11px;
+}
+
+/* 条目行。右键是这条记录唯一的操作入口（与标签组一致），所以行本身不做成按钮，
+   只给 `context-menu` 光标与悬停底提示"这里可以右键"。 */
+.backup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: transparent;
+  cursor: context-menu;
+  transition: background 0.14s ease;
+}
+
+.backup-row:hover {
+  background: var(--bg-element);
+}
+
+/* 已固定：用"保护色"标出来，明确"这份不会被轮换删掉"。
+   绿色沿用原先的 rgba(64,160,96,·)，是既有配色，不换色相。 */
+.backup-row.pinned {
+  border-color: rgba(64, 160, 96, 0.55);
+  background: rgba(64, 160, 96, 0.07);
+}
+
+.backup-row.pinned:hover {
+  background: rgba(64, 160, 96, 0.12);
+}
+
+.backup-row-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.backup-row-time {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.backup-row-size {
+  font-size: 10px;
+  color: var(--text-primary);
+  opacity: 0.85;
+}
+
+/* ------------------------------------------------------------------ *
+ * 徽标：来源标签必须一眼看出"这不是按钮"
+ * ------------------------------------------------------------------ */
+
+/* 【这是本次最实质的一致性修复】
+ *
+ * 来源标签（定时备份 / 启动备份 / 立即备份）此前是一块 `padding: 1px 5px` +
+ * `border-radius: 3px` + `background: var(--bg-main, var(--bg-element))` 的小方块。
+ * 实测它与旁边真正的按钮在**底色上只差 4% 不透明度**（标签 0.72 vs 按钮 0.76，
+ * mica 浅色态），都是"浅色圆角小块"——连视觉模型都把它读成了按钮。
+ *
+ * 它其实是一段**说明性文字**（"这份备份是怎么产生的"），只是前面那个时间点的
+ * 补充信息，不可点击；把它做成按钮的样子属于语义与形态不符。
+ *
+ * 改法是**去掉所有"按钮特征"、加上"标签特征"**，词条文案一个字不动：
+ *   - 底色透明（按钮有 `--button-border` 描边 + `--bg-button` 底色）
+ *   - 左侧一道 2px 竖条作为"标注"的视觉锚点（按钮没有）
+ *   - 半径压到 2px，是"切角标注"而非按钮的 `--button-radius`（10–12px）
+ *   - 高度 16px，与按钮的 26px 明显不同
+ *   - 字号 9px / 字重 600 / 轻微字距，读作"标签"而不是"可点控件"
+ *   - `cursor: default`（按钮是 pointer）
+ * 并给它配一个语义图标（时钟 / 电源 / 闪电），进一步表明"这是来源说明"。
+ * 以上每一处差异都能用 `getComputedStyle` 量出来，见 tools/visual-harness/backup-measure.mjs。 */
+.backup-origin-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+  padding: 0 6px 0 5px;
+  background: transparent;
+  border: none;
+  border-inline-start: 2px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--text-primary);
+  opacity: 0.85;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+
+/* 已固定徽标：与来源标签同属"状态标注"，因此共用同一套形态语言
+   （小号、方角、不描边），靠颜色区分语义——来源是中性标注，固定是保护色。
+   它与来源标签并排出现，两者若形态各异就会重新产生割裂感。 */
+.backup-pinned-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+  padding: 0 6px;
+  background: rgba(64, 160, 96, 0.14);
+  border: none;
+  border-radius: 2px;
+  color: rgb(52, 140, 82);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+
+/* 深色主题下绿色需要提亮，否则在深底上对比不足（浅色态那支绿对深底偏暗）。 */
+:root.dark-mode .backup-pinned-tag,
+body.dark-mode .backup-pinned-tag {
+  background: rgba(64, 160, 96, 0.2);
+  color: rgb(110, 205, 145);
+}
+
+/* ------------------------------------------------------------------ *
+ * 底部提示
+ * ------------------------------------------------------------------ */
+
+/* 提示条承载一段**操作性说明**（"右键可固定、删除或恢复此备份"），
+   是用户唯一能学会本弹窗交互的地方，因此不能靠低对比度把它压成装饰。
+   层级改由结构与字号表达：顶部一道分隔线 + 承托底 + 11px 字号，
+   把它与列表内容分开，而不是让它淡到看不见。 */
+.backup-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--bg-element);
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-primary);
+  opacity: 0.9;
+}
+
+.backup-hint > svg {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+  opacity: 0.85;
+}
+
+/* ------------------------------------------------------------------ *
+ * 二次确认框里的"被操作对象"身份行
+ * ------------------------------------------------------------------ */
+
+/* 删除与恢复都需要用户核对"删的是哪一份"。时间用等宽数字对齐，
+   来源与大小降一档，与弹窗内其它次级文字保持同一套层级规则。 */
+.backup-confirm-subject {
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 0 0 12px;
+  color: var(--text-primary);
+}
+
+.backup-confirm-subject-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.backup-confirm-subject-meta {
+  color: var(--text-primary);
+  opacity: 0.85;
+}
+
+/* ------------------------------------------------------------------ *
+ * 对比度实测（6 套主题 × 明暗，tools/visual-harness/backup-measure.mjs）
+ *
+ * 修前 `.backup-hint` 的位置（`--text-secondary` + opacity .8）：
+ *   mica/浅 2.98   acrylic/浅 2.20   paper/浅 3.13   retro/浅 2.89
+ *   sakura/浅 2.26 sticky-note/浅 3.68
+ *   mica/深 5.17   acrylic/深 4.92   paper/深 3.58   retro/深 4.53
+ *   sakura/深 4.89 sticky-note/深 5.81
+ * 六套主题的浅色态全部低于 AA 的 4.5 —— 用户说的"接近透明"不是错觉。
+ *
+ * 修后（`--text-primary` + opacity .9 + 承托底 `--bg-element`）：
+ * 见 tools/visual-harness/backup-measure.mjs 的输出，最低值出现在承托底与文字
+ * 反差最小的主题上，仍稳定高于 4.5。之所以不用 `--text-secondary` 再调透明度：
+ * 该令牌在 acrylic / sakura 浅色态对本弹窗底色只有 2.77 / 2.84，无论怎么调
+ * 透明度都到不了 AA —— 那是主题令牌与窗口底色的固有配比，属于要单独决策的
+ * 视觉调整，不在"把本该一致的地方改一致"的范围内。
+ * ------------------------------------------------------------------ */

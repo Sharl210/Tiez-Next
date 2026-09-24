@@ -2,15 +2,15 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 
 // ---- 真实样式，与 src/main.tsx 的加载顺序一致 ----
-import "/root/Tiez-Next/src/index.css";
-import "/root/Tiez-Next/src/styles/components/index.css";
-import "/root/Tiez-Next/src/styles/themes/load";
+import "../../../src/index.css";
+import "../../../src/styles/components/index.css";
+import "../../../src/styles/themes/load";
 
 // ---- 真实组件（一字未改）----
-import ClipboardSettingsGroup from "/root/Tiez-Next/src/features/settings/components/groups/ClipboardSettingsGroup";
-import SettingsFooter from "/root/Tiez-Next/src/features/settings/components/SettingsFooter";
-import FileTransferChatView from "/root/Tiez-Next/src/features/file-transfer/components/FileTransferChatView";
-import { translations } from "/root/Tiez-Next/src/locales";
+import ClipboardSettingsGroup from "../../../src/features/settings/components/groups/ClipboardSettingsGroup";
+import SettingsFooter from "../../../src/features/settings/components/SettingsFooter";
+import FileTransferChatView from "../../../src/features/file-transfer/components/FileTransferChatView";
+import { translations } from "../../../src/locales";
 
 /**
  * CSS 变量缺陷验证台。

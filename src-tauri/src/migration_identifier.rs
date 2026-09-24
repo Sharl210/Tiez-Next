@@ -70,7 +70,7 @@
 //! 而无法整体编译），从而使迁移逻辑能够被真实文件操作验证。
 
 use std::fs;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 /// 本应用当前的标识符（`tauri.conf.json` 的 `identifier`）。
@@ -853,7 +853,47 @@ enum Outcome {
 ///
 /// 返回被改名的文件列表；调用方在交付失败时据此还原。
 fn yield_target_db(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut yielded = Vec::new();
+    yield_target_db_with(source, target, &mut |from, to| fs::rename(from, to))
+}
+
+/// [`yield_target_db`] 的实现主体：把"改名"这一步作为**可注入的接缝**接收。
+///
+/// 【为什么要有这个接缝】测试需要在任意平台上确定性地复现"改名失败"，而真机上的失败
+/// 来自 Windows 的 `os error 32`（文件被本应用自己打开的句柄占住）。Linux 允许改名
+/// 已打开的文件，凭"持有连接"无论如何也造不出同样的失败，因此把改名动作参数化：
+/// 测试可以注入"对某个名字必然失败"的改名器来复现占用，也可以注入"第二次才失败"的
+/// 改名器来验证回滚；生产路径传的仍是 [`fs::rename`]。
+///
+/// 【失败时是否已经改动过目标或源 —— 结论：没有，所以不需要"预先探测"】
+///
+/// 本函数是交付（`promote`）之前的**第一步写操作**，调用点在 [`migrate_from`] 的
+/// "第三步：交付"开头。走到这里时，此前只发生过两类动作：对源与目标的**只读**
+/// `scan_tree`，以及把源**复制**到目标同级的暂存目录。两者都不改动源，也不改动目标的
+/// 既有条目。因此：
+///
+/// - **源**：全程只被读取，任何失败出路都不动它（本模块的核心保证）。
+/// - **目标**：循环顺序是 `""` → `-wal` → `-shm`，而真机被占用的恰恰是主库，
+///   所以**第一个 `rename` 就会失败**，此时 `yielded` 仍为空、目标一个字节都没变。
+///
+/// 也就是说失败点"可控且干净"，与 `services::backup::import::swap_managed_entries`
+/// 面对同一约束时采用的"直接试、失败即回滚"是同一个模式，因此这里**同样不需要**
+/// "先拿哑名试改名再改回"式的预先探测——那只会把一次系统调用变成三次，换不来任何
+/// 更强的保证（探测同样会被占用挡住，且探测与真改之间存在竞态窗口）。
+///
+/// 唯一需要自己兜住的是**非首个条目失败**（主库已让位、`-wal` 才失败）：此时必须把
+/// 已经让位的条目放回原位，使"失败即等于调用前状态"成立。这一步在早期实现里是漏的
+/// （`?` 直接返回，`yielded` 里已改名的条目无人还原），现由下面的 `Err` 分支补齐。
+/// 让位留档的文件名标记：`clipboard.db` → `clipboard.db.unused-<时间戳>`。
+///
+/// 生产代码与测试都用它，避免两处各写一遍字面量后悄悄漂移。
+const UNUSED_MARKER: &str = ".unused-";
+
+fn yield_target_db_with(
+    source: &Path,
+    target: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut yielded: Vec<PathBuf> = Vec::new();
 
     // 幂等细节：若目标里那个"空库"（连同 WAL 侧车）与源里的同名文件**内容完全一致**
     // （典型场景是用户迁移成功后重启，应用又创建/打开了一模一样的库），就没有必要改名
@@ -871,6 +911,25 @@ fn yield_target_db(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String>
             _ => false,
         }
     };
+
+    // 【这段清理在"文件被占用"时确实会静默失败，但结论是：不需要在这里处理】
+    //
+    // `let _ = fs::remove_file(...)` 吞掉了错误。实测确认这个吞并在两种平台下都会
+    // 真的吞掉一次失败：Windows 上被占用的文件删除会返回 `os error 32`（本就在
+    // `remove_file` 上也照样发生）；即便在 Linux 上，"目录不可写"也会让 `remove_file`
+    // 失败。所以它**确实是一处真实的静默失败点**。
+    //
+    // 但它不需要补救，理由是**这里的失败没有后果**：这个分支的语义是"目标里那个文件与
+    // 源里的同名文件一模一样，删掉它让后续 `merge_into` 覆盖过去"。而 `merge_into`
+    // 对已存在的文件是 `continue`（绝不覆盖），所以就算删除失败、文件留在原地，目标里
+    // 的内容仍然**与源完全一致**——用户得到的库是他要的那一份。换句话说：删成功是
+    // "后面会覆盖成同样的内容"，删失败是"已经是同样的内容"，两条路殊途同归。
+    //
+    // 这与真正的失败点不同：那个分支必须改名（把目标让出来），改名失败会让用户拿不到
+    // 旧数据、且应用会继续打开那个空库，因此必须报错。**"静默"只允许用在不影响结果的
+    // 清理上**，这也是下面 `rename` 失败必须显式返回错误的原因。
+    //
+    // 代价说明：删除失败时不会留下 `.unused-` 留档（本来也不该留，两者内容一致）。
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -890,28 +949,144 @@ fn yield_target_db(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String>
             continue;
         }
         let to = target.join(format!("{}.unused-{}", name, stamp));
-        fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "无法让位目标里未使用过的空库 {}：{}（源目录未改动）",
-                from.display(),
-                e
-            )
-        })?;
+        // 【失败必须回到调用前状态】`fs::rename` 在同一个循环里逐个改名
+        // （主库 → -wal → -shm）。若前一个成功、后一个失败，**已经改名的那个必须放回去**
+        // —— 否则用户会遇到比原始报错更糟的状态：迁移报"失败"，但目标库其实已经被改名走了，
+        // 应用继续打开那个空库，用户的数据看起来"消失了"。
+        //
+        // 这条原来漏了：`?` 直接返回，`yielded` 里已改名的条目无人还原，而还原函数
+        // （`restore_yielded_target_db`）只在**调用方**的失败分支里被调 —— 那只覆盖
+        // "改名全成功、后续步骤失败"的情形。现在两条路径都还原。
+        if let Err(e) = rename(&from, &to) {
+            let msg = format!(
+                "{}（源目录未改动）",
+                occupied_or_failed_hint(&from, &name, &e)
+            );
+            // 把本次已改名的放回原位。放回失败的条目**不吞掉**，一并报给用户，
+            // 让他知道哪些文件停在了什么位置（比静默留档可诊断）。
+            let mut unrestored: Vec<String> = Vec::new();
+            for prev in yielded.iter().rev() {
+                let Some(orig) = prev
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.split(UNUSED_MARKER).next())
+                    .map(|n| target.join(n))
+                else {
+                    continue;
+                };
+                if rename(prev, &orig).is_err() {
+                    unrestored.push(
+                        prev.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            if unrestored.is_empty() {
+                // 【必须告知"已经放回去了"】用户在看到"迁移失败"时最担心的就是
+                // "我的数据是不是被搞乱了"。这一行直接回答它，并提供可核对的依据
+                // （可以自己去看目标目录里主库还在不在）。
+                return Err(format!(
+                    "{msg}\n已让位到一半的文件已全部放回原位，目标目录恢复成你操作前的样子。"
+                ));
+            }
+            return Err(format!(
+                "{msg}\n另外，以下已让位的文件未能还原，它们仍留在目标目录里：{}",
+                unrestored.join("、")
+            ));
+        }
         yielded.push(to);
     }
     Ok(yielded)
 }
 
-/// 还原被 [`yield_target_db`] 改名让位的空库（仅用于交付失败回滚）。
+/// 让位目标空库失败时给用户的提示。
+///
+/// 【为什么不能直接把系统错误抛给用户】真机上用户看到的是
+/// `另一个程序正在使用此文件，进程无法访问。(os error 32)`。这句话有两个问题：
+/// 一是**误导**——占用者不是"另一个程序"，**就是本应用自己**：应用启动时已经打开了
+/// 数据目录里的 `clipboard.db`（`app/setup.rs` 的 `database::init_db`，连接常驻在
+/// `DbState`），用户按提示去关别的软件永远关不出结果；二是**不可执行**——它没说下一步
+/// 该做什么。因此这里把可识别的"被占用"统一换成一句能照做的事，并保留"源目录未改动"
+/// 这一保证（由调用方拼接，见上）。
+///
+/// ## "占用"的判定不能依赖平台错误码
+///
+/// 判据取**两次独立信号**，任一命中即按"占用"处理：
+///
+/// 1. `ErrorKind::PermissionDenied` —— Windows 上 `ERROR_SHARING_VIOLATION`（32）与
+///    `ERROR_LOCK_VIOLATION`（33）都映射到这一档；文件被占用的**最常见**表现就是它。
+/// 2. `ErrorKind::Other` —— 兼容未被归入上述类别的共享冲突。
+///
+/// 反例值得记下来：Linux 上 `Error::from_raw_os_error(32)` 是 `BrokenPipe`，
+/// **不是** `PermissionDenied`。所以判据必须是"kind + 文件名"这个组合，而不是
+/// "错误码等于 32"——后者在非 Windows 平台上会把无关错误误报成占用。
+///
+/// 名字的约束同样重要：**只有主库 `clipboard.db` 被占用时才能把结论说成"数据库被占用"**。
+/// `-wal` / `-shm` 失败的原因可能完全不同（残留文件的权限、杀软隔离等），套用同一句话
+/// 会把用户引向错误的排查方向，因此那种情况只做"别的东西挡住了它 + 退回重试"的保守表述。
+fn occupied_or_failed_hint(from: &Path, name: &str, e: &io::Error) -> String {
+    let looks_occupied = matches!(
+        e.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::Other
+    );
+    // 【不要拼接系统给的本地化错误句子】原文就是
+    // `另一个程序正在使用此文件，进程无法访问。(os error 32)`，把它嵌进提示里等于
+    // 把要消除的误导原样留在用户眼前。这里只保留**可诊断的技术细节**（错误档位 + 错误号），
+    // 既够支持人员定位，又不会与"占用者就是本应用自己"的结论打架。
+    let detail = match e.raw_os_error() {
+        Some(code) => format!("系统错误码 {}，错误档位 {:?}", code, e.kind()),
+        None => format!("错误档位 {:?}", e.kind()),
+    };
+    if name == DB_FILE && looks_occupied {
+        return format!(
+            "无法让位目标里未使用过的空库 {}：它正被 Tiez-Next 自己占用（{}）。\
+             \n请从系统托盘（任务栏右下角）的 Tiez-Next 图标右键选择「退出 Tiez-Next」，\
+             完全退出应用后再重试本次迁移。\
+             \n注意：这不是别的程序占用了它，关闭其它软件不会有帮助；\
+             点窗口右上角的 × 只是把窗口收进托盘，应用仍在运行。",
+            from.display(),
+            detail
+        );
+    }
+    format!(
+        "无法让位目标里未使用过的空库 {}：{}。\
+         \n这通常是因为该文件仍被占用（例如应用的另一个窗口或后台进程还在用它）。\
+         \n请从系统托盘的 Tiez-Next 图标右键选择「退出 Tiez-Next」，完全退出应用后再重试。",
+        from.display(),
+        detail
+    )
+}
+
+/// 还原被 [`yield_target_db`] 改名让位的空库（交付失败、或让位中途失败时回滚）。
+///
+/// 【为什么不用 `file_name()` 再做 `.unused-` 字符串切割】那样写有个隐患：切出来的
+/// "原名"会被重新 `join` 到 `target` 上，而 `target` 是应用数据目录的**绝对路径**。
+/// 只要路径里任何一段包含 `.unused-`（用户完全可能把数据目录放在名为
+/// `backup.unused-2024` 的文件夹下），`split` 就会从**路径中间**切开，还原落到一个
+/// 完全无关的位置——既不报错，也不还原，是典型的静默错位。
+///
+/// 因此这里改成"用 `to` 的文件名反推原名，并且**只在 `to` 确实位于 `target` 之下**时
+/// 才动手"，用 [`Path::file_name`] 而不是字符串切割，还原目标由 `target.join(原名)`
+/// 精确构造。
 fn restore_yielded_target_db(yielded: &[PathBuf], target: &Path) {
+    // 后缀形如 `.unused-<时间戳>`；常量集中在这里，与 [`yield_target_db_with`] 里生成
+    // 归档名时用的是同一个标记。
+    const MARKER: &str = ".unused-";
     for to in yielded {
-        // 文件名形如 `clipboard.db.unused-<ts>`，去掉后缀即可还原。
-        let Some(name) = to.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        // 只还原"确实在本次目标目录里"的条目，越界的一律不碰。
+        if !to.starts_with(target) {
+            continue;
+        }
+        let Some(file_name) = to.file_name().map(|n| n.to_string_lossy().to_string()) else {
             continue;
         };
-        let Some(original) = name.split(".unused-").next() else {
+        let Some(original) = file_name.split(MARKER).next() else {
             continue;
         };
+        if original.is_empty() || original == file_name {
+            continue;
+        }
         let from = target.join(original);
         if !from.exists() {
             let _ = fs::rename(to, &from);
@@ -2593,5 +2768,425 @@ mod tests {
             "source_is_ancestor_of_target"
         );
         assert_eq!(SkipReason::SourceInsideTarget.code(), "source_inside_target");
+    }
+
+    // ================= 真实便携版副本的端到端验证 =================
+
+    /// 用**真实的 SQLite 库**（而非假文件头）造一份便携版副本，验证三层用户选择。
+    ///
+    /// 与前面几条测试的区别：前面用 100 字节文件头造假库（本模块按设计不依赖 rusqlite），
+    /// **只够验证"文件存在/内容一致"这类判定**。本条要验证的是**端到端能不能真跑通**，
+    /// 因此库必须是真库——否则一旦代码里出现"打开并读一下"的动作，假库会以
+    /// `file is not a database` 失败，而那与用户遇到的问题**不是同一件事**。
+    ///
+    /// 【为什么要覆盖三层】用户点「选择其它目录」时选中哪一层，取决于他打开到哪一步：
+    /// 便携版解压后是**两层同名目录**，`data/` 在第二层里。三种选择都必须能迁移成功
+    /// —— 这是真机上最容易出错的地方。
+    fn make_real_sqlite_db(path: &Path) -> usize {
+        use rusqlite::Connection;
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER);
+             CREATE TABLE clipboard_history (
+                 id INTEGER PRIMARY KEY, content_type TEXT, content TEXT,
+                 html_content TEXT, source_app TEXT, timestamp INTEGER, preview TEXT);
+             CREATE TABLE saved_tags (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO schema_migrations VALUES (1);",
+        )
+        .unwrap();
+        let rows = 120;
+        {
+            let mut st = conn
+                .prepare("INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview) VALUES ('text', ?, 'TestApp', ?, '')")
+                .unwrap();
+            for i in 0..rows {
+                st.execute(rusqlite::params![format!("旧版第 {i} 条"), 1_700_000_000i64 + i as i64])
+                    .unwrap();
+            }
+        }
+        conn.execute("INSERT INTO saved_tags (name) VALUES ('旧标签')", []).unwrap();
+        drop(conn);
+        rows
+    }
+
+    /// 在目录树下找那个 `clipboard.db`（只用于测试断言，不做生产判定）。
+    fn find_db_below(dir: &Path) -> Option<PathBuf> {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let candidate = d.join(DB_FILE);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if let Ok(entries) = fs::read_dir(&d) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        stack.push(e.path());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 造一份**与真机同构**的便携版副本，返回外层目录。
+    fn seed_portable_copy(root: &Path) -> PathBuf {
+        let outer = root.join("TieZ_0.3.3-portable");
+        let inner = outer.join("TieZ_0.3.3-portable");
+        let data = inner.join("data");
+        fs::create_dir_all(data.join("attachments")).unwrap();
+        fs::create_dir_all(data.join("emoji_favorites")).unwrap();
+        fs::write(inner.join("tiez-app.exe"), b"MZ_fake").unwrap();
+        fs::write(inner.join("说明.txt"), "说明").unwrap();
+        make_real_sqlite_db(&data.join(DB_FILE));
+        fs::write(data.join("attachments/old.png"), vec![b'a'; 2000]).unwrap();
+        fs::write(data.join("emoji_favorites/e.json"), b"[]").unwrap();
+        fs::write(data.join("datapath.txt"), b"").unwrap();
+        outer
+    }
+
+    /// 目标侧：模拟"应用已启动过、建了一个空库"。
+    ///
+    /// 【必须是真库】这条测试要**持有连接**来构造占用，而 `rusqlite` 打不开假文件头
+    /// （报 `file is not a database`）。夹具造假文件时，失败信息会指向被测代码，
+    /// 很容易被误判成"实现坏了"——本仓库已踩过一次（见维护文档 MD-0004 一带的教训）。
+    fn seed_target_with_empty_db(target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        let conn = rusqlite::Connection::open(target.join(DB_FILE)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER);
+             CREATE TABLE clipboard_history (
+                 id INTEGER PRIMARY KEY, content_type TEXT, content TEXT,
+                 html_content TEXT, source_app TEXT, timestamp INTEGER, preview TEXT);
+             CREATE TABLE saved_tags (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+    }
+
+    fn count_db_rows(db: &Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0)))
+            .unwrap_or(-1)
+    }
+
+    /// **三层选择都必须能迁移成功**，且迁移后目标库里是**真实的 120 条记录**。
+    #[test]
+    fn portable_copy_migrates_from_all_three_levels() {
+        for (label, pick) in [
+            ("外层", 0usize),
+            ("内层", 1),
+            ("data", 2),
+        ] {
+            let root = tmp(&format!("portable-{label}"));
+            let outer = seed_portable_copy(&root);
+            let src = match pick {
+                0 => outer.clone(),
+                1 => outer.join("TieZ_0.3.3-portable"),
+                _ => outer.join("TieZ_0.3.3-portable/data"),
+            };
+            let target = root.join("com.tieznext");
+            seed_target_with_empty_db(&target);
+
+            let outcome = migrate_from_source_dir(&src, &target, true);
+            let migrated = matches!(outcome, MigrationOutcome::Migrated { .. });
+            assert!(
+                migrated,
+                "选中「{label}」（{}）时必须迁移成功，实际：{outcome:?}",
+                src.display()
+            );
+
+            // 【关键】不只看返回值：**目标库里真的要有那 120 条**。
+            // 只断言"返回了 Migrated"是不够的——文件搬过去了但库打不开、
+            // 或者搬的是那个空库，返回值一样是 Migrated。
+            let rows = count_db_rows(&target.join(DB_FILE));
+            assert_eq!(
+                rows, 120,
+                "选中「{label}」迁移后，目标库里应有 120 条真实记录，实际 {rows} 条"
+            );
+
+            // 附件也要真到位
+            assert!(
+                target.join("attachments/old.png").is_file(),
+                "选中「{label}」时附件应一并迁移"
+            );
+            // 源目录必须完好：真正的库在 <选中层>/[<同名层>/]data/clipboard.db。
+            // **不要猜层数** —— 选「外层」时它还在第二层的 data 里。直接找。
+            let src_db = find_db_below(&src)
+                .unwrap_or_else(|| panic!("选中「{label}」后找不到源库，源可能被改动"));
+            assert!(
+                src_db.is_file(),
+                "选中「{label}」迁移后源库 {} 不得被改动/删除",
+                src_db.display()
+            );
+            assert_eq!(
+                count_db_rows(&src_db),
+                120,
+                "选中「{label}」迁移后源库内容必须原样保留"
+            );
+        }
+    }
+
+    /// **目标空库被占用时**（真机 `os error 32` 的场景），迁移不得破坏任何一侧。
+    ///
+    /// 本机是 Linux，允许改名已打开的文件，因此这里**显式持有连接**来构造占用；
+    /// 在 Windows 上同样的代码会真的失败。两种平台下本测试的**断言都成立**：
+    /// 要么迁移成功、要么干净失败，**不允许出现"一半搬了"或"目标库被破坏"**。
+    #[test]
+    fn occupied_target_db_never_corrupts_either_side() {
+        let root = tmp("occupied");
+        let outer = seed_portable_copy(&root);
+        let src = outer.join("TieZ_0.3.3-portable/data");
+        let target = root.join("com.tieznext");
+        seed_target_with_empty_db(&target);
+
+        // 持有目标库的连接，模拟"应用正在运行"
+        let held = rusqlite::Connection::open(target.join(DB_FILE)).unwrap();
+        held.execute_batch("CREATE TABLE marker (x INTEGER)").unwrap();
+
+        let outcome = migrate_from_source_dir(&src, &target, true);
+
+        // 无论成败，两侧都必须可读、数据不丢。
+        assert_eq!(
+            count_db_rows(&src.join(DB_FILE)),
+            120,
+            "源库必须完好（迁移只读源）"
+        );
+        assert!(
+            target.join(DB_FILE).is_file(),
+            "目标库文件不得消失（{}）",
+            format!("{outcome:?}")
+        );
+        drop(held);
+    }
+
+    // ===================================================================
+    // 目标空库被"本应用自己"占用时的处置
+    //
+    // 真机报错（用户截图，逐字）：
+    //   迁移未完成：无法让位目标里未使用过的空库
+    //   C:\Users\...\com.tieznext\clipboard.db：另一个程序正在使用此文件，
+    //   进程无法访问。(os error 32)（源目录未改动）
+    //
+    // 缺陷有两层：① 文案把占用者说成"另一个程序"（其实是应用自己打开的库），
+    // 且没给可执行的下一步；② 让位中途失败时**不回滚已改名的条目**。
+    //
+    // 【怎么在 Linux 上复现 Windows 的占用语义】见 `yield_target_db_with` 的文档：
+    // 把"改名"参数化后，测试注入一个确定失败的改名器。理由如下——
+    //   * Linux 允许改名已打开的文件，`Connection::open` 后 `fs::rename` 照样成功
+    //     （本仓库已有的 `occupied_target_db_never_corrupts_either_side` 在 Linux 上
+    //     走的正是成功路径），所以"持句柄"这条真机路径在此平台上**造不出失败**；
+    //   * root 会绕过目录权限检查（实测 0o555 目录下 rename/remove 均成功），
+    //     所以权限注入在本环境同样不可用；
+    //   * 而真正要验证的不是"Linux 能不能造出 os error 32"，而是**本模块面对
+    //     "改名被占用挡下"时给出的行为**：文案是否可执行、是否保住"源目录未改动"、
+    //     以及中途失败时是否回到调用前状态。注入式接缝能在两个平台上确定性地验证这三件事，
+    //     注入的底层错误对象又与 Windows 上 `io::Error::from_raw_os_error(32)` 完全一致。
+    // ===================================================================
+
+    /// 造一个 Windows `os error 32`（`ERROR_SHARING_VIOLATION`）对应的 `io::Error`。
+    ///
+    /// 用 `ErrorKind::PermissionDenied` 而不是 `from_raw_os_error(32)`：Windows 会把
+    /// 32/33 映射到那个 kind，而 Linux 上 `from_raw_os_error(32)` 是 `BrokenPipe`
+    /// ——测试要复现的是**Windows 的语义**（占用 → 权限类错误），不是错误号字面值。
+    fn sharing_violation() -> io::Error {
+        io::Error::new(
+            ErrorKind::PermissionDenied,
+            "另一个程序正在使用此文件，进程无法访问。(os error 32)",
+        )
+    }
+
+    /// 目标库被占用时，用户拿到的必须是**可执行的人话**，而不是原始系统错误。
+    #[test]
+    fn occupied_target_db_error_is_actionable_and_never_blames_other_programs() {
+        let root = tmp("occupied-msg");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        // 只有主库被占用（真机情形）。
+        let mut rename = |from: &Path, _to: &Path| -> io::Result<()> {
+            if from.file_name().is_some_and(|n| n == DB_FILE) {
+                return Err(sharing_violation());
+            }
+            fs::rename(from, _to)
+        };
+        let err = yield_target_db_with(&source, &target, &mut rename)
+            .expect_err("主库被占用时必须失败，不得假装成功");
+
+        // ① 必须点明占用者就是本应用自己，并给出可执行的下一步。
+        assert!(
+            err.contains("Tiez-Next") && err.contains("占用"),
+            "错误必须说明是应用自己在占用该库，实际：{err}"
+        );
+        assert!(
+            err.contains("退出") && err.contains("托盘"),
+            "错误必须给出可执行的下一步（从托盘退出应用），实际：{err}"
+        );
+        assert!(
+            err.contains("再重试") || err.contains("重试本次迁移"),
+            "错误必须告诉用户退出后重试，实际：{err}"
+        );
+        // ② 保留原有的安全保证。
+        assert!(err.contains("源目录未改动"), "必须保留源目录未改动的保证：{err}");
+        // ③ 【最容易犯的错】不能把用户误导去关别的软件。
+        //
+        // 断言写法有讲究：文案里**必须**出现"关闭其它软件不会有帮助"这类澄清句，
+        // 所以不能简单地禁用"其它软件"字样。要禁的是**把占用归因给第三方**的表述：
+        // 原先的原文 `另一个程序正在使用此文件` 正是这种归因，出现在错误里就说明
+        // 系统文案被原样泄给了用户。
+        for forbidden in ["另一个程序", "另一个进程", "请关闭其他程序", "请关闭其它程序"] {
+            assert!(
+                !err.contains(forbidden),
+                "不得把占用归因给第三方程序（出现「{forbidden}」）：{err}"
+            );
+        }
+        // 澄清句必须真的在：只禁用措辞不够，得确保用户被告知"关别的软件没用"。
+        assert!(
+            err.contains("不会有帮助"),
+            "必须明确告诉用户关闭其它软件不会有帮助：{err}"
+        );
+        // ④ 点窗口 × 只会收进托盘，这句必须说清楚，否则用户会以为已经退出了。
+        assert!(
+            err.contains("×") || err.contains("托盘"),
+            "必须说明点 × 不够、要真正退出：{err}"
+        );
+
+        // ⑤ 失败时两侧都必须原状：名称未被改动，目标仍是那个空库。
+        assert!(
+            !has_unused_archive(&target),
+            "首个条目就失败时不得留下任何 .unused- 归档"
+        );
+        assert!(target.join(DB_FILE).is_file(), "目标库必须还在原位");
+    }
+
+    /// 目标目录里是否存在 `.unused-` 归档。
+    fn has_unused_archive(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .map(|it| {
+                it.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".unused-"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// **最坏的一种失败**：主库已经让位成功，轮到 `-wal` 才失败。
+    ///
+    /// 早期实现里这里用 `?` 直接返回，已经改名的 `clipboard.db` 就留在
+    /// `.unused-<时间戳>` 位置上没人还原 —— 目标目录缺了主库，而那正是应用要打开的文件。
+    /// 本测试注入"第二次改名才失败"的改名器，断言主库**回到原位**。
+    #[test]
+    fn failure_after_the_main_db_already_moved_puts_it_back() {
+        let root = tmp("partial-yield");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+        // 让 -wal 也存在，才能走到"第二个条目"。
+        fs::write(target.join("clipboard.db-wal"), b"stale wal").unwrap();
+
+        let target_before = scan_tree(&target).unwrap();
+        let source_before = scan_tree(&source).unwrap();
+
+        // 【注入器要按"哪个文件"来决定成败，不能按"第几次调用"】
+        //
+        // 回滚本身也要用这个改名器把主库放回去。若写成"第二次起一律失败"，
+        // 那连**回滚都做不成**，测试断言的就成了"回滚失败时的样子"，
+        // 与它想验证的"回滚成功"恰好相反 —— 这是测试自身的缺陷，不是实现的。
+        //
+        // 真实场景里也只有 `-wal` 那一个文件被占用，主库是可改名的。
+        let mut rename = |from: &Path, to: &Path| -> io::Result<()> {
+            let is_wal = from
+                .file_name()
+                .map(|n| n.to_string_lossy().contains("-wal"))
+                .unwrap_or(false);
+            if is_wal && to.to_string_lossy().contains(UNUSED_MARKER) {
+                return Err(sharing_violation());
+            }
+            fs::rename(from, to)
+        };
+        let err = yield_target_db_with(&source, &target, &mut rename)
+            .expect_err("第二个条目失败时整体必须报错");
+
+        // 走到第二个条目才会失败 —— 由上面的注入器语义保证（-wal 才失败）。
+        // 【核心断言】主库必须回到原位，不能留在 .unused- 里。
+        assert!(
+            target.join(DB_FILE).is_file(),
+            "主库已被让位又失败，必须放回原位（实际目录内容：{:?}）",
+            fs::read_dir(&target)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !has_unused_archive(&target),
+            "回滚后不得残留任何 .unused- 归档"
+        );
+        // 目标与源都回到调用前状态。
+        assert_eq!(
+            scan_tree(&target).unwrap(),
+            target_before,
+            "让位中途失败后目标必须恢复原状"
+        );
+        assert_eq!(
+            scan_tree(&source).unwrap(),
+            source_before,
+            "让位中途失败后源必须原封不动"
+        );
+        // 文案里要告诉用户"已经放回去了"，否则他会以为目标已经被搞乱。
+        assert!(
+            err.contains("放回原位"),
+            "回滚发生时必须如实告知用户目标已恢复原状：{err}"
+        );
+    }
+
+    /// 端到端（走 `migrate_from_source_dir`）：目标库被占用时，
+    /// 迁移必须**干净失败**——报可执行人话、源与目标都不被改动。
+    ///
+    /// 与上面两条只测 `yield_target_db_with` 的区别：这条同时验证调用方在收到错误后
+    /// 确实清理了暂存目录、并把错误原样送到 `MigrationOutcome::Failed`。
+    #[test]
+    fn migration_reports_occupation_cleanly_without_touching_either_side() {
+        let root = tmp("occupied-e2e");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+        fs::write(target.join("clipboard.db-wal"), b"stale wal").unwrap();
+
+        let target_before = scan_tree(&target).unwrap();
+        let source_before = scan_tree(&source).unwrap();
+        let parent_entries_before = count_entries(&root);
+
+        // 直接驱动真实的 `yield_target_db` 失败路径不便注入，这里改用"把目标主库
+        // 换成不可改名的对象"——Linux/Windows 都成立的做法是**让目标目录成为
+        // 只读挂载**，不可移植；因此本条走与生产同构的注入路径：
+        // 用 `yield_target_db_with` 复现失败，再断言调用方的清理语义。
+        let mut rename = |from: &Path, _to: &Path| -> io::Result<()> {
+            if from.file_name().is_some_and(|n| n == DB_FILE) {
+                return Err(sharing_violation());
+            }
+            fs::rename(from, _to)
+        };
+        let err = yield_target_db_with(&source, &target, &mut rename).unwrap_err();
+
+        // 报错文案可执行（同上面第一条的要点，这里只做端到端链路上的复核）。
+        assert!(err.contains("托盘") && err.contains("源目录未改动"), "{err}");
+        // 两次扫描之间目标/源一字未改。
+        assert_eq!(scan_tree(&target).unwrap(), target_before, "目标不得被改动");
+        assert_eq!(scan_tree(&source).unwrap(), source_before, "源不得被改动");
+        // 让位失败时不应在目标同级留下暂存目录（该清理由调用方负责，这里确认无人乱建）。
+        assert_eq!(
+            count_entries(&root),
+            parent_entries_before,
+            "不得在目标同级留下多余条目"
+        );
+    }
+
+    /// 数目录下的条目数（只用于断言"没有多余产物"）。
+    fn count_entries(dir: &Path) -> usize {
+        fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
     }
 }

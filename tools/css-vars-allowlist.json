@@ -30,16 +30,14 @@
       "name": "--bg-main",
       "reason": "别名，非缺陷。使用点全部写成 var(--bg-main, var(--bg-element))，兜底是项目既有语义令牌 --bg-element（卡片/内嵌表面底色），因此缺变量时样式照常生效。它出现在 BackupListModal / DataSettingsGroup 的中性徽标上，语义就是「与卡片底同色的一小块」——没有为新名字补定义的必要，就地映射会改动那两处被排除的文件。",
       "sites": [
-        "src/features/settings/components/BackupListModal.tsx:428",
-        "src/features/settings/components/groups/DataSettingsGroup.tsx:812"
+        "src/features/settings/components/groups/DataSettingsGroup.tsx:812",
+        "src/styles/components/auto-backup.css:276"
       ]
     },
     {
       "name": "--border-color",
       "reason": "别名，非缺陷。所有使用点都带 fallback（rgba(128,128,128,0.25/0.3/0.35)），是一条中性灰描边，在六套主题下都可见且已与相邻控件视觉一致。注意调用方自己在括号外拼了 `1px solid`，所以这里不能换成项目里已含宽度与样式的 --line-soft/--panel-border，否则会变成 `1px solid 1px solid ...` 而整条失效——这恰恰是本次要避免的那类静默丢弃。",
       "sites": [
-        "src/features/settings/components/BackupListModal.tsx:396",
-        "src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:235",
         "src/features/settings/components/groups/DataSettingsGroup.tsx:792",
         "src/features/settings/components/groups/DataSettingsGroup.tsx:860",
         "src/features/settings/components/groups/DataSettingsGroup.tsx:893",
@@ -49,7 +47,8 @@
         "src/features/settings/components/groups/McpSettingsGroup.tsx:301",
         "src/features/settings/components/groups/McpSettingsGroup.tsx:390",
         "src/features/settings/components/groups/McpSettingsGroup.tsx:543",
-        "src/features/settings/components/groups/McpSettingsGroup.tsx:577"
+        "src/features/settings/components/groups/McpSettingsGroup.tsx:577",
+        "src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:235"
       ]
     },
     {
@@ -71,7 +70,9 @@
     {
       "name": "--tags-border-color",
       "reason": "别名，非缺陷。唯一使用点写成 var(--tags-border-color, rgba(128,128,128,0.24))，兜底的中性灰描边一直生效，「新建标签」的虚线芯片在六套主题下都可见。项目里同族的 --tag-chip-border 语义更贴（实体芯片描边），但两者颜色与粗细不同：换过去会让这个虚线占位芯片的描边颜色随主题变化，是观感改动而非缺陷修复，因此保留原样。",
-      "sites": ["src/styles/components/tag-assign.css:108"]
+      "sites": [
+        "src/styles/components/tag-assign.css:108"
+      ]
     },
     {
       "name": "--danger-color",
@@ -85,12 +86,16 @@
     {
       "name": "--input-bg",
       "reason": "别名，非缺陷。唯一使用点写成 var(--input-bg, var(--bg-input))，兜底就是项目既有语义令牌 --bg-input，缺变量时输入框底色照常生效。",
-      "sites": ["src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:236"]
+      "sites": [
+        "src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:236"
+      ]
     },
     {
       "name": "--text-color",
       "reason": "别名，非缺陷。唯一使用点写成 var(--text-color, var(--text-primary))，兜底就是项目既有语义令牌 --text-primary，缺变量时文字颜色照常生效。",
-      "sites": ["src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:237"]
+      "sites": [
+        "src/features/settings/components/groups/AutoBackupSettingsGroup.tsx:237"
+      ]
     }
   ]
 }

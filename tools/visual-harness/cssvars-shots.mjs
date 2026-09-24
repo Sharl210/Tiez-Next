@@ -7,7 +7,7 @@
  * 数字需要一处可肉眼核对的落点：当量测说"更新确认框修前无背景"时，
  * 对应的 PNG 应当能直接看出那块面板是透的。
  */
-import pw from "/root/Tiez-Next/node_modules/playwright-core/index.js";
+import pw from "../../node_modules/playwright-core/index.js";
 const { chromium } = pw;
 import http from "node:http";
 import fs from "node:fs";

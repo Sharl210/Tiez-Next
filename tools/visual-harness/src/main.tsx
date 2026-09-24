@@ -2,20 +2,28 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { HelpCircle } from "lucide-react";
 
-// ---- 真实样式，与 main.tsx 的加载顺序一致 ----
-import "/root/Tiez-Next/src/index.css";
-import "/root/Tiez-Next/src/styles/components/index.css";
+// ---- 真实样式，与 src/main.tsx 的加载顺序一字不差 ----
+// src/main.tsx 的顺序是：index.css → styles/components/index.css → styles/themes/load。
+// 【本台曾经漏了第三行】漏掉它时页面只剩 `base.css` 的默认变量：`theme-mica` /
+// `theme-paper` / `dark-mode` 这些类挂到根元素上也不产生任何效果。于是 `?theme=xxx`
+// 参数看着在生效，实际六套主题量到的全是同一组 base 值（实测：`--bg-button` 在
+// mica / paper / acrylic / sakura / retro / sticky-note 下都返回 base 的
+// `rgba(255, 255, 255, .76)`）。"跨主题一致性"这类缺陷正是靠多主题遍历发现的，
+// 主题样式没加载 = 遍历无效，量出来的"一致"是假的。因此这行不能省。
+import "../../../src/index.css";
+import "../../../src/styles/components/index.css";
+import "../../../src/styles/themes/load";
 // 自定义右键菜单的样式是「按需 import」的（TagManager.tsx 里那行），
 // 备份列表的菜单复用同一套类名，因此这里也必须把它加载进来。
-import "/root/Tiez-Next/src/styles/components/tag-group-menu.css";
+import "../../../src/styles/components/tag-group-menu.css";
 
 // ---- 真实组件（一字未改）----
-import AutoBackupSettingsGroup from "/root/Tiez-Next/src/features/settings/components/groups/AutoBackupSettingsGroup";
-import DataSettingsGroup from "/root/Tiez-Next/src/features/settings/components/groups/DataSettingsGroup";
-import BackupListModal from "/root/Tiez-Next/src/features/settings/components/BackupListModal";
+import AutoBackupSettingsGroup from "../../../src/features/settings/components/groups/AutoBackupSettingsGroup";
+import DataSettingsGroup from "../../../src/features/settings/components/groups/DataSettingsGroup";
+import BackupListModal from "../../../src/features/settings/components/BackupListModal";
 
 // ---- 真实文案（不做任何子集裁剪）----
-import { translations } from "/root/Tiez-Next/src/locales";
+import { translations } from "../../../src/locales";
 
 /**
  * 组件级视觉验证台。

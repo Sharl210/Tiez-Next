@@ -1,4 +1,4 @@
-import pw from "/root/Tiez-Next/node_modules/playwright-core/index.js";
+import pw from "../../node_modules/playwright-core/index.js";
 const { chromium } = pw;
 import http from "node:http";
 import fs from "node:fs";

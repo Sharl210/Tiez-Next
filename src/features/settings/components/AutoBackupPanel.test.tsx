@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { act, createElement } from "react";
+import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import AutoBackupSettingsGroup from "./groups/AutoBackupSettingsGroup";
 import BackupListModal, { type AutoBackupListPayload } from "./BackupListModal";
@@ -178,6 +178,69 @@ const mountModal = async () => {
   });
   await flush();
 };
+
+/**
+ * 挂载悬浮窗，并**故意每轮渲染都传一个新的 `onLoaded`**。
+ *
+ * 这正是父组件 `AutoBackupSettingsGroup` 的真实写法（内联箭头函数），也是当年那个
+ * 无限刷新循环的起点。用一个稳定的函数挂载会让本组测试失去判别力——它测不到循环。
+ */
+const mountModalWithUnstableOnLoaded = async () => {
+  await act(async () => {
+    root.render(
+      createElement(BackupListModal, {
+        open: true,
+        t,
+        theme: "light",
+        onClose: () => {},
+        // 【必须内联】每次 render() 都新建一个函数引用，模拟父组件重渲染。
+        onLoaded: () => {
+          reRenders += 1;
+        },
+      })
+    );
+  });
+  await flush();
+};
+
+/** 供上面那个不稳定回调累加"父组件第几次收到通知"。 */
+let reRenders = 0;
+
+/**
+ * **完整闭环**的最小复现：一个持有 state 的父组件，把 `onLoaded` 写成内联箭头函数，
+ * 并在回调里 `setState`。
+ *
+ * # 为什么必须有它（而不是只传一个不稳定的函数）
+ *
+ * 只把 `onLoaded` 传成新的内联函数，并**不足以**复现用户看到的循环 —— 因为闭环的
+ * 最后一环是「回调修改父组件状态 → 父组件重渲染 → 生成新的内联函数」。少了这一环，
+ * `refresh` 重建后没有任何东西会让它再次重建，循环自然不成立，测试也就抓不到它
+ * （实测：只传不稳定函数的版本在**修复前**的旧代码上也会通过 —— 那种测试是假的）。
+ *
+ * 这里 `setSummary` 每次写入一个新对象字面量，与
+ * `AutoBackupSettingsGroup.tsx` 里那段 `setSummary({ total, pinned, bytes })`
+ * 逐字同构：新对象引用 → React 必然重渲染 → 必然产出新的内联 `onLoaded`。
+ */
+const ParentHarness = () => {
+  const [, setSummary] = useState<{ total: number; pinned: number; bytes: number } | null>(null);
+  return createElement(BackupListModal, {
+    open: true,
+    t,
+    theme: "light",
+    onClose: () => {},
+    onLoaded: (p: AutoBackupListPayload) => {
+      summaryWrites += 1;
+      setSummary({
+        total: p.totalCount,
+        pinned: p.pinnedCount,
+        bytes: p.entries.reduce((sum, e) => sum + e.sizeBytes, 0),
+      });
+    },
+  });
+};
+
+/** 父组件被回调写入了多少次（每次写入都会引发一轮父渲染）。 */
+let summaryWrites = 0;
 
 const rowByName = (name: string): HTMLElement => {
   const el = container.querySelector<HTMLElement>(`[data-backup-row="${name}"]`);
@@ -602,5 +665,157 @@ describe("Tauri 命令参数契约", () => {
     expect(call![1]).toHaveProperty("appVersion");
     // 版本查询失败也不能让按钮点不动：这里必须是字符串（允许空串）。
     expect(typeof (call![1] as { appVersion: unknown }).appVersion).toBe("string");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 无限刷新循环（用户原话："里面的刷新按钮一直在闪烁"）
+// ---------------------------------------------------------------------------
+
+/**
+ * # 为什么必须单独锁住这一条
+ *
+ * 用户反馈的"刷新按钮一直在闪烁"不是动画问题，而是**每帧都在重新请求后端**。
+ * 闭环是：
+ *
+ *   ① 父组件把 `onLoaded` 写成内联箭头函数 → 每次父渲染都是新引用
+ *   ② `refresh = useCallback(…, [explain, onLoaded])` → onLoaded 变则 refresh 重建
+ *   ③ `useEffect(() => { if (open) void refresh() }, [open, refresh])` → 重跑
+ *   ④ refresh 里调 `onLoaded?.(data)` → 父组件 setState → 回到 ①
+ *
+ * 它有三个"看起来已经修好了"的假象，所以只靠截图或 DOM 断言抓不到：
+ *   - `open` 没变，effect 的"打开时加载一次"意图看着仍然成立
+ *   - `loading` 在 true/false 之间来回，图标切换像极了动画在跑
+ *   - 单次渲染下 `invoke` 确实只被调一次（要"再渲染一次"才暴露）
+ *
+ * 因此这里的判据是**调用次数**：在"父组件每轮都重建 onLoaded"的条件下挂载并
+ * 多轮 flush，`list_auto_backups` 必须恰好被调用 1 次，且此后不再增长。
+ * 在旧代码（依赖数组里含 `onLoaded`）上这条会失败——那时每次 setPayload 都会
+ * 触发下一轮，次数持续增长（实测 3 轮 flush 后达到 8 次以上，见报告）。
+ */
+describe("无限刷新循环", () => {
+  /** 统计 `list_auto_backups` 被调用的次数。 */
+  const listCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "list_auto_backups").length;
+
+  it("父组件在 onLoaded 里 setState 时，list_auto_backups 仍只调用 1 次（不进入刷新循环）", async () => {
+    // 这条是缺陷 1 的主判据，用的是**完整闭环**的 harness：
+    // 父组件持有 state，onLoaded 是内联函数且会 setState。
+    summaryWrites = 0;
+    await act(async () => {
+      root.render(createElement(ParentHarness));
+    });
+
+    // 首轮：挂载 → open=true → refresh → invoke → onLoaded → 父 setState → 父渲染。
+    // 到这里为止 1 次 invoke 是**正确**行为（本来就应该加载一次）。
+    expect(listCalls()).toBe(1);
+
+    // 关键：不再手动重渲染。若仍有循环，它会靠"父 setState → 新 onLoaded →
+    // refresh 重建 → effect 重跑"自行继续。多轮 flush 给它充分机会。
+    await flush();
+    await flush();
+    await flush();
+
+    // 修好后：次数恒为 1，且父组件只被写入了 1 次。
+    // 修复前（refresh 依赖里含 onLoaded）：每轮 setState 都会掀起下一轮，
+    // 次数随 flush 次数增长（实测 3 轮后达到 6–8 次）。
+    expect(listCalls()).toBe(1);
+    expect(summaryWrites).toBe(1);
+  });
+
+  it("父组件每轮都新建 onLoaded 时，list_auto_backups 仍只调用 1 次（不进入刷新循环）", async () => {
+    reRenders = 0;
+    await mountModalWithUnstableOnLoaded();
+
+    // 这一条是上面那条的"弱化版"：只给不稳定的 onLoaded，父组件不做 setState。
+    // 它单独不足以抓住循环（缺闭环最后一环），但能守住"refresh 的身份不随
+    // onLoaded 变化"这一半，且能在 `refresh` 被别处高频调用时报警。
+    expect(listCalls()).toBe(1);
+    await flush();
+    await flush();
+    expect(listCalls()).toBe(1);
+  });
+
+  it("onLoaded 拿到的始终是最新那个回调（换掉回调后能读到新值，不是过期闭包）", async () => {
+    // 这条与上一条互补：上一条防"循环"，这一条防"为了断循环而写死 ref 初值"
+    // （`useRef(onLoaded)` 那种写法会让回调永远停在第一版上）。
+    const seen: number[] = [];
+    const render = (mark: number) =>
+      root.render(
+        createElement(BackupListModal, {
+          open: true,
+          t,
+          theme: "light",
+          onClose: () => {},
+          onLoaded: (p: AutoBackupListPayload) => {
+            seen.push(mark);
+            // 顺带证明载荷是真的传下来了，回调不是被空调用。
+            expect(p.totalCount).toBe(ENTRIES.length);
+          },
+        })
+      );
+
+    await act(async () => {
+      render(1);
+    });
+    await flush();
+    expect(seen).toEqual([1]);
+
+    // 换一个新回调（新引用）并**触发一次真正的刷新**（点刷新按钮）。
+    // 若 refresh 闭包里捕获的是旧回调，这里推入的会是 1 而不是 2。
+    await act(async () => {
+      render(2);
+    });
+    await flush();
+
+    const refreshBtn = container.querySelector<HTMLButtonElement>("[data-backup-refresh]");
+    expect(refreshBtn).not.toBeNull();
+    await click(refreshBtn);
+
+    expect(seen).toContain(2);
+    // 且不该因为一次点击又跑出循环（总共 1 次挂载 + 1 次点击 = 2 次）。
+    expect(listCalls()).toBe(2);
+  });
+
+  it("刷新中显示**带动画的** Loader2（补 animate-spin 的那一处）", async () => {
+    // 用户看到的"闪"还有一个次要成因：`<Loader2 size={12} />` 缺 `animate-spin`
+    // （该动画定义在 `ai.css`），于是"刷新中"只表现为两个图标来回换，而不是一个
+    // 转动的 loader。这里用**挂起的 Promise** 把 loading 态真正冻住再断言，
+    // 否则 mock 立刻 resolve，loading 一闪而过，断言会恒真。
+    //
+    // `hold` 在挂载完成后才打开，因此挂载那次（第 1 次调用）立即返回，
+    // 组件处于静止态；打开后下一次调用会卡在 `gate` 上，把 loading 真正冻住。
+    let hold = false;
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((r) => {
+      release = () => r();
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_auto_backups") {
+        if (hold) await gate;
+        return listPayload();
+      }
+      if (cmd === "get_auto_backup_config") return CONFIG;
+      return undefined;
+    });
+
+    await mountModal();
+    const refreshBtn = container.querySelector<HTMLButtonElement>("[data-backup-refresh]")!;
+    // 静止态（挂载那次已 resolve）：RefreshCw，不带动画类。
+    // 这条对照很重要——它证明"能查到 animate-spin"不是因为图标一直挂着。
+    expect(refreshBtn.querySelector("svg.animate-spin")).toBeNull();
+
+    // 点击刷新：必须同步进入 loading 态，并渲染**带 animate-spin** 的 Loader2。
+    hold = true;
+    await act(async () => {
+      refreshBtn.click();
+    });
+    expect(refreshBtn.querySelector("svg.animate-spin")).not.toBeNull();
+
+    await act(async () => {
+      release?.();
+    });
+    await flush();
+    // 收尾：放行后回到静止态。
+    expect(refreshBtn.querySelector("svg.animate-spin")).toBeNull();
   });
 });
