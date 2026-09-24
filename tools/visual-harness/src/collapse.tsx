@@ -56,6 +56,22 @@ const theme = params.get("theme") ?? "mica";
 const colorMode = params.get("colorMode") ?? "light";
 const compactMode = params.get("compact") === "1";
 const openEditor = params.get("open") ?? "";
+
+/** 标签编辑态：`?tagopen=1&tagquery=i` —— 供标签候补浮层的量测使用。 */
+const tagOpen = params.get("tagopen") === "1";
+const tagQuery = params.get("tagquery") ?? "";
+
+/**
+ * 量测用的标签池。
+ *
+ * 刻意给足 40 条、且多条包含同一个字母：候补列表的**可见高度上限是 4 行**，
+ * 若池子太小，"超出可滚动"这条根本量不到（列表本身就填不满 4 行），
+ * 于是"限高失效"这类缺陷会被假绿掩盖。
+ */
+const HARNESS_TAG_POOL = [
+  "ims", "img", "invoice", "ims配置", "ims下发", "image",
+  ...Array.from({ length: 34 }, (_, i) => `tag-${i}`),
+];
 const onlyCase = params.get("case") ?? "";
 
 /** 与 `App.tsx` 的 `t` 同一约定：查不到就返回键名本身。 */
@@ -199,8 +215,10 @@ const Row = ({ spec }: { spec: CaseSpec }) => {
         windowPinned={false}
         isSensitiveHidden={false}
         isRevealed={true}
-        isEditingTags={false}
-        tagInput=""
+        isEditingTags={tagOpen}
+        tagInput={tagQuery}
+        tagSuggestions={tagOpen ? HARNESS_TAG_POOL : []}
+        onTagPick={tagOpen ? noop : undefined}
         theme={theme}
         language={lang}
         t={t}

@@ -732,6 +732,11 @@ export const translations = {
         edit_item_note_clear_hint: "清空输入框即可删除备注",
         edit_item_binary_notice: "此条目保存的是文件路径或图片数据，正文不可编辑，但可以编辑备注。",
         edit_item_rich_text_warning: "富文本条目保存后会被降级为纯文本，原有格式（HTML）将被清除，且无法撤销。",
+        // R12：编辑弹窗拆成「编辑内容」与「编辑备注」两个按钮后，两个弹窗的标题
+        // 必须各自说清改的是哪一样，否则用户分不清自己点进了哪个入口。
+        // `edit_item`（"编辑条目内容"）保持不动：主页面仍在用它。
+        edit_item_body_title: "编辑条目内容",
+        edit_item_note_title: "编辑备注",
         confirm_delete_tag_scope: "将解除 {count} 条条目与该分组的关联；条目本身会保留，不会被删除。",
         input_content_placeholder: "在此处输入条目内容...",
         save: "保存",
@@ -1498,6 +1503,9 @@ export const translations = {
         edit_item_note_clear_hint: "Clear the field to remove the note",
         edit_item_binary_notice: "This entry stores a file path or image data, so its body cannot be edited. The note can still be edited.",
         edit_item_rich_text_warning: "Saving a rich-text entry converts it to plain text and clears its formatting (HTML). This cannot be undone.",
+        // R12: the two editors are separate entries now, so they need separate titles.
+        edit_item_body_title: "Edit Item Content",
+        edit_item_note_title: "Edit Note",
         confirm_delete_tag_scope: "{count} entries will be unlinked from this group. The entries themselves are kept and will not be deleted.",
         input_content_placeholder: "Enter item content here...",
         save: "Save",
@@ -2267,6 +2275,9 @@ export const translations = {
         edit_item_note_clear_hint: "清空輸入框即可刪除備註",
         edit_item_binary_notice: "此條目儲存的是檔案路徑或圖片資料，正文不可編輯，但可以編輯備註。",
         edit_item_rich_text_warning: "富文本條目儲存後會被降級為純文字，原有格式（HTML）將被清除，且無法復原。",
+        // R12：兩個編輯入口拆開後，彈窗標題要各自說清改的是哪一樣。
+        edit_item_body_title: "編輯條目內容",
+        edit_item_note_title: "編輯備註",
         confirm_delete_tag_scope: "將解除 {count} 條條目與此分組的關聯；條目本身會保留，不會被刪除。",
         input_content_placeholder: "在此處輸入條目內容...",
         save: "儲存",

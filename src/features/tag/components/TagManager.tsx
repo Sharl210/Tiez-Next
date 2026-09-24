@@ -4,10 +4,15 @@ import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
     Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
-    Sparkles, AlertTriangle
+    Sparkles, AlertTriangle, StickyNote
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
+import {
+    isBodyEditable,
+    isNoteEditable,
+    MAX_ENTRY_NOTE_CHARS,
+} from "../../clipboard/types";
 import TagGroupContextMenu from "./TagGroupContextMenu";
 import "../../../styles/components/tag-group-menu.css";
 
@@ -32,14 +37,76 @@ interface TagInfo {
     count: number;
 }
 
-/** R4: content types whose `content` is a path or a data URL, not editable text. */
-const BINARY_CONTENT_TYPES = ['image', 'file', 'video'];
+/**
+ * 标签管理页卡片的「编辑内容 / 编辑备注」按钮可见性。
+ *
+ * # 为什么这两个判据必须从 `features/clipboard/types` 引入，而不是本文件自己写一份
+ *
+ * 本文件原来自带一套 `BINARY_CONTENT_TYPES = ['image','file','video']` 和一个自实现的
+ * 二元判据函数。它与主页面用的判据**不等价**：
+ *
+ *   - `isNoteEditable` 是"可编辑正文类型的**补集**"，所以 `emoji_sync`、
+ *     以及后端将来新增的任何类型，**都**算它命中；
+ *   - 那套自实现的判据是只含三个类型的白名单，上述类型**都落空**。
+ *
+ * 于是同一个条目在主页面有备注按钮、在标签管理页没有 —— v0.5.4 已经因为
+ * "两处各写一套判据"踩过一次这个分叉，这里不再重复。
+ *
+ * # 为什么 `canEditNote` 是"两个判据的并集"，而不是 `isNoteEditable` 单独一个
+ *
+ * 用户的要求是「编辑备注内容**每个条目都要有这个按钮**」，而 `isNoteEditable`
+ * 按定义把 `text` / `code` / `url` / `rich_text` 排除在外（实测这四个返回 `false`）——
+ * 单独用它，这四类条目就**没有**备注入口，直接违背这句话。
+ *
+ * 另一条路是复制 `EDITABLE_BODY_TYPES` 的清单自己判，那正是本注释开头说的分叉。
+ * 所以这里取两个**同源**判据的并集：`isBodyEditable` 命中 → 它有正文入口，
+ * 但它**仍然需要一个独立的备注入口**（两个按钮是分开的）；`isNoteEditable` 命中 →
+ * 它只有备注入口。两者合起来 = 每一条都有备注入口，且不新增任何本地清单。
+ */
+export const resolveCardEditActions = (contentType: string | undefined | null) => {
+    const type = contentType ?? '';
+    return {
+        /** 「编辑内容」按钮：只有正文是文本的类型才显示（白名单，未预见的类型不获得正文写入口）。 */
+        canEditBody: isBodyEditable(type),
+        /**
+         * 「编辑备注」按钮：**每个条目**都显示。
+         *
+         * 直接用同源判据，不做 `|| isBodyEditable(type)` 的补丁 —— `isNoteEditable`
+         * 本身已经是恒真（备注是条目元数据，与内容类型无关）。在这里再或一次，
+         * 会让"备注为什么显示"这件事有两个来源，下次任一边改动就会出现第三种组合。
+         */
+        canEditNote: isNoteEditable(type),
+    };
+};
 
-const isBinaryContentType = (contentType: string | undefined | null) =>
-    !!contentType && BINARY_CONTENT_TYPES.includes(contentType);
+/** 卡片编辑弹窗的两种模式：只改正文，或只改备注。 */
+export type CardEditMode = 'body' | 'note';
 
-/** R6: mirror of `MAX_ENTRY_NOTE_CHARS` in `clipboard_repo.rs`. */
-const MAX_NOTE_CHARS = 2000;
+/**
+ * 编辑弹窗的保存计划 —— 抽成纯函数，好让"备注弹窗绝不会写正文"这条不变量
+ * 可以被直接断言，而不是只能靠"界面上没渲染那个输入框"间接推断。
+ *
+ * 两个写入**各自受自己的模式门控**：
+ *   - `body` 模式只可能写正文，`note` 模式只可能写备注；
+ *   - 再叠加脏检查，避免"打开就保存"也发一次没有意义的写命令。
+ *
+ * 只靠脏检查是不够的：`note` 模式里 `content` 与 `originalContent` 恒等，
+ * 于是把模式门控删掉也"看起来没错"，直到某天弹窗开始预填正文草稿为止。
+ * 所以门控必须显式存在，并由单测直接钉住。
+ */
+export const resolveEditSavePlan = (edit: {
+    mode: CardEditMode;
+    content: string;
+    note: string;
+    originalContent: string;
+    originalNote: string;
+}): { writeBody: boolean; writeNote: boolean } => ({
+    writeBody: edit.mode === 'body' && edit.content !== edit.originalContent,
+    writeNote: edit.mode === 'note' && edit.note !== edit.originalNote,
+});
+
+/** R6: mirror of `MAX_ENTRY_NOTE_CHARS`（与主页面共用同一常量，不再各自写 2000）。 */
+const MAX_NOTE_CHARS = MAX_ENTRY_NOTE_CHARS;
 
 /**
  * R3: the one built-in tag name that a feature actually produces.
@@ -424,14 +491,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     }, []);
     const [isCreatingItem, setIsCreatingItem] = useState(false);
     /**
-     * R4/R6: the edit dialog now serves every content type. `originalContent` /
-     * `originalNote` are kept so saving only issues the commands for what actually
-     * changed — firing `update_item_content` on an untouched body would otherwise
-     * be a no-op that still emits a refresh, and `update_entry_note` on an untouched
-     * note would rewrite the row for nothing.
+     * R4/R6/R12: the edit dialog serves every content type, in one of **two modes**.
+     *
+     * `mode` is what keeps the two features from drifting into each other: a body
+     * editor renders only the body field and only ever writes the body; a note editor
+     * renders only the note field and only ever writes the note. `originalContent` /
+     * `originalNote` are still kept so each mode can skip a write it did not change
+     * (an untouched `update_item_content` would be a no-op that still emits a refresh).
      */
     const [editingItem, setEditingItem] = useState<{
         id: number;
+        mode: CardEditMode;
         content: string;
         note: string;
         contentType: string;
@@ -876,35 +946,34 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     /**
-     * R4/R6: save the edit dialog.
+     * R4/R6/R12: save the edit dialog — **only the field its mode owns**.
      *
-     * Two independent writes:
-     *   - the *note* is sent for every content type, because a note is entry
-     *     metadata and never touches `content`;
-     *   - the *body* is sent only for text-like types. For `image` / `file` /
-     *     `video` the body is a path or a data URL, so the textarea is not rendered
-     *     for them and this branch is unreachable from the UI; the back end rejects
-     *     it as well (`update_entry_content` → `is_binary_content_type`), so a stale
-     *     caller cannot corrupt a row either.
+     * # 为什么必须按模式分开写，而不是"哪个变了就写哪个"
      *
-     * Each write is guarded by a dirty check so opening the dialog and pressing save
-     * does not emit a pointless `clipboard-changed` round trip.
+     * 上一版是一个弹窗同时渲染正文与备注，保存时对两者各做一次脏检查。本轮把它们
+     * 拆成两个按钮／两种模式之后，"备注弹窗顺手保存正文"就成了必须堵死的回归：
+     * 用户点「编辑备注」时并不打算碰正文，一旦保存路径仍按脏检查走，任何让正文草稿
+     * 与原文不一致的情形（预填、格式化、未来新增的字段同步）都会**静默重写正文**。
+     *
+     * 所以写入由 `resolveEditSavePlan` 按模式门控：`body` 模式最多写正文，
+     * `note` 模式最多写备注。脏检查只在其上叠加，用来省掉没有意义的写命令。
      */
     const handleSaveItem = async () => {
         if (!editingItem) return;
-        const { id, contentType, content, note, originalContent, originalNote } = editingItem;
-        const isBinary = isBinaryContentType(contentType);
-        const bodyChanged = !isBinary && content !== originalContent;
-        const noteChanged = note !== originalNote;
-
-        if (bodyChanged && !content.trim()) return;
+        const plan = resolveEditSavePlan(editingItem);
+        if (!plan.writeBody && !plan.writeNote) {
+            setEditingItem(null);
+            return;
+        }
+        // 正文不允许被清空（备注可以，清空即删除备注）。
+        if (plan.writeBody && !editingItem.content.trim()) return;
 
         try {
-            if (bodyChanged) {
-                await invoke('update_item_content', { id, newContent: content });
+            if (plan.writeBody) {
+                await invoke('update_item_content', { id: editingItem.id, newContent: editingItem.content });
             }
-            if (noteChanged) {
-                await invoke('update_entry_note', { id, note });
+            if (plan.writeNote) {
+                await invoke('update_entry_note', { id: editingItem.id, note: editingItem.note });
             }
             setEditingItem(null);
             if (selectedTag) await loadTagItems(selectedTag);
@@ -912,16 +981,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     /**
-     * R6: open the quick note editor for one card.
+     * R4/R6/R12: open the edit dialog for one card, in exactly one mode.
      *
-     * The dialog is shared with the body editor (R4), so this seeds it with the
-     * entry's current body and note and lets the user change either. Keeping one
-     * dialog means the two features cannot drift apart in behaviour.
+     * Both fields are seeded with the entry's real values so the dialog never shows a
+     * stale or blank draft; the *mode* then decides which one is rendered and which
+     * one the save path is allowed to write.
      */
-    const openItemEditor = (item: ClipboardEntry) => {
+    const openItemEditor = (item: ClipboardEntry, mode: CardEditMode) => {
         const note = item.note || '';
         setEditingItem({
             id: item.id,
+            mode,
             content: item.content,
             note,
             contentType: item.content_type,
@@ -1320,7 +1390,10 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                         <div className="status-msg">{selectedTag ? t('no_items') : t('select_tag_to_begin')}</div>
                     ) : (
                         <div className={`items-${viewMode} ${isManageMode ? 'manage-mode' : ''}`}>
-                            {sortedItems.map(item => (
+                            {sortedItems.map(item => {
+                                // R12: 每张卡的按钮可见性只算一次，且判据与主页面同源。
+                                const editActions = resolveCardEditActions(item.content_type);
+                                return (
                                 <div
                                     key={item.id}
                                     className={`themed-card ${selectedItemIds.has(item.id) ? 'selected' : ''}`}
@@ -1345,19 +1418,44 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                                 </div>
                                             ) : (
                                                 <>
-                                                    {/* R4: the edit entry point is offered for every
-                                                        content type. For text-like bodies the dialog edits
-                                                        the text; for image/file/video it edits the note and
-                                                        the body field is not rendered, because those rows
-                                                        store a path or a data URL in `content`. */}
-                                                    <button className="card-action-btn" title={t('edit_item')} onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        openItemEditor(item);
-                                                    }}>
-                                                        <Edit2 size={10} />
-                                                    </button>
+                                                    {/* R12: 两个**独立**的编辑入口，可见性由共享判据决定
+                                                        （`resolveCardEditActions` → `isBodyEditable` /
+                                                        `isNoteEditable`）：
+                                                          - 「编辑内容」只有正文是文本的类型才有
+                                                            （`text`/`code`/`url`/`rich_text`）；
+                                                          - 「编辑备注」**每个条目**都有 ——
+                                                            `emoji_sync` 与未预见的类型同样包含在内。
+                                                        两个按钮各自只开自己那种模式的弹窗，也各自只写
+                                                        自己那一个字段（见 `handleSaveItem`）。 */}
+                                                    {editActions.canEditBody && (
+                                                        <button
+                                                            className="card-action-btn"
+                                                            data-testid="card-edit-body"
+                                                            title={t('edit_item')}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                openItemEditor(item, 'body');
+                                                            }}
+                                                        >
+                                                            <Edit2 size={10} />
+                                                        </button>
+                                                    )}
+                                                    {editActions.canEditNote && (
+                                                        <button
+                                                            className="card-action-btn"
+                                                            data-testid="card-edit-note"
+                                                            title={t('edit_item_note_label')}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                openItemEditor(item, 'note');
+                                                            }}
+                                                        >
+                                                            <StickyNote size={10} />
+                                                        </button>
+                                                    )}
                                                     <button
                                                         className="card-action-btn"
+                                                        data-testid="card-open"
                                                         onClick={(e) => {
                                                             e.stopPropagation();
                                                             invoke('open_content', {
@@ -1414,7 +1512,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                         <div className="meta-usage"><MousePointer2 size={8} /> {item.use_count || 0}</div>
                                     </div>
                                 </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
                 </div>
@@ -1558,21 +1657,20 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 </div>
             )}
 
-            {/* Edit Item Modal */}
+            {/* Edit Item Modal —— R12：两种模式，**各自只渲染自己那一个字段**。
+                「编辑内容」进来只看得到正文，「编辑备注」进来只看得到备注框；
+                标题、正文与保存路径都由 `editingItem.mode` 决定，两个入口不会
+                再共用同一个把两样东西混在一起的弹窗。 */}
             {editingItem && (
                 <div className="modal-overlay" onClick={() => setEditingItem(null)}>
-                    <div className={`confirm-dialog tag-manager-dialog theme-${theme}`} onClick={e => e.stopPropagation()}>
-                        <h3>{t('edit_item')}</h3>
+                    <div
+                        className={`confirm-dialog tag-manager-dialog theme-${theme}`}
+                        data-testid={`item-editor-${editingItem.mode}`}
+                        onClick={e => e.stopPropagation()}
+                    >
+                        <h3>{t(editingItem.mode === 'note' ? 'edit_item_note_title' : 'edit_item_body_title')}</h3>
 
-                        {/* R4: the body field is rendered only for text-like content.
-                            For image/file/video the row stores a path or a data URL, so
-                            editing it as text would break the reference; the dialog then
-                            offers the note alone instead of a disabled field. */}
-                        {isBinaryContentType(editingItem.contentType) ? (
-                            <p className="edit-item-body-notice">
-                                {t('edit_item_binary_notice')}
-                            </p>
-                        ) : (
+                        {editingItem.mode === 'body' ? (
                             <div className="modal-input-field">
                                 <label className="edit-item-label">{t('edit_item_content_label')}</label>
                                 <textarea
@@ -1592,25 +1690,31 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                     </p>
                                 )}
                             </div>
-                        )}
-
-                        {/* R6: the note is editable for every content type and is written
-                            through its own command, so it never touches the body. */}
-                        <div className="modal-input-field">
-                            <label className="edit-item-label">{t('edit_item_note_label')}</label>
-                            <textarea
-                                className="tag-manager-textarea note-textarea"
-                                value={editingItem.note}
-                                placeholder={t('edit_item_note_placeholder')}
-                                maxLength={MAX_NOTE_CHARS}
-                                onChange={e => setEditingItem({ ...editingItem, note: e.target.value })}
-                                onKeyDown={e => e.stopPropagation()}
-                            />
-                            <div className="edit-item-note-meta">
-                                <span>{t('edit_item_note_clear_hint')}</span>
-                                <span>{editingItem.note.length} / {MAX_NOTE_CHARS}</span>
+                        ) : (
+                            <div className="modal-input-field">
+                                <label className="edit-item-label">{t('edit_item_note_label')}</label>
+                                <textarea
+                                    className="tag-manager-textarea note-textarea"
+                                    value={editingItem.note}
+                                    placeholder={t('edit_item_note_placeholder')}
+                                    maxLength={MAX_NOTE_CHARS}
+                                    onChange={e => setEditingItem({ ...editingItem, note: e.target.value })}
+                                    onKeyDown={e => e.stopPropagation()}
+                                    autoFocus
+                                />
+                                <div className="edit-item-note-meta">
+                                    <span>{t('edit_item_note_clear_hint')}</span>
+                                    <span>{editingItem.note.length} / {MAX_NOTE_CHARS}</span>
+                                </div>
+                                {/* 正文不是文本的类型（图片/文件/视频等）没有「编辑内容」按钮，
+                                    这里说明一句，免得用户以为正文入口丢了。 */}
+                                {!isBodyEditable(editingItem.contentType) && (
+                                    <p className="edit-item-body-notice">
+                                        {t('edit_item_binary_notice')}
+                                    </p>
+                                )}
                             </div>
-                        </div>
+                        )}
 
                         <div className="confirm-dialog-buttons">
                             <button className="confirm-dialog-button" onClick={() => setEditingItem(null)}>

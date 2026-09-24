@@ -138,33 +138,39 @@ export const isBodyEditable = (contentType: string): boolean =>
   EDITABLE_BODY_TYPES.includes(contentType);
 
 /**
- * R11: whether this entry gets a note editor on the main page.
+ * R11: whether this entry gets a note editor.
  *
- * # 为什么判据是"可编辑正文类型的补集"，而不是另一个白名单
+ * # 判据：**永远为真** —— 备注与内容类型无关
  *
- * 原实现是 `BINARY_CONTENT_TYPES.includes(contentType)` —— 一个只含
- * `["image","file","video"]` 的白名单。于是**凡是不在这两个清单里的类型都拿不到备注入口**：
- * `emoji_sync`、以及后端将来新增的任何类型，用户在界面上**看不到「编辑备注」**。
+ * 这个函数被改过两次，两次都因为"拿正文的可编辑性去推备注的可编辑性"而漏掉一批条目：
  *
- * 用真实组件量测（`tools/visual-harness/collapse.mjs`）实测到：
+ * | 版本 | 判据 | 漏掉谁 |
+ * |---|---|---|
+ * | 最初 | `["image","file","video"].includes(t)` | `emoji_sync`、后端将来新增的任何类型 |
+ * | v0.5.4 | `!EDITABLE_BODY_TYPES.includes(t)` | **`text` / `code` / `url` / `rich_text`** |
  *
- *   emoji_sync    → 编辑备注 = 无   ← 与"每一个条目都要支持编辑备注"矛盾
- *   unknown_type  → 编辑备注 = 无
+ * 第二版看起来"反过来了就对了"，其实只是把漏掉的那批**换成了另一批** —— 凡是有正文编辑
+ * 入口的类型，就**没有**备注入口。而用户的原话是「**编辑备注内容每个条目都要有这个按钮**」。
  *
- * 而备注**是条目元数据**（`note` 列），与 `content` 列里放的是文本还是路径**无关** ——
- * 后端 `update_entry_note` 对所有行都接受。所以拿"正文可不可编辑"去推"备注可不可编辑"
- * 本身就是错的判据。
+ * 根子上错在：**备注是条目元数据**（`note` 列），与 `content` 列里放的是文本、路径还是
+ * data URL **完全无关**。后端 `update_entry_note` 对所有行一视同仁。所以"正文能不能编辑"
+ * 与"备注能不能编辑"是两件独立的事，不该用前者派生后者。
  *
- * ⇒ 改为「**除已知可编辑正文的类型外，一律可编辑备注**」：
- *   - `text` / `code` / `url` / `rich_text` 走完整的正文编辑入口，不需要备注专用入口
- *   - **其余全部**（含 image/file/video，以及尚未预见的类型）都拿备注入口
+ * 于是这里直接返回 `true`：**每个条目都能编辑备注**。保留成函数（而不是删掉判断）
+ * 是为了让调用点保持一致的形状，也为将来万一真有"不允许备注"的类型留一个落点。
  *
- * 原注释担心"未预见的类型会静默获得一个未经审查的写路径"—— 该担心对**正文编辑**成立
- * （`isBodyEditable` 仍是白名单，保持不变），但对**备注**不成立：备注的写路径是唯一的
- * `update_entry_note`，与内容类型无关，不存在"未审查的写路径"。
+ * ## 与 `isBodyEditable` 的关系
+ *
+ * 两者**独立**，不是互补：
+ * - `isBodyEditable` —— 仍是白名单（正文编辑确实存在"未预见的类型会静默获得未经审查的
+ *   写路径"的风险，那个担心成立）
+ * - `isNoteEditable` —— 恒真（备注写路径唯一：`update_entry_note`，与类型无关）
+ *
+ * 所以 `text` 类条目**同时**有「编辑内容」和「编辑备注」两个入口，这是**正确**的，
+ * 不是重复：两个按钮进的是两个不同的弹窗、改的是两个不同的字段。
  */
-export const isNoteEditable = (contentType: string): boolean =>
-  !EDITABLE_BODY_TYPES.includes(contentType);
+export const isNoteEditable = (_contentType: string): boolean => true;
+
 
 /**
  * R10: `rich_text` is editable, but saving downgrades it to plain text and drops

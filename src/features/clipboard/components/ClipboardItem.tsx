@@ -49,8 +49,11 @@ import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot
 import { getFileIcon as getSystemFileIcon, peekFileIcon } from "../../../shared/lib/fileIcon";
 import { getSourceAppIcon, peekSourceAppIcon } from "../../../shared/lib/sourceAppIcon";
 import { registerCompactPreviewControls } from "../lib/compactPreviewControls";
+import { TAG_SUGGEST_VISIBLE_ROWS } from "../constants";
+import { selectTagSuggestions } from "../lib/tagSuggestions";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
+
 /**
  * R6: how much of an entry note is shown inline before it is cut off. The full text
  * stays reachable through the `title` tooltip, so a long note cannot break the row
@@ -802,15 +805,16 @@ const ClipboardItem = ({
             };
         })()
         : null;
-    const pickableTagSuggestions = useMemo(() => {
-        if (!isEditingTags) return [];
-        const existing = new Set(item.tags || []);
-        const q = localTagInput.trim().toLowerCase();
-        return tagSuggestions
-            .filter((tag) => !existing.has(tag))
-            .filter((tag) => !q || tag.toLowerCase().includes(q))
-            .slice(0, 14);
-    }, [isEditingTags, item.tags, localTagInput, tagSuggestions]);
+    const pickableTagSuggestions = useMemo(
+        () =>
+            selectTagSuggestions({
+                editing: isEditingTags,
+                query: localTagInput,
+                allTags: tagSuggestions,
+                existingTags: item.tags || [],
+            }),
+        [isEditingTags, item.tags, localTagInput, tagSuggestions]
+    );
 
     const [tagSuggestIndex, setTagSuggestIndex] = useState(-1);
     const tagSuggestListRef = useRef<HTMLDivElement | null>(null);
@@ -1532,7 +1536,15 @@ const ClipboardItem = ({
                         <div
                             ref={tagSuggestListRef}
                             id={`tag-suggest-list-${item.id}`}
-                            className="tag-edit-suggestions-popover hide-scrollbar"
+                            className="tag-edit-suggestions-popover"
+                              /*
+                               * 把"最多几行"从 JS 侧传给 CSS，让行数只有一个来源。
+                               *
+                               * CSS 的 `max-height: calc(rows × 行高)` 需要知道行数；
+                               * 若 CSS 再自己写一遍 4，改一处忘一处就会让"JS 限制的条数"
+                               * 与"CSS 限制的高度"分叉 —— 那正是本次要修的那类缺陷。
+                               */
+                              style={{ ["--tag-suggest-rows" as string]: String(TAG_SUGGEST_VISIBLE_ROWS) }}
                             role="listbox"
                             aria-label={t('find_tags')}
                             onMouseDown={(e) => e.stopPropagation()}

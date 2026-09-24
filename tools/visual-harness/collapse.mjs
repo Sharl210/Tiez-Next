@@ -145,7 +145,7 @@ const page = await browser.newPage({ viewport: VIEWPORT });
 // 而"失效"的表现是**判据悄悄变松**（阈值比实际行高小），比报错更危险。
 // 也**不能**留 0：阈值 0 会让所有高危断言无条件通过 = 假绿。
 {
-  await page.goto(`http://127.0.0.1:${port}/src/collapse.html`, { waitUntil: "load" });
+  await page.goto(`http://127.0.0.1:${port}/src/collapse.html?case=text`, { waitUntil: "load" });
   await page.waitForSelector("[data-test-clipboard-item]", { timeout: 15000 });
   const lh = await measureLineHeight(page);
   if (!(lh > 0)) {
@@ -295,17 +295,33 @@ const CARDS = [
   "unknown_type",
 ];
 
-/** 每种类型的「编辑内容 / 编辑备注」应当具备与否 —— 与产品判据同源（见 types.ts）。 */
+/**
+ * 每种类型的「编辑内容 / 编辑备注」应当具备与否 —— 与产品判据同源（见 types.ts）。
+ *
+ * # 为什么 noteEdit 在这一版**全部变成 true**
+ *
+ * 上一版这里对正文可编辑的类型（text/code/url/rich_*）写的是 `noteEdit: false`，
+ * 与当时的 `isNoteEditable = !isBodyEditable(t)` 一致。但那个判据本身就错了 ——
+ * 它让"有正文编辑入口的类型"拿不到备注入口，而用户的要求是
+ * **「编辑备注内容每个条目都要有这个按钮」**。
+ *
+ * 两轮修复都栽在同一件事上：拿正文的可编辑性去派生备注的可编辑性。
+ * 现在 `isNoteEditable` 恒真（备注是条目元数据，与内容类型无关），
+ * 所以这里每一项的 noteEdit 都是 true —— **包括正文可编辑的类型**。
+ *
+ * ⚠️ 这个表是**期望值**，不是量测结果。它必须来自产品判据（types.ts），
+ * 不能改成"量出来什么就写什么"——那样它就只是把现状抄一遍，失去判别力。
+ */
 const BTN_MATRIX = {
-  text: { bodyEdit: true, noteEdit: false },
-  code: { bodyEdit: true, noteEdit: false },
-  url: { bodyEdit: true, noteEdit: false },
-  rich_html: { bodyEdit: true, noteEdit: false },
-  rich_table: { bodyEdit: true, noteEdit: false },
-  rich_broken_img: { bodyEdit: true, noteEdit: false },
-  rich_noise: { bodyEdit: true, noteEdit: false },
-  rich_img_only: { bodyEdit: true, noteEdit: false },
-  rich_empty: { bodyEdit: true, noteEdit: false },
+  text: { bodyEdit: true, noteEdit: true },
+  code: { bodyEdit: true, noteEdit: true },
+  url: { bodyEdit: true, noteEdit: true },
+  rich_html: { bodyEdit: true, noteEdit: true },
+  rich_table: { bodyEdit: true, noteEdit: true },
+  rich_broken_img: { bodyEdit: true, noteEdit: true },
+  rich_noise: { bodyEdit: true, noteEdit: true },
+  rich_img_only: { bodyEdit: true, noteEdit: true },
+  rich_empty: { bodyEdit: true, noteEdit: true },
   image: { bodyEdit: false, noteEdit: true },
   image_missing: { bodyEdit: false, noteEdit: true },
   file: { bodyEdit: false, noteEdit: true },

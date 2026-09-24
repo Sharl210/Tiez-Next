@@ -108,7 +108,22 @@
     width: 100%;
     top: calc(100% + 5px);
     bottom: auto;
-    max-height: min(11rem, 38vh);
+    /*
+     * 可见高度 = 恰好 4 行，超出由 `overflow-y` 滚动查看。
+     *
+     * 【为什么用行高变量而不是写死像素】用户要的是"最多展示 4 行，超过可以用鼠标
+     * 滚动查看"。写死 `11rem`（≈176px，能显示 10 行上下）会在输入时铺开一大片面板，
+     * 把条目本身的内容遮住 —— 那正是用户说的"遮挡栏"。
+     *
+     * 写死一个像素值也不行：字号随用户设置变化后，要么显示不满 4 行（浪费空间），
+     * 要么露出第 5 行半截（看着像被切断）。所以这里把"一行多高"抽成变量，
+     * 由下一条规则把候选项**固定到该高度**，于是 `4 × 行高` 是精确的。
+     *
+     * 与 `ClipboardItem.tsx` 的 `TAG_SUGGEST_VISIBLE_ROWS` 联动：改这里也要改那边。
+     */
+    --tag-suggest-row-h: 18px;
+    --tag-suggest-rows: 4;
+    max-height: calc(var(--tag-suggest-rows) * var(--tag-suggest-row-h) + 6px + 2px);
     min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
@@ -119,6 +134,17 @@
     box-shadow: var(--tags-shadow);
     z-index: 10060;
     box-sizing: border-box;
+    /*
+     * 滚动条：用户明确说"超过可以用鼠标滚动查看"。
+     *
+     * 刻意**不用** `.hide-scrollbar`（那个类把滚动条 `display: none`）—— 列表被限高
+     * 到 4 行后，若滚动条完全不可见，用户会以为列表到此为止、看不到下面还有更多。
+     *
+     * 用 `thin` 而不是默认宽度：本列表很窄，默认宽的滚动条会占掉约 1/6 的可读宽度。
+     * 实测本机 Chrome 下渲染宽度 6px，且不悬停时自动淡出（覆盖式滚动条），
+     * 既不长期占用视觉，需要时又能看见 —— 这正是想要的效果。
+     */
+    scrollbar-width: thin;
 }
 
 .tag-suggest-item {
@@ -136,7 +162,11 @@
     text-align: left;
     cursor: pointer;
     line-height: 1.2;
+    /* 固定行高，让上面 `max-height` 的 `4 × 行高` 成为精确值 */
+    height: var(--tag-suggest-row-h, 18px);
     min-height: 0;
+    flex-shrink: 0;
+    box-sizing: border-box;
 }
 
 .tag-suggest-pill {
