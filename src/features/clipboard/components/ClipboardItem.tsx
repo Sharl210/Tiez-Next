@@ -1491,18 +1491,34 @@ const ClipboardItem = ({
                         }}
                     >
                         {tag}
-                        {isEditingTags && (
-                            <button
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    onTagDelete(tag);
-                                }}
-                                title={t('remove_tag')}
-                                style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', opacity: 0.72, cursor: 'pointer', display: 'flex' }}
-                            >
-                                <X size={8} />
-                            </button>
-                        )}
+                          {isEditingTags && (
+                              /*
+                               * 标签上的删除叉。
+                               *
+                               * 【为什么不能是 `<X size={8} />` + `padding: 0`】
+                               * 那样可点区域只有 **8×8 像素** —— 用户的原话是"那个叉叉大一点，
+                               * 现在很难点击"。8px 远低于能可靠点中的尺寸，而在标签这种密集
+                               * 排布里，误点的代价是删掉一个标签。
+                               *
+                               * 这里把**可点区域**扩到 18×18（图标 8→12），并用负外边距把
+                               * 多出来的部分抵消掉，使标签芯片的整体尺寸基本不变 ——
+                               * 否则加宽点击区会把每个标签都撑大，一行放不下几个。
+                               *
+                               * 另加了 `aria-label`：只有 title 的图标按钮在屏幕阅读器里
+                               * 不保证读得出来。
+                               */
+                              <button
+                                  onClick={(e) => {
+                                      e.stopPropagation();
+                                      onTagDelete(tag);
+                                  }}
+                                  title={t('remove_tag')}
+                                  aria-label={t('remove_tag')}
+                                  className="tag-chip-remove"
+                              >
+                                  <X size={12} />
+                              </button>
+                          )}
                     </span>
                 );
             })}

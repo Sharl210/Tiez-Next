@@ -86,6 +86,84 @@ if (typed.exists) {
   check("overflow-y 允许滚动", typed.overflowY === "auto" || typed.overflowY === "scroll", `overflowY=${typed.overflowY}`);
 }
 
+// ===========================================================================
+// 删除叉的可点区域 + 滚轮不穿透
+// ===========================================================================
+//
+// 这两条是用户直接反馈的交互问题：
+//   ① 「剪切板条目里面取消标签的那个叉叉大一点，现在很难点击」
+//   ② 「联想列表鼠标放在列表里面滚动时不要影响外面的剪切板条目一起滚动」
+//
+// 它们都**必须量**，因为都不可见地坏：① 视觉上叉叉看起来"有"，但可点区只有 8px；
+// ② 滚动在浮层没超出时看不出问题，只有滚到底之后继续滚才会暴露。
+
+console.log("\n[删除叉的可点区域] 期望 >= 18x18，且不把标签撑大");
+{
+  await page.goto(`http://127.0.0.1:${port}/src/collapse.html?case=with_tags&tagopen=1&theme=retro&colorMode=light`, { waitUntil: "load" });
+  await page.waitForTimeout(700);
+  const rm = await page.evaluate(() => {
+    const b = document.querySelector(".tag-chip-remove");
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    const svg = b.querySelector("svg");
+    const sr = svg ? svg.getBoundingClientRect() : null;
+    const chip = b.closest(".tag-chip");
+    const cr = chip.getBoundingClientRect();
+    return {
+      btnW: +r.width.toFixed(1), btnH: +r.height.toFixed(1),
+      iconW: sr ? +sr.width.toFixed(1) : null,
+      chipH: +cr.height.toFixed(1),
+    };
+  });
+  check("删除叉存在", !!rm);
+  if (rm) {
+    check("可点区域 >= 18x18", rm.btnW >= 18 && rm.btnH >= 18, `实测 ${rm.btnW}x${rm.btnH}`);
+    check("图标 >= 12px", rm.iconW >= 12, `实测 ${rm.iconW}px`);
+    // 加宽点击区若把芯片也撑大，一行就放不下几个标签 —— 那是另一个问题。
+    check("标签芯片未被撑大（高 <= 22）", rm.chipH <= 22, `实测 ${rm.chipH}px`);
+  }
+}
+
+console.log("\n[滚轮不穿透] 期望：浮层内滚动到底后，外层条目列表纹丝不动");
+{
+  // `tagfirst=1`：只让**第一个**用例进编辑态，但整页仍渲染 ——
+  // 必须有可滚的外层，否则"是否被带动"这条没有判别力。
+  await page.setViewportSize({ width: 352, height: 300 });
+  await page.goto(`http://127.0.0.1:${port}/src/collapse.html?tagopen=1&tagfirst=1&tagquery=i&theme=retro&colorMode=light`, { waitUntil: "load" });
+  await page.waitForTimeout(900);
+  await page.evaluate(() => {
+    const p = document.querySelector(".tag-edit-suggestions-popover");
+    if (p) p.scrollIntoView({ block: "center" });
+  });
+  await page.waitForTimeout(300);
+
+  const pre = await page.evaluate(() => {
+    const l = document.querySelector(".history-list");
+    const p = document.querySelector(".tag-edit-suggestions-popover");
+    if (!p) return null;
+    return { outer: l.scrollTop, max: p.scrollHeight - p.clientHeight,
+             y: Math.round(p.getBoundingClientRect().y),
+             overscroll: getComputedStyle(p).overscrollBehaviorY };
+  });
+  check("浮层存在且已滚入视口", !!pre && pre.y >= 0, pre ? `y=${pre.y}` : "无浮层");
+  check("overscroll-behavior-y = contain", !!pre && pre.overscroll === "contain", pre ? `实测 ${pre.overscroll}` : "");
+
+  if (pre) {
+    const box = await page.locator(".tag-edit-suggestions-popover").first().boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    // 滚到底**之后继续滚** —— 这才是考验"链断没断"的时刻
+    for (let i = 0; i < 30; i++) { await page.mouse.wheel(0, 120); await page.waitForTimeout(25); }
+    const post = await page.evaluate(() => {
+      const l = document.querySelector(".history-list");
+      const p = document.querySelector(".tag-edit-suggestions-popover");
+      return { outer: l.scrollTop, inner: p.scrollTop };
+    });
+    check("浮层内部滚到底", post.inner >= pre.max - 1, `inner ${post.inner}/${pre.max}`);
+    check("外层条目列表未被动", post.outer === pre.outer, `outer ${pre.outer} → ${post.outer}`);
+  }
+  await page.setViewportSize({ width: 380, height: 900 });
+}
+
 const failed = findings.filter((f) => !f.ok);
 console.log(`\n断言 ${findings.length - failed.length} / ${findings.length} 通过`);
 if (failed.length) {

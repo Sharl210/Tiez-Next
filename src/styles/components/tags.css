@@ -135,6 +135,27 @@
     z-index: 10060;
     box-sizing: border-box;
     /*
+     * 【滚轮不要穿透到外面的条目列表】
+     *
+     * 用户原话：「添加标签的那个联想列表鼠标放在列表里面滚动时不要影响外面的剪切板
+     * 条目一起滚动就是分开，我鼠标放在联想列表里面就是滚动列表的，放在外面就是滚动
+     * 外面的条目列表」。
+     *
+     * 浏览器默认行为是 **scroll chaining**（滚动链）：内层滚到边界后，滚轮事件会继续
+     * 传给可滚动的祖先，于是列表已经到头了，外层条目列表却开始跟着动 —— 一次滚轮
+     * 动了两个东西，用户会失去"我在滚哪一层"的判断。
+     *
+     * `overscroll-behavior: contain` 把链断在这里：内层滚到头就不再往外传。
+     * 用 `contain` 而不是 `none`：两者对**本元素**的效果相同，但 `none` 在某些
+     * 浏览器里还会阻止下拉刷新之类的边界手势；这里只想断开祖先滚动，`contain` 语义
+     * 更准。
+     *
+     * 顺带把 `overscroll-behavior-x` 也设上，避免横向滚动条出现时同样穿透。
+     */
+    overscroll-behavior: contain;
+    overscroll-behavior-x: contain;
+
+    /*
      * 滚动条：用户明确说"超过可以用鼠标滚动查看"。
      *
      * 刻意**不用** `.hide-scrollbar`（那个类把滚动条 `display: none`）—— 列表被限高
@@ -234,4 +255,47 @@
 
 :root.dark-mode .search-input::placeholder {
     color: rgba(255, 255, 255, 0.5) !important;
+}
+
+/* ==========================================================================
+   标签上的删除叉 —— 扩大可点区域，但不撑大标签
+   ==========================================================================
+
+   用户原话：「剪切板条目里面取消标签的那个叉叉大一点，现在很难点击」。
+
+   此前它是 `<X size={8} />` 配 `padding: 0`，可点区域就是 **8×8 像素**。
+   那个尺寸在鼠标下都难瞄（更不用说触控板），而误点的代价是**删掉一个标签**。
+
+   做法：把按钮本体撑到 18×18，再用**负外边距**把多出来的 6px 从两侧吃掉 ——
+   这样点击区变大，而标签芯片的整体宽度基本不变（不会因为加宽点击区导致
+   一行放不下几个标签）。上下同理用负外边距抵消，避免标签被撑高。
+
+   为什么不用 `::before` 做隐形热区：那个方案在 `overflow: hidden` 的芯片里会被裁掉，
+   而这里是**真的要变大**，不是要隐形。
+   ========================================================================== */
+
+.tag-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 可点区域 18×18 */
+  width: 18px;
+  height: 18px;
+  /* 把多出来的尺寸从布局里抵消掉：左右各 5px（18 - 原来的 8），上下各 4px */
+  margin: -4px -5px -4px -1px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  opacity: 0.72;
+  cursor: pointer;
+  border-radius: 50%;
+  flex-shrink: 0;
+  /* 悬停时给一个淡淡的底，让"这里可以点"变得可见 */
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+}
+
+.tag-chip-remove:hover {
+  opacity: 1;
+  background-color: rgba(255, 255, 255, 0.22);
 }

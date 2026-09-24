@@ -57,9 +57,23 @@ const colorMode = params.get("colorMode") ?? "light";
 const compactMode = params.get("compact") === "1";
 const openEditor = params.get("open") ?? "";
 
-/** 标签编辑态：`?tagopen=1&tagquery=i` —— 供标签候补浮层的量测使用。 */
-const tagOpen = params.get("tagopen") === "1";
+/**
+ * 标签编辑态：`?tagopen=1&tagquery=i` —— 供标签候补浮层的量测使用。
+ *
+ * ⚠️ **它只作用于 `case=<id>` 指定的那一个用例**（同时也要求给了 `case`）。
+ *
+ * 起初它是全局的，于是整页 15+ 个条目**全部**进入标签编辑态。而那些条目各自带
+ * `z-index: 48`（`.history-item:has(.item-tags-container.tag-edit-active)`），
+ * 靠后的条目会盖住靠前条目的候补浮层 —— 结果量测到"浮层只有 1 行可见、滚轮打到
+ * 后面的条目上"，看起来像产品缺陷，实际上是量测台自己造出来的层叠冲突。
+ *
+ * 真实使用中同一时刻只会有一条在编辑标签，所以按 case 限定才是**真实条件**。
+ */
+const tagOpenAll = params.get("tagopen") === "1";
 const tagQuery = params.get("tagquery") ?? "";
+
+/** `tagfirst=1`：只让第一个用例进标签编辑态（整页仍渲染，外层仍可滚）。 */
+const tagFirst = params.get("tagfirst") === "1";
 
 /**
  * 量测用的标签池。
@@ -70,6 +84,10 @@ const tagQuery = params.get("tagquery") ?? "";
  */
 const HARNESS_TAG_POOL = [
   "ims", "img", "invoice", "ims配置", "ims下发", "image",
+  // 再加 20 个以 i 开头的：用户输入 `i` 是本次要验证的场景，而候补列表的**可见高度
+  // 上限是 4 行** —— 池子里若只有 6 个 i 开头，"超出可滚动"这条只溢出一点点，
+  // 量不出真正的滚动行为（会得到"滚了 4px 就到底"这种没有判别力的结果）。
+  ...Array.from({ length: 20 }, (_, i) => `item-${i}`),
   ...Array.from({ length: 34 }, (_, i) => `tag-${i}`),
 ];
 const onlyCase = params.get("case") ?? "";
@@ -167,6 +185,17 @@ const CASES: CaseSpec[] = [
    * 用例；否则 `.entry-note-sparkle` 根本不在 DOM 里，"图标是否统一"就无法断言。
    */
   { id: "with_note", note: "带备注", entry: baseEntry({ id: 120, content_type: "text", content: "一条带备注的文本内容。", preview: "一条带备注的文本内容。", note: "这是我自己写的备注" }) },
+  /*
+   * 带**标签**的用例。
+   *
+   * 其余用例的 `tags` 都是空的，于是"标签芯片"以及它上面的删除叉**从来不在 DOM 里**，
+   * 相关的几何断言（芯片高度会不会被按钮撑大、删除叉的可点区有多大）**全都测不到**。
+   * 这正是用户反馈"那个叉叉很难点击"时量测台给不出任何证据的原因。
+   *
+   * 给两个标签而不是一个：芯片是 flex 行内排列，单个芯片量不出"加宽点击区之后
+   * 一行还放得下几个"这类问题。
+   */
+  { id: "with_tags", note: "带标签", entry: baseEntry({ id: 121, content_type: "text", content: "一条带标签的文本内容。", preview: "一条带标签的文本内容。", tags: ["ims", "img"] }) },
   { id: "code", note: "代码", entry: baseEntry({ id: 102, content_type: "code", content: "fn main() {\n    println!(\"hi\");\n}", preview: "fn main() {" }) },
   { id: "url", note: "链接", entry: baseEntry({ id: 103, content_type: "url", content: "https://example.com/a/b", preview: "https://example.com/a/b" }) },
   { id: "rich_html", note: "富文本（HTML 分支）", entry: baseEntry({ id: 104, content_type: "rich_text", content: "第一段正文\n第二段正文", preview: "第一段正文", html_content: RICH_HTML }) },
@@ -223,10 +252,26 @@ const Row = ({ spec }: { spec: CaseSpec }) => {
         windowPinned={false}
         isSensitiveHidden={false}
         isRevealed={true}
-        isEditingTags={tagOpen}
+        // `tagfirst=1`（配 `tagopen=1`）→ 只让**第一个**用例进编辑态，整页仍全渲染。
+        //
+        // ⚠️ 为什么不用 `case=first`：`onlyCase` 同时被用来**过滤渲染哪一条**，
+        // 用一个不存在的 id 当开关会把所有条目都过滤掉（量到 0 条，什么也测不出）。
+        // 单独一个参数才互不干扰。
+        //
+        // 为什么需要它：验证"滚轮在浮层里滚动不要带动外层列表"必须有**可滚的外层**，
+        // 只渲染一条时外层根本不滚，那条断言没有判别力。
+        isEditingTags={tagOpenAll && (tagFirst ? spec.id === CASES[0].id : onlyCase === spec.id)}
         tagInput={tagQuery}
-        tagSuggestions={tagOpen ? HARNESS_TAG_POOL : []}
-        onTagPick={tagOpen ? noop : undefined}
+        tagSuggestions={
+          tagOpenAll && (tagFirst ? spec.id === CASES[0].id : onlyCase === spec.id)
+            ? HARNESS_TAG_POOL
+            : []
+        }
+        onTagPick={
+          tagOpenAll && (tagFirst ? spec.id === CASES[0].id : onlyCase === spec.id)
+            ? noop
+            : undefined
+        }
         theme={theme}
         language={lang}
         t={t}
