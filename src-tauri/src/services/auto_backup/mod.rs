@@ -73,6 +73,56 @@ pub fn to_app_error(e: AutoBackupError) -> AppError {
     AppError::Raw(e.payload().to_string())
 }
 
+/// 轮换时**不可删**的备份包名（除"已固定"之外的那一类）。
+///
+/// # 为什么需要它
+///
+/// 恢复是两阶段的：用户点「恢复」时只做"组装暂存 + 写待接管标记"，真正的数据替换
+/// 发生在**下次启动**。这两件事之间可能隔很久（用户可能过几天才重启），而自动备份的
+/// 轮换会在这个窗口里继续跑。
+///
+/// 于是会出现：用户点恢复 → 没重启 → 后台触发一次备份 → 轮换把那份包当作"最老的、
+/// 未固定的"删掉 ⇒ 用户**既没有可重来的包**（连"再点一次恢复"都做不到），
+/// 而且万一提升失败就**没有任何退路**。
+///
+/// # 名字从哪来
+///
+/// 来自待接管标记里的 `protected_backup`（见 `migration_pending::PendingMigration`）。
+/// 这里直接读标记文件而不缓存：标记是**唯一权威**，而轮换可能在任何时刻发生 ——
+/// 缓存一份就等于制造"缓存与标记不一致"的窗口。
+///
+/// # 保护何时结束
+///
+/// 提升成功后启动期会删掉标记，于是本函数自然返回空 —— **保护随标记一起消失**，
+/// 不需要另设一处"记得解除保护"的代码（那种地方迟早会被忘掉）。
+///
+/// # 读不到标记时
+///
+/// 返回空列表（不保护）。这与"标记不存在"同义：没有任何待生效的恢复，
+/// 也就没有任何包需要额外保护。
+fn pending_restore_protection(app: &AppHandle) -> Vec<String> {
+    let Some(native_dir) = app.path().app_data_dir().ok() else {
+        return Vec::new();
+    };
+    protection_from_marker_dir(&native_dir)
+}
+
+/// [`pending_restore_protection`] 的纯函数内核：从一个**标记目录**里读出保护名单。
+///
+/// 【为什么要拆出来】`pending_restore_protection` 需要 `AppHandle`，在单测里造不出来；
+/// 而"读标记 → 取出包名"这一步恰恰是**最容易悄悄写错**的地方（读错字段、早退、
+/// 把 `None` 当成空串……）。拆成纯函数之后它可以被直接断言。
+///
+/// 这不是为了测试而测试：拆之前实测过一次"把整个函数改成永远返回空"，
+/// **全套 544 个测试依然全绿** —— 也就是说这条链当时没有任何守卫，
+/// 下次有人改坏它不会有任何提示。
+pub(crate) fn protection_from_marker_dir(native_data_dir: &std::path::Path) -> Vec<String> {
+    crate::migration_pending::read(native_data_dir)
+        .and_then(|p| p.protected_backup)
+        .into_iter()
+        .collect()
+}
+
 fn store_for(data_dir: &std::path::Path) -> Result<AutoBackupStore, AppError> {
     AutoBackupStore::open_for_data_dir(data_dir).map_err(to_app_error)
 }
@@ -251,7 +301,7 @@ pub fn run_auto_backup_now(
         .create(&data_dir, BackupOrigin::Manual, &app_version)
         .map_err(to_app_error)?;
     let rotation = store
-        .enforce_rotation(cfg.max_keep)
+        .enforce_rotation_protecting(cfg.max_keep, &pending_restore_protection(&app))
         .map_err(to_app_error)?;
     let entries = store.list().map_err(to_app_error)?;
     let payload = view(&store, cfg, entries, rotation.warnings.clone());
@@ -332,7 +382,7 @@ fn startup_pass(app: &AppHandle) {
     );
     if outcome.created.is_some() {
         // 启动备份也要遵守留存上限：否则"把份数调小之后重启"会让总量一直超着。
-        let _ = store.enforce_rotation(cfg.max_keep);
+        let _ = store.enforce_rotation_protecting(cfg.max_keep, &pending_restore_protection(app));
         let _ = app.emit(EVENT_CREATED, serde_json::json!({"origin": "startup"}));
     }
     for w in outcome.warnings {
@@ -364,7 +414,9 @@ fn scheduled_pass(app: &AppHandle) {
         now_ms,
     );
     if outcome.created.is_some() {
-        if let Ok(rotation) = store.enforce_rotation(cfg.max_keep) {
+        if let Ok(rotation) =
+            store.enforce_rotation_protecting(cfg.max_keep, &pending_restore_protection(app))
+        {
             for w in &rotation.warnings {
                 crate::info!("[AUTO_BACKUP] {}", w);
             }

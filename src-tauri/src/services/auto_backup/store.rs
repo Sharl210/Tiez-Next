@@ -387,6 +387,32 @@ pub fn validate_archive_name(name: &str) -> Result<(), AutoBackupError> {
 /// 返回 `(要删的, 删不掉的多余份数)`。第二项只在"未固定的份数仍不足以降到上限"时大于 0
 /// ——正常路径下它不是 0 就是超过上限（见模块文档与 [`AutoBackupStore::enforce_rotation`]）。
 pub fn plan_rotation(entries: &[BackupEntry], max_keep: u32) -> (Vec<BackupEntry>, u32) {
+    plan_rotation_protecting(entries, max_keep, &[])
+}
+
+/// 与 [`plan_rotation`] 相同，但额外把 `protected` 里的名字当作**不可删**。
+///
+/// 【为什么需要它 —— 一个真实的数据风险】
+///
+/// 恢复是两阶段的：用户在设置页点「恢复」时只做"组装暂存 + 写待接管标记"，
+/// 真正的数据替换发生在**下次启动**。这两件事之间可能隔很久（用户可能过几天才重启），
+/// 而**自动备份的轮换会在这个窗口里继续跑**。
+///
+/// 于是：用户点恢复 → 没重启 → 后台触发一次备份 → 轮换把那份包当成"最老的、未固定的"
+/// 删掉 ⇒ 用户**既没有可重来的包**（他连"再点一次恢复"都做不到），
+/// 而且万一提升失败就**没有任何退路**。
+///
+/// 这不只是"少一个文件"：那是用户刚刚选择了"回到这个时刻"的那份数据，
+/// 在他明确表达要它之后的几分钟里被后台任务删掉。
+///
+/// 所以把"待生效恢复所用的包名"作为一类保护项传进来，与 `pinned` **同等对待**
+/// —— 复用同一套"跳过不可删项、只在不够时如实报 deficit"的逻辑，
+/// 而不是在轮换里另开一条分支（那条分支迟早会与这条走岔）。
+pub fn plan_rotation_protecting(
+    entries: &[BackupEntry],
+    max_keep: u32,
+    protected: &[String],
+) -> (Vec<BackupEntry>, u32) {
     let max_keep = max_keep.max(1) as usize;
     if entries.len() <= max_keep {
         return (Vec::new(), 0);
@@ -411,7 +437,10 @@ pub fn plan_rotation(entries: &[BackupEntry], max_keep: u32) -> (Vec<BackupEntry
         if doomed.len() >= excess {
             break;
         }
-        if entry.pinned {
+        // 固定的，以及**正被一次待生效的恢复所用**的，都不删。
+        // 后者见 `plan_rotation_protecting` 的文档：删掉它会同时拿走用户的当前恢复
+        // 与重来一次的机会。
+        if entry.pinned || protected.iter().any(|n| n == &entry.archive_name) {
             continue;
         }
         doomed.push((*entry).clone());
@@ -700,8 +729,20 @@ impl AutoBackupStore {
     /// 因此总有一个轮换位。这里仍如实处理，是因为用户可以把 `max_keep` 调小、
     /// 也可以手工往目录里放文件。）
     pub fn enforce_rotation(&mut self, max_keep: u32) -> Result<RotationOutcome, AutoBackupError> {
+        self.enforce_rotation_protecting(max_keep, &[])
+    }
+
+    /// 与 [`Self::enforce_rotation`] 相同，但额外保护 `protected` 里列出的包名。
+    ///
+    /// 调用方（自动备份服务）会把"正被一次待生效的恢复所用"的包名传进来，
+    /// 理由见 [`plan_rotation_protecting`]。
+    pub fn enforce_rotation_protecting(
+        &mut self,
+        max_keep: u32,
+        protected: &[String],
+    ) -> Result<RotationOutcome, AutoBackupError> {
         let entries = self.list()?;
-        let (doomed, deficit) = plan_rotation(&entries, max_keep);
+        let (doomed, deficit) = plan_rotation_protecting(&entries, max_keep, protected);
         let mut outcome = RotationOutcome::default();
 
         for entry in doomed {
@@ -724,7 +765,8 @@ impl AutoBackupStore {
         if deficit > 0 {
             outcome.undelatable_excess = deficit;
             outcome.warnings.push(format!(
-                "还有 {} 份备份超出上限，但它们全部处于固定状态，未删除。请先取消其中一部分的固定，或调大最大留存份数。",
+                "还有 {} 份备份超出上限，但它们处于固定状态、或正被一次「重启后生效」的恢复使用，未删除。\
+                 请先取消其中一部分的固定，或调大最大留存份数。",
                 deficit
             ));
         }

@@ -19,6 +19,7 @@
 //! （该反向对照已在实现中实测通过：把 `plan_rotation` 里的 `if entry.pinned { continue; }`
 //! 注释掉后，`rotation_never_deletes_a_pinned_backup` 立刻变红。见任务报告。）
 
+use super::*;
 use super::store::*;
 use super::config::AutoBackupConfig;
 use chrono::NaiveDate;
@@ -1033,4 +1034,306 @@ fn pinned_count_never_exceeds_the_limit_across_a_long_sequence() {
         );
     }
     assert_eq!(ok, 5, "6 份里最多只能固定 5 份");
+}
+
+// ===========================================================================
+// 待生效恢复所用的备份包，不能被轮换删掉
+// ===========================================================================
+//
+// 【这组测试防的是一个真实的数据风险，不是记账】
+//
+// 恢复是两阶段的：点「恢复」时只做"组装暂存 + 写待接管标记"，真正的数据替换发生在
+// **下次启动**。这中间可能隔很久（用户可能过几天才重启），而轮换会在窗口里继续跑。
+//
+// 于是会出现：用户点恢复 → 没重启 → 后台触发一次备份 → 轮换把那份包当作"最老的、
+// 未固定的"删掉 ⇒ 用户**既没有可重来的包**（连"再点一次恢复"都做不到），
+// 而且万一提升失败就**没有任何退路**。
+//
+// 下面第一条断言就是"用户此刻最需要的那份包被保留了"；第二条是它的反向对照。
+
+mod pending_restore_protection {
+    use super::*;
+
+    /// 基本情形：受保护的那份是最老的、本该第一个被删 —— 它必须活下来，
+    /// 而**其余**该删的仍然要删（否则就成了"保护一个 = 停止整个轮换"）。
+    #[test]
+    fn protected_backup_survives_rotation_while_others_are_still_deleted() {
+        let root = tmp_root("protect-basic");
+        let (_data, mut store) = open_store(&root);
+        seed_entries(
+            &store.dir,
+            &[
+                (BackupOrigin::Scheduled, "010000", 1, false),
+                (BackupOrigin::Scheduled, "020000", 1, false),
+                (BackupOrigin::Scheduled, "030000", 1, false),
+                (BackupOrigin::Scheduled, "040000", 1, false),
+                (BackupOrigin::Scheduled, "050000", 1, false),
+            ],
+        );
+
+        // 最老的那份（01:00）正是"用户点了恢复要回到的时刻"，且它**没有**被固定。
+        let protected = vec![
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .find(|e| e.archive_name.contains("20260501T010000"))
+                .expect("种子里应有 01:00 那份")
+                .archive_name
+                .clone(),
+        ];
+
+        let outcome = store
+            .enforce_rotation_protecting(3, &protected)
+            .expect("轮换应当成功");
+
+        assert!(
+            !outcome.deleted.iter().any(|n| n == &protected[0]),
+            "正被一次待生效的恢复使用的包**不能**被删（实际删了 {:?}）",
+            outcome.deleted
+        );
+        assert!(
+            store.dir.join(&protected[0]).exists(),
+            "受保护的包必须仍然在磁盘上，否则用户连重来一次都做不到"
+        );
+        // 保护一个不等于停止轮换：另外两份最老的仍要删掉。
+        assert_eq!(
+            outcome.deleted.len(),
+            2,
+            "超出 2 份，受保护的那份之外仍应删掉 2 份（实际 {:?}）",
+            outcome.deleted
+        );
+    }
+
+    /// **反向对照**：同样的种子、同样的上限，**不传**保护名单 → 那份包会被删掉。
+    ///
+    /// 这条是上一条的判别力来源：没有它，"受保护的包还在"可能只是因为轮换根本没删任何
+    /// 东西（例如上限算错、或排序反了），而不是因为保护起了作用。
+    #[test]
+    fn without_protection_the_same_backup_is_deleted() {
+        let root = tmp_root("protect-reverse");
+        let (_data, mut store) = open_store(&root);
+        seed_entries(
+            &store.dir,
+            &[
+                (BackupOrigin::Scheduled, "010000", 1, false),
+                (BackupOrigin::Scheduled, "020000", 1, false),
+                (BackupOrigin::Scheduled, "030000", 1, false),
+                (BackupOrigin::Scheduled, "040000", 1, false),
+                (BackupOrigin::Scheduled, "050000", 1, false),
+            ],
+        );
+        let oldest = store
+            .list()
+            .unwrap()
+            .iter()
+            .find(|e| e.archive_name.contains("20260501T010000"))
+            .expect("种子里应有 01:00 那份")
+            .archive_name
+            .clone();
+
+        let outcome = store.enforce_rotation(3).expect("轮换应当成功");
+
+        assert!(
+            outcome.deleted.iter().any(|n| n == &oldest),
+            "不传保护名单时，最老的那份**应当**被删 —— 否则前一条测试证明不了保护起了作用"
+        );
+    }
+
+    /// 全部受保护且都超量时，如实报 `deficit`，而不是静默删掉一个。
+    ///
+    /// 这与"全部已固定"的处理一致：宁可让用户知道"超了但删不掉"，
+    /// 也不能为了让数字好看而删掉他正在依赖的数据。
+    #[test]
+    fn all_protected_reports_deficit_instead_of_deleting() {
+        let root = tmp_root("protect-deficit");
+        let (_data, mut store) = open_store(&root);
+        seed_entries(
+            &store.dir,
+            &[
+                (BackupOrigin::Scheduled, "010000", 1, false),
+                (BackupOrigin::Scheduled, "020000", 1, false),
+                (BackupOrigin::Scheduled, "030000", 1, false),
+            ],
+        );
+        let all: Vec<String> = store.list().unwrap().into_iter().map(|e| e.archive_name).collect();
+
+        let outcome = store.enforce_rotation_protecting(1, &all).expect("轮换应当成功");
+
+        assert!(outcome.deleted.is_empty(), "全部受保护时不应删任何一份");
+        assert_eq!(
+            outcome.undelatable_excess, 2,
+            "应如实报告「还有 2 份超量但删不掉」，而不是假装轮换完成了"
+        );
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("重启后生效")),
+            "提示里应说明这些包是**因为待生效的恢复**才没删，用户才知道该做什么（实际 {:?}）",
+            outcome.warnings
+        );
+    }
+
+    /// 保护名单里的名字若已不存在（用户手工删了包），轮换照常进行、不报错。
+    #[test]
+    fn protection_for_a_missing_name_is_harmless() {
+        let root = tmp_root("protect-missing");
+        let (_data, mut store) = open_store(&root);
+        seed_entries(
+            &store.dir,
+            &[
+                (BackupOrigin::Scheduled, "010000", 1, false),
+                (BackupOrigin::Scheduled, "020000", 1, false),
+                (BackupOrigin::Scheduled, "030000", 1, false),
+            ],
+        );
+
+        let outcome = store
+            .enforce_rotation_protecting(1, &["20260101T000000-scheduled-1.zip".to_string()])
+            .expect("名单里有个不存在的名字不应导致轮换失败");
+
+        assert_eq!(outcome.deleted.len(), 2, "应正常按上限删掉 2 份");
+    }
+}
+
+// ===========================================================================
+// 端到端：`pending_restore_protection` 真的读到了标记里的包名
+// ===========================================================================
+//
+// 上面那组测试验证的是**轮换会尊重保护名单**；这一组验证**名单真的来自标记文件**。
+//
+// 两者缺一不可：只有前者，一个"名单永远是空的"的实现也能全绿 ——
+// 那正是本次要修的那个缺陷（用户点了恢复，轮换照删不误）。
+mod pending_protection_is_read_from_marker {
+    use super::*;
+
+    /// 标记里写了 `protectedBackup` → 读出来就是它。
+    #[test]
+    fn marker_protected_backup_is_surfaced() {
+        let root = tmp_root("marker-read");
+        let native_dir = root.join("native-com.tieznext");
+        std::fs::create_dir_all(&native_dir).unwrap();
+
+        let pending = crate::migration_pending::PendingMigration::for_kind_protecting(
+            crate::migration_pending::PendingKind::LocalRestore,
+            root.join("com.tieznext"),
+            root.join(".com.tieznext.pending-restore-1"),
+            root.join("com.tieznext"),
+            true,
+            "0.5.9",
+            Some("20260925T010000-scheduled-1.zip".to_string()),
+        );
+        crate::migration_pending::write(&native_dir, &pending).unwrap();
+
+        let read_back = crate::migration_pending::read(&native_dir)
+            .expect("刚写下的标记必须能读回");
+        assert_eq!(
+            read_back.protected_backup.as_deref(),
+            Some("20260925T010000-scheduled-1.zip"),
+            "标记必须记住这次恢复用的是哪份包 —— 否则轮换无从得知该保护谁"
+        );
+    }
+
+    /// 迁移那条链写的标记没有这个字段 → 读回是 `None`（不该凭空造出一个包名）。
+    #[test]
+    fn takeover_marker_has_no_protected_backup() {
+        let root = tmp_root("marker-read-migration");
+        let native_dir = root.join("native-com.tieznext");
+        std::fs::create_dir_all(&native_dir).unwrap();
+
+        let pending = crate::migration_pending::PendingMigration::for_kind(
+            crate::migration_pending::PendingKind::Takeover,
+            root.join("旧目录"),
+            root.join(".com.tieznext.pending-takeover"),
+            root.join("com.tieznext"),
+            true,
+            "0.5.9",
+        );
+        crate::migration_pending::write(&native_dir, &pending).unwrap();
+
+        let read_back = crate::migration_pending::read(&native_dir).unwrap();
+        assert_eq!(
+            read_back.protected_backup, None,
+            "迁移没有'源备份包'这个概念，不该凭空写一个名字进去"
+        );
+    }
+}
+
+// ===========================================================================
+// 保护名单的读取内核（`protection_from_marker_dir`）
+// ===========================================================================
+//
+// 【这组测试是补上的，起因是一次"全绿却没覆盖"】
+//
+// 接线完成后做反向对照：把读取逻辑整个改成"永远返回空列表"，
+// **544 个测试依然全绿** —— 说明从"标记文件"到"轮换的保护名单"这一段
+// 当时没有任何守卫。而它恰好是最容易悄悄写错的地方。
+//
+// 拆出纯函数内核后，下面每条都有判别力。
+mod protection_from_marker_dir_reads_the_marker {
+    use super::*;
+
+    fn write_marker(dir: &std::path::Path, protected: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let pending = crate::migration_pending::PendingMigration::for_kind_protecting(
+            crate::migration_pending::PendingKind::LocalRestore,
+            dir.join("data"),
+            dir.join(".pending"),
+            dir.join("data"),
+            true,
+            "0.5.9",
+            protected.map(|s| s.to_string()),
+        );
+        crate::migration_pending::write(dir, &pending).unwrap();
+    }
+
+    /// 标记里记了包名 → 名单里有它（这是让轮换"知道该保护谁"的唯一通道）。
+    #[test]
+    fn returns_the_name_recorded_in_the_marker() {
+        let dir = tmp_root("pv-read");
+        write_marker(&dir, Some("20260925T010000-scheduled-1.zip"));
+
+        assert_eq!(
+            protection_from_marker_dir(&dir),
+            vec!["20260925T010000-scheduled-1.zip".to_string()],
+            "读不到名字，轮换就会把用户正等着恢复用的那份包删掉"
+        );
+    }
+
+    /// 标记存在但没有这个字段（迁移留下的）→ 空名单，不是"一个空字符串"。
+    #[test]
+    fn no_field_yields_empty_not_a_blank_placeholder() {
+        let dir = tmp_root("pv-none");
+        write_marker(&dir, None);
+
+        assert!(
+            protection_from_marker_dir(&dir).is_empty(),
+            "没有保护对象时必须是空名单 —— 返回一个空串会让保护判定永远不成立，\
+             而读代码的人会以为有东西被保护着"
+        );
+    }
+
+    /// 没有标记文件 → 空名单（没有任何待生效的恢复，也就没有要额外保护的东西）。
+    #[test]
+    fn missing_marker_yields_empty() {
+        let dir = tmp_root("pv-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(protection_from_marker_dir(&dir).is_empty());
+    }
+
+    /// 标记文件损坏 → 空名单且**不 panic**（轮换不能因为一个坏文件而停摆）。
+    #[test]
+    fn corrupted_marker_yields_empty_without_panicking() {
+        let dir = tmp_root("pv-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            crate::migration_pending::marker_path(&dir),
+            b"{ this is not the json you are looking for",
+        )
+        .unwrap();
+
+        assert!(
+            protection_from_marker_dir(&dir).is_empty(),
+            "坏标记按'没有待办'处理：轮换照常进行，而不是让整个自动备份卡住"
+        );
+    }
 }

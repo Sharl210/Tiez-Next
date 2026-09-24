@@ -195,6 +195,35 @@ static IMPORT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 ///
 /// 返回值只有两种结局：`Ok`（数据已完全恢复）或 `Err`（**现有数据一个字节都没动**）。
 /// 不存在"恢复了一半"的中间态。
+/// 从恢复请求里取"源备份包的文件名"（用于把它固定住，免遭自动备份轮换删除）。
+///
+/// 只取**文件名**而不存绝对路径：固定索引 `PinIndex` 本来就是按名字记的
+/// （见 `auto_backup/store.rs`），而且包一定在那个受管目录里 —— 存路径会多一份
+/// 可能与实际目录不一致的状态。
+///
+/// 【为什么不是所有恢复都有】数据管理里的"导入备份"用的是用户自选的任意路径，
+/// 它不在自动备份目录里，也就没有"被轮换删掉"这回事。所以只有源包确实落在
+/// 自动备份目录内时才有名字可保护；否则返回 `None`，行为与改动前一致。
+fn backup_archive_name(req: &RestoreRequest) -> Option<String> {
+    let name = req.archive_path.file_name()?.to_string_lossy().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    // 只在"源包确实位于**自动备份目录**内"时才保护 —— 否则这个名字对轮换毫无意义
+    // （轮换只动它自己那个目录），而记进标记会让人误以为有什么在被保护。
+    //
+    // 【判据必须是自动备份目录本身，不能是"数据目录的父目录"】后者宽松得多：
+    // 数据目录的父级通常还放着别的东西（桌面就在旁边、同级还有用户自己建的文件夹），
+    // 用它判定会把**从桌面导入**的包也当成"在自动备份目录内"而记下名字 ——
+    // 那是虚假的保护。本仓库里已经有测试专门验证这一点
+    // （`archive_outside_auto_backup_dir_is_not_recorded`），它当初正是抓出了这个 bug。
+    let auto_dir = crate::services::auto_backup::store::auto_backup_dir(&req.data_dir);
+    if !req.archive_path.starts_with(&auto_dir) {
+        return None;
+    }
+    Some(name)
+}
+
 pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError> {
     // 串行化整个导入流程。被 poison（持锁线程 panic）时也继续取用：宁可继续串行执行，
     // 也不要因为一次 panic 让功能永久不可用——锁在这里只用于互斥，不保护共享数据。
@@ -284,7 +313,15 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
     // 备份包（导出链只读它，本模块从不写它）。填 `data_dir` 而不是留空，是为了让现有
     // 接管路径（它无条件用这个字段做路径改写）不需要理解两种语义：对恢复来说
     // "旧前缀 = 当前数据目录"恰好是正确的。
-    let pending = crate::migration_pending::PendingMigration::for_kind(
+    //
+    // 【为什么要把源备份包的名字记进标记】这一提交到下次启动之间有个可能很长的窗口，
+    // 而**自动备份的轮换会在这个窗口里继续跑**。用户点了恢复 → 没重启 → 后台触发一次
+    // 备份 → 轮换把那份包当作"最老的、未固定的"删掉。后果是双重的：既没有可重来的包
+    // （连"再点一次恢复"都做不到），而且如果提升失败就更没有任何退路。
+    //
+    // 记下名字之后，运行期会把它**固定住**（见下面的 `protect_pending_backup`），
+    // 启动期提升成功后解除固定 —— 见 `app/setup.rs`。
+    let pending = crate::migration_pending::PendingMigration::for_kind_protecting(
         crate::migration_pending::PendingKind::LocalRestore,
         data_dir.clone(),
         staging.clone(),
@@ -294,6 +331,7 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
         // 反过来（先写标记再组装）会让下次启动把一个不完整的片段当成正式数据提升。
         true,
         env!("CARGO_PKG_VERSION"),
+        backup_archive_name(req),
     );
 
     let marker_path = match crate::migration_pending::write(marker_dir, &pending) {
@@ -4193,6 +4231,119 @@ mod reviewer_fix_tests {
 ///   来确定性地复现，而不是假装自己复现了平台行为。真机验证清单见任务交付说明。
 #[cfg(test)]
 mod two_phase_restore_tests {
+    use super::*;
+
+    // =======================================================================
+    // 源备份包的保护名：只有"真的会被轮换删掉"的包才记
+    // =======================================================================
+    //
+    // 恢复提交时要把源包名写进待接管标记，好让自动备份轮换**不删它** ——
+    // 否则用户点了恢复却没重启，后台备份一跑就把那份包当"最老的、未固定的"删掉，
+    // 他既没有可重来的包，也没有退路。
+    //
+    // 但**不是所有恢复都需要保护**：数据管理里的「导入备份」用的是用户自选的任意路径
+    // （桌面、U 盘……），那些包不在自动备份目录里，也就永远不会被轮换碰到。
+    // 给它们也记一个名字是**虚假的保护** —— 标记里写着"在保护"，而实际上什么都没保护，
+    // 读代码的人会以为有条链路在起作用。
+
+    /// 本模块专用的临时根目录（各测试模块各有一份，互不共享状态）。
+    fn local_tmp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tiez-protect-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 源包**在**自动备份目录内 → 记下名字（这才有保护的意义）。
+    #[test]
+    fn archive_inside_auto_backup_dir_is_recorded_for_protection() {
+        let parent = local_tmp_root("protect-name-inside");
+        let data_dir = parent.join("com.tieznext");
+        // 自动备份目录是数据目录的**兄弟**：`<父级>/Tiez-Next/auto_backups/`
+        let auto_dir = parent.join("Tiez-Next").join("auto_backups");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        let archive = auto_dir.join("20260925T010000-scheduled-1.zip");
+        std::fs::write(&archive, b"x").unwrap();
+
+        let name = backup_archive_name(&RestoreRequest {
+            data_dir: data_dir.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data_dir)),
+        });
+
+        assert_eq!(
+            name.as_deref(),
+            Some("20260925T010000-scheduled-1.zip"),
+            "源包在自动备份目录内时必须记下名字，否则轮换会把它删掉"
+        );
+    }
+
+    /// 源包**不在**自动备份目录内（用户从桌面导入）→ 不记名字。
+    #[test]
+    fn archive_outside_auto_backup_dir_is_not_recorded() {
+        let parent = local_tmp_root("protect-name-outside");
+        let data_dir = parent.join("com.tieznext");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let desktop = parent.join("Desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let archive = desktop.join("我的备份.zip");
+        std::fs::write(&archive, b"x").unwrap();
+
+        let name = backup_archive_name(&RestoreRequest {
+            data_dir: data_dir.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data_dir)),
+        });
+
+        assert_eq!(
+            name, None,
+            "桌面上的包不会被轮换碰到，记名字是虚假的保护"
+        );
+    }
+
+    /// 名字只在"包确实在自动备份目录里"时才有 —— 与标记目录无关。
+    ///
+    /// 【这条测试原先写的是另一件事】它以前断言"没有标记目录 → 不记名字"，因为当时的
+    /// 判据借用了 `pending_marker_dir.parent()`。后来判据改成**精确的自动备份目录**，
+    /// 这个函数的输入就只剩 `data_dir` 与 `archive_path` 两项 —— 标记目录写不写得成
+    /// 是调用方的事（拿不到标记目录时 `restore_backup` 会直接失败并回滚暂存，
+    /// 根本走不到写标记这一步）。
+    ///
+    /// 保留这条测试但改成验证真实语义：**判据单一**，不依赖无关的请求字段。
+    #[test]
+    fn protection_name_depends_only_on_archive_location_not_marker_dir() {
+        let parent = local_tmp_root("protect-name-nodir");
+        let data_dir = parent.join("com.tieznext");
+        let auto_dir = crate::services::auto_backup::store::auto_backup_dir(&data_dir);
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        let archive = auto_dir.join("a.zip");
+        std::fs::write(&archive, b"x").unwrap();
+
+        let with_marker = backup_archive_name(&RestoreRequest {
+            data_dir: data_dir.clone(),
+            archive_path: archive.clone(),
+            pending_marker_dir: Some(marker_dir_for(&data_dir)),
+        });
+        let without_marker = backup_archive_name(&RestoreRequest {
+            data_dir,
+            archive_path: archive,
+            pending_marker_dir: None,
+        });
+
+        assert_eq!(with_marker.as_deref(), Some("a.zip"));
+        assert_eq!(
+            with_marker, without_marker,
+            "判据必须只取决于包的位置；牵进标记目录会让「什么算受保护」变得难以推理"
+        );
+    }
+
     use super::*;
     use crate::services::backup::export::{create_backup, BackupRequest};
 

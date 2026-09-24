@@ -145,6 +145,22 @@ pub struct PendingMigration {
     pub created_at: u64,
     /// 写入时的应用版本，便于排查"哪一版留下的"。
     pub app_version: String,
+    /// **这次恢复用的源备份包名**（仅 `LocalRestore` 有值）。
+    ///
+    /// 【为什么必须记下来】恢复是两阶段的：提交（运行期）与提升（下次启动）之间有个
+    /// 可能很长的时间窗，而**自动备份的轮换**会在这个窗口里继续跑。用户点了恢复 →
+    /// 没重启 → 后台触发一次备份 → 轮换把那份包当作"最老的、未固定的"删掉。
+    ///
+    /// 后果是双重的：用户重启后**既没拿到新数据**（其实拿到了，但若提升失败就没退路）、
+    /// **也没有可重来的包**（他连"再点一次恢复"都做不到）。
+    ///
+    /// 所以提交时要把这份包**固定住**（pin），而固定需要一个名字 —— 就是本字段。
+    /// 提升成功后由启动期解除固定，避免它长期占着留存名额。
+    ///
+    /// 【为什么不用 `source_dir` 顺手存】那个字段在 `LocalRestore` 下承载的是
+    /// "旧路径前缀"语义（被路径改写逻辑无条件使用），往里塞一个 zip 名会让两件事
+    /// 混在一个字段里 —— 那正是本仓库反复强调要避免的。
+    pub protected_backup: Option<String>,
 }
 
 impl PendingMigration {
@@ -174,12 +190,37 @@ impl PendingMigration {
         staging_done: bool,
         app_version: impl Into<String>,
     ) -> Self {
+        Self::for_kind_protecting(
+            kind,
+            source_dir,
+            staging_dir,
+            target_dir,
+            staging_done,
+            app_version,
+            None,
+        )
+    }
+
+    /// 与 [`Self::for_kind`] 相同，但额外记下"这次恢复所用的源备份包名"。
+    ///
+    /// 见 [`Self::protected_backup`] 的说明：这个名字用于把该包**固定住**，
+    /// 免得在"已提交、未重启"的时间窗里被自动备份轮换删掉。
+    pub fn for_kind_protecting(
+        kind: PendingKind,
+        source_dir: PathBuf,
+        staging_dir: PathBuf,
+        target_dir: PathBuf,
+        staging_done: bool,
+        app_version: impl Into<String>,
+        protected_backup: Option<String>,
+    ) -> Self {
         Self {
             kind,
             source_dir,
             staging_dir,
             target_dir,
             staging_done,
+            protected_backup,
             created_at: now_unix_secs(),
             app_version: app_version.into(),
         }
@@ -296,8 +337,15 @@ fn json_bool_field(src: &str, key: &str) -> Option<bool> {
 
 /// 渲染成标记文件的文本形式（`\n` 结尾，人可读）。
 pub fn render(pending: &PendingMigration) -> String {
+    // `protectedBackup` **只在有值时输出**：它是 V2 之后新增的可选字段，
+    // 迁移那条链（`Takeover`）永远没有它。不输出比输出 `null` 更干净 ——
+    // 读回时"缺字段"与"null"都映到 `None`，两种写法等价，但少一个字段更易读。
+    let protected = match &pending.protected_backup {
+        Some(name) => format!(",\n  \"protectedBackup\": \"{}\"", escape_json(name)),
+        None => String::new(),
+    };
     format!(
-        "{{\n  \"format\": \"{}\",\n  \"kind\": \"{}\",\n  \"sourceDir\": \"{}\",\n  \"stagingDir\": \"{}\",\n  \"targetDir\": \"{}\",\n  \"stagingDone\": {},\n  \"createdAt\": {},\n  \"appVersion\": \"{}\"\n}}\n",
+        "{{\n  \"format\": \"{}\",\n  \"kind\": \"{}\",\n  \"sourceDir\": \"{}\",\n  \"stagingDir\": \"{}\",\n  \"targetDir\": \"{}\",\n  \"stagingDone\": {},\n  \"createdAt\": {},\n  \"appVersion\": \"{}\"{}\n}}\n",
         FORMAT,
         pending.kind.as_str(),
         escape_json(&pending.source_dir.to_string_lossy()),
@@ -306,6 +354,7 @@ pub fn render(pending: &PendingMigration) -> String {
         pending.staging_done,
         pending.created_at,
         escape_json(&pending.app_version),
+        protected,
     )
 }
 
@@ -337,6 +386,9 @@ pub fn parse(raw: &str) -> Option<PendingMigration> {
         staging_done: json_bool_field(raw, "stagingDone").unwrap_or(!is_v2),
         created_at: json_u64_field(raw, "createdAt").unwrap_or(0),
         app_version: json_string_field(raw, "appVersion").unwrap_or_default(),
+        // 可选字段：只有恢复那条链会写它（迁移没有"源备份包"这个概念）。
+        // 缺字段与 null 都映到 `None`，两种写法等价。
+        protected_backup: json_string_field(raw, "protectedBackup").filter(|s| !s.is_empty()),
     })
 }
 
@@ -606,6 +658,14 @@ mod tests {
     fn marker_round_trips_through_text_form() {
         for kind in [PendingKind::Takeover, PendingKind::LocalRestore] {
             for staging_done in [true, false] {
+                // `protected_backup` 两种取值都要往返：
+                // `None` 是迁移那条链（它没有"源备份包"这个概念），
+                // `Some` 是恢复那条链（它要把包名记下来免得被轮换删掉）。
+                // 只测一种会让另一种的序列化悄悄坏掉。
+                for protected in [
+                    None,
+                    Some("20260925T010000-scheduled-1.zip".to_string()),
+                ] {
                 let pending = PendingMigration {
                     kind,
                     source_dir: PathBuf::from(r"D:\备份\旧数据"),
@@ -616,6 +676,7 @@ mod tests {
                     staging_done,
                     created_at: 1_790_000_000,
                     app_version: "0.5.3".to_string(),
+                    protected_backup: protected.clone(),
                 };
                 let text = render(&pending);
                 assert!(
@@ -629,8 +690,9 @@ mod tests {
                 assert_eq!(
                     parse(&text).as_ref(),
                     Some(&pending),
-                    "标记必须能原样解析回来（kind={kind:?} staging_done={staging_done}）"
+                    "标记必须能原样解析回来（kind={kind:?} staging_done={staging_done} protected={protected:?}）"
                 );
+                }
             }
         }
     }
