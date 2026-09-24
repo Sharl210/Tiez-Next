@@ -36,6 +36,17 @@ export const invoke = async (cmd: string) => {
     // 干扰截图取色（本文件曾缺它）。
     // 系统级设置清单：返回"一项满足、一项待处理、一项无法确认"三种状态，
     // 好让验证台能同时量到三种呈现（否则只会渲染出其中一种，漏掉另两种的样式问题）。
+    /**
+     * 全库标签（含**尚无条目的**）。
+     *
+     * 这里刻意放两个"没有任何条目在用"的标签（`ims-未使用` / `img-未使用`）。
+     * 主页面的候补池曾经**只**从 history 的 `item.tags` 收集，于是这类标签
+     * 在标签管理页看得到、在主页面打标签时搜不到 —— 用户的原话是
+     * "怎么输入都只有这个"。带上它们，量测才有判别力。
+     */
+    case "get_all_tags_info": return {
+      ims: 3, img: 1, invoice: 0, "ims-未使用": 0, "img-未使用": 0,
+    };
     case "get_system_checklist": return [
       { id: "firewall", satisfied: false, probeOk: true, detail: "Action: Block", ack: false },
       { id: "uac", satisfied: false, probeOk: false, detail: "UAC 探测仅支持 Windows", ack: false },

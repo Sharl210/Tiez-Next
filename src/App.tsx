@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { collectSelectableTags } from "./features/clipboard/lib/selectableTags";
 import { listen } from "@tauri-apps/api/event";
 import ToastContainer from "./shared/components/ToastContainer";
 import ConfirmDialog from "./shared/components/ConfirmDialog";
@@ -496,28 +497,80 @@ const App = () => {
     [hotkey]
   );
 
-  // Compute all tags when tag manager / tag filter is open, or while editing an item's tags (quick-pick list)
-  const allTags = useMemo(() => {
-    if (!effectiveShowTagManager && !showTagFilter && editingTagsId === null) return [];
+  /**
+   * 页面上"可选的全部标签"。
+   *
+   * # 数据来源：`saved_tags` **并上**当前历史里出现过的标签
+   *
+   * 这里原先**只**从 `history` 的 `item.tags` 收集。后果是：用户在标签管理页
+   * 建好、但还没赋给任何条目的标签，在主页面打标签时**搜不到** —— 输入什么都只能
+   * 看到已用过的那一两个。用户的原话是"怎么输入都只有这个"。
+   *
+   * 而标签管理页读的是 `get_all_tags_info`（`tag_repo.get_all_with_counts`），
+   * 那个查询**已经把 `saved_tags` 里 0 条目的标签也列出来了**
+   * （见其内注释 "Also include saved tags with 0 count"）。两边数据源不同，
+   * 于是同一个标签在管理页看得到、在主页面看不到。
+   *
+   * ⇒ 改为两者合并：以 `saved_tags` 为准（它更全），历史里出现过的名字作为补充
+   * （`saved_tags` 行被删掉、而条目上仍留着该名字时，它不该凭空消失 ——
+   * 那仍然是这条记录的真实标签）。
+   *
+   * # 内置敏感标签名仍然不注入
+   *
+   * 它们曾经被无条件加进来，于是删不掉：删了分组 → `saved_tags` 行没了 →
+   * 下一次渲染又把名字塞回每个选择器。现在它们只从**数据**里回来 ——
+   * 隐私保护开着且有条目命中敏感规则时，捕获管线会把 `sensitive` 写到那个条目上
+   * （`services/clipboard/pipeline.rs`），于是名字经由下面的 `history` 出现。
+   * 删掉的分组因此会一直保持删除状态，直到真的有匹配内容进来。
+   */
+  /**
+   * 全库标签名（`saved_tags` 的全部内容，含尚无条目的）。
+   *
+   * # 为什么单独拉一次，而不是复用标签管理页那份
+   *
+   * 标签管理页有自己的 `fetchTags`，但它只在管理页打开时跑，且结果留在那个组件里。
+   * 主页面的标签编辑器需要同一份数据 —— 而在此之前它**根本没有**这份数据，
+   * 只能从已加载的历史里凑，于是"在管理页建好、还没用过的标签"在主页面搜不到。
+   *
+   * # 拉取时机
+   *
+   * 只在**标签编辑器打开、筛选器打开、或管理页打开**时拉 —— 与 `allTags` 的守卫
+   * 条件一致。平时不拉，避免为一个不显示的东西增加启动期请求。
+   *
+   * 拉失败时保持上一次的值（不清空）：宁可显示略旧的标签池，也不要因为一次读取失败
+   * 让候补列表突然变空 —— 那看起来就像"功能坏了"。
+   */
+  const [savedTagNames, setSavedTagNames] = useState<string[]>([]);
 
-    const set = new Set<string>();
-    // Built-in sensitive names are deliberately NOT injected here.
-    //
-    // They used to be added unconditionally, which made them impossible to get rid
-    // of: deleting the group removed its `saved_tags` row, and the next render put
-    // the name straight back into every picker. Injecting them only while privacy
-    // protection is on would still resurrect them after a deliberate delete.
-    //
-    // They now come back the honest way — from data. When privacy protection is on
-    // and an entry matches a sensitive rule, the capture pipeline pushes `sensitive`
-    // onto that entry (`services/clipboard/pipeline.rs`), so the name is found via
-    // the history below and the group reappears carrying its entries. A deleted group
-    // therefore stays deleted until real matching content arrives.
-    history.forEach((item) => {
-      (item.tags || []).forEach((tag) => set.add(tag));
-    });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [history, effectiveShowTagManager, showTagFilter, editingTagsId]);
+  useEffect(() => {
+    if (!effectiveShowTagManager && !showTagFilter && editingTagsId === null) return;
+    let cancelled = false;
+    invoke<Record<string, number>>("get_all_tags_info")
+      .then((map) => {
+        if (cancelled) return;
+        setSavedTagNames(Object.keys(map ?? {}));
+      })
+      .catch((err) => {
+        // 保持旧值，不清空 —— 见上方注释。
+        console.error("[TAGS] 读取全库标签失败，候补列表将只显示已用过的标签：", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveShowTagManager, showTagFilter, editingTagsId]);
+
+  const allTags = useMemo(
+    () =>
+      collectSelectableTags({
+        savedTagNames,
+        historyTags: history.flatMap((item) => item.tags ?? []),
+        // 这三者任一为真时页面才需要标签池（编辑器打开 / 筛选器 / 管理页）。
+        // 都不需要时返回空数组，避免为一个不显示的东西白算一遍。
+        needed:
+          effectiveShowTagManager || showTagFilter || editingTagsId !== null,
+      }),
+    [history, savedTagNames, effectiveShowTagManager, showTagFilter, editingTagsId]
+  );
 
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {

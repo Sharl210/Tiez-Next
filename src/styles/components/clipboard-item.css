@@ -437,14 +437,43 @@
   filter: saturate(1.15);
 }
 
-/* 编辑备注按钮：默认与其它图标按钮一样安静，悬停/激活时才亮出来 ——
-   避免一排图标按钮里有一个长期抢眼。 */
-.note-edit-btn {
-  color: var(--text-secondary);
-  transition: color 0.15s ease;
+/* 编辑备注按钮的 ✨：与备注行那个 ✨ **同一个颜色**。
+ *
+ * 用户的原话是"备注的图标应该是和这个 ✨ 要**百分百一致**不管是颜色还是形状"。
+ *
+ * 上一版这里写的是"默认灰、悬停才上色"—— 那是一般图标按钮的做法，但**对这一个
+ * 按钮是错的**：它的作用就是标识"备注"，而备注行的 ✨ 是常态有色的。两者常态下
+ * 颜色不同，用户看到的就还是"不一致"。所以这里改成**常态即主题色**，与
+ * `.entry-note-sparkle` 完全一致；悬停只做轻微提亮，不再改变色相。
+ *
+ * 之所以不再担心"一排图标里有一个抢眼"：备注行的 ✨ 本来就是这个界面的常态，
+ * 按钮跟着它有颜色恰恰构成"✨ = 备注"的一致符号，而不是噪音。
+ */
+/*
+ * 【为什么选择器要写成三个类：`.btn-icon.note-edit-btn.entry-note-mark`】
+ *
+ * 主题文件里有 `.theme-sticky-note .btn-icon { color: var(--text-secondary) }`。
+ * 它是**两个类**，而它在产物里排在组件样式**之后**（实测：组件规则偏移 37885，
+ * 主题规则偏移 181097），所以两个类对两个类时**主题赢**。
+ *
+ * 实测后果：sticky-note 主题下按钮的 ✨ 是 `--text-secondary`（棕 rgb(122,92,80)），
+ * 而备注行那个是 `--accent-color`（橙金 rgb(240,167,11)）—— 两处仍然不一致，
+ * 正好违背用户"要和这个 ✨ **百分百一致**"的要求。
+ *
+ * 提到**三个类**后严格高于主题规则，无需 `!important`，也不必去每套主题里补例外
+ * （那是"改一处漏一处，新主题又会漏"的做法）。
+ *
+ * `entry-note-mark` 这个类本身没有样式，它只用于把特异性抬到 3 ——
+ * 名字取"备注标记"，避免下一个读代码的人以为它是个装饰类。
+ */
+.btn-icon.note-edit-btn.entry-note-mark {
+  color: var(--accent-color, var(--text-secondary));
+  filter: saturate(1.15);
+  transition: filter 0.15s ease;
 }
 
-.note-edit-btn:hover,
-.note-edit-btn.active {
-  color: var(--accent-color, var(--text-secondary));
+.btn-icon.note-edit-btn.entry-note-mark:hover,
+.btn-icon.note-edit-btn.entry-note-mark.active {
+  /* 只提亮，不改色相 —— 改色相会让"悬停前 / 悬停后"看起来是两个不同的图标 */
+  filter: saturate(1.15) brightness(1.12);
 }

@@ -2266,7 +2266,7 @@ const ClipboardItem = ({
                         )}
                         {isNoteEditable(item.content_type) && onEditNote && (
                             <button
-                                className={`btn-icon note-edit-btn ${noteEditorOpen ? "active" : ""}`}
+                                className={`btn-icon note-edit-btn entry-note-mark ${noteEditorOpen ? "active" : ""}`}
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onEditNote(e);
@@ -2281,7 +2281,18 @@ const ClipboardItem = ({
                                   * 毫无关联 —— 用户只能靠 tooltip 才知道这个按钮是干什么的。
                                   * 两处统一之后，"✨ = 备注"成了这个界面的固定符号。
                                   */}
-                                <Sparkles size={12} />
+                                {/*
+                                  * 【尺寸与备注行的 ✨ 严格一致（都是 10）】
+                                  *
+                                  * 此前这里是 12、备注行是 10 —— 用户的原话是
+                                  * "备注的图标应该是和这个 ✨ 要**百分百一致**不管是颜色还是形状"。
+                                  * 两个同款图标只差 2px 时，并排看过去就是"不一样"，而这种
+                                  * 不一致没有任何设计理由支撑（它只是两处各写各的默认值造成的）。
+                                  *
+                                  * 颜色由 `.note-edit-btn` 给（与 `.entry-note-sparkle`
+                                  * 用同一个令牌），见 clipboard-item.css。
+                                  */}
+                                <Sparkles size={10} />
                             </button>
                         )}
                         <button
