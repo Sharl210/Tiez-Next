@@ -320,8 +320,16 @@ export const useSettingsPostInit = ({
     // 多显示器下跟随鼠标会让窗口随焦点跨屏跳变，与「窗口保留在唤起屏」的期望相反。
     setFollowMouse(settings["app.follow_mouse"] === "true");
     setShowAppBorder(settings["app.show_app_border"] === "true");
-    setRegistryWinVEnabled(settings["app.registry_win_v_enabled"] === "true");
-    setPasteMethod(settings["app.paste_method"] || "simulate");
+    // Win+V 接管：**唯一真键**是 `app.use_win_v_shortcut`（后端 `setup.rs` 也读它）。
+    //
+    // 【为什么必须统一】历史上这里读的是 `app.registry_win_v_enabled`，而后端读的是
+    // `app.use_win_v_shortcut`——两个键名指同一个功能，于是"界面显示的开关状态"与
+    // "后端实际触发的优化"永远可能不一致（而且两个键**都没人写**，分支永不可达）。
+    // 统一到 `app.use_win_v_shortcut` 之后，"界面"与"后端"才可能指向同一件事；
+    // 老用户库里可能只存在旧键，由后端 `setup.rs` 的一次性迁移搬过来（新键已存在时
+    // 不覆盖，用户的最近意愿优先）。
+    setRegistryWinVEnabled(settings["app.use_win_v_shortcut"] === "true");
+    setPasteMethod(settings["app.paste_method"] || "shift_insert");
     setShowSourceAppIcon(settings["app.show_source_app_icon"] !== "false");
 
 

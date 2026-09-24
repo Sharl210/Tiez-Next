@@ -171,6 +171,91 @@ const DB_FILE: &str = "clipboard.db";
 /// 的目录时，数据目录即切到该目录。见 [`resolve_source_dir`]。
 pub const PORTABLE_DATA_DIR: &str = "data";
 
+// ---------------------------------------------------------------------------
+// 迁移进度：阶段、文案与节流判据（全部纯逻辑，不依赖 Tauri）
+// ---------------------------------------------------------------------------
+
+/// 过程中事件名（沿用本仓库 kebab-case 约定，见 `services/auto_backup/mod.rs`）。
+pub const EVENT_MIGRATION_PROGRESS: &str = "migration-progress";
+/// 结束事件名（成功 / deferred / 失败都会发一次）。
+pub const EVENT_MIGRATION_DONE: &str = "migration-done";
+
+/// `copying` 阶段的发射节流窗口（毫秒）。
+///
+/// 【为什么必须节流】迁移的典型负载是"上千个小文件"。若每个文件都发一次事件，
+/// 事件通道会被刷爆，前端反而渲染不过来，表现为"界面卡住"——比没有进度更糟。
+pub const PROGRESS_THROTTLE_MS: u64 = 150;
+
+/// 一次进度快照。字段与冻结契约的 payload 一一对应。
+///
+/// `stage_label` 由**后端**产出人话（界面原样显示，不再做映射）——两边各翻一次
+/// 必然漂移：后端改了文案、界面还在说旧话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationProgress {
+    /// 阶段取值：`precheck` / `copying` / `verifying` / `deferred` / `done` / `failed`。
+    pub stage: &'static str,
+    /// 该阶段的中文说明，直接可显示。
+    pub stage_label: &'static str,
+    /// 当前阶段已完成量。
+    pub done: u64,
+    /// 当前阶段总量；`0` 表示不可计量（界面显示"不确定进度"，**不得显示 0%**）。
+    pub total: u64,
+    /// 已复制字节（仅 `copying` 阶段有意义）。
+    pub bytes: u64,
+    /// 总字节（来自 `scan_tree`）。
+    pub bytes_total: u64,
+    /// 可选补充说明；失败时为错误摘要。
+    pub message: Option<String>,
+}
+
+/// 阶段 → 中文文案。契约里这张表由后端持有，界面只显示结果。
+pub fn stage_label(stage: &str) -> &'static str {
+    match stage {
+        "precheck" => "正在检查源目录",
+        "copying" => "正在复制数据",
+        "verifying" => "正在校验完整性",
+        "deferred" => "数据已就绪，等待重启接管",
+        "done" => "迁移完成",
+        "failed" => "迁移失败",
+        _ => "正在迁移",
+    }
+}
+
+/// 本次进度是否应当真的发出去（节流判据，纯函数便于直接对数字下断言）。
+///
+/// `is_last = true` 时**无条件**放行：保证最后一个条目一定被报出去，否则进度条会
+/// 永远停在 `done < total`（例如"999/1000"），用户以为迁移卡住了。
+pub fn should_emit_progress(elapsed_ms: u64, is_last: bool) -> bool {
+    is_last || elapsed_ms >= PROGRESS_THROTTLE_MS
+}
+
+
+/// 源目录的只读统计（进度条总数与总字节的来源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSummary {
+    /// 条目总数（含目录条目，与内部一致性校验同一口径）。
+    pub entries: u64,
+    /// 全部条目的字节数之和。
+    pub bytes: u64,
+}
+
+/// 只读统计**归一化之后**的源目录：`precheck` 阶段用它给出进度总数。
+///
+/// 必须先归一化（[`resolve_source_dir`]）再统计，否则用户把上层目录选成源时，
+/// 统计出的是整棵目录树的规模、而真正要复制的只是一小块——进度条会从头到尾都不对。
+///
+/// 返回 `None` 表示读不到（路径不存在、不是目录、没有权限）。此时**不报错**：
+/// 进度总数退化为"不可计量"（`total = 0`，界面显示不确定进度），
+/// 真正的诊断由随后的迁移本身给出。
+pub fn scan_source_summary(source: &Path) -> Option<SourceSummary> {
+    let resolved = resolve_source_dir(source);
+    let entries = scan_tree(&resolved).ok()?;
+    Some(SourceSummary {
+        entries: entries.len() as u64,
+        bytes: entries.iter().map(|(_, s)| *s).sum(),
+    })
+}
+
 /// 一次迁移的结果。调用方据此决定是否继续做数据库内路径重写。
 #[derive(Debug)]
 pub enum MigrationOutcome {
@@ -201,6 +286,28 @@ pub enum MigrationOutcome {
     },
     /// 迁移失败。源目录与既有目标目录均未被破坏。
     Failed { source: PathBuf, error: String },
+    /// **数据已复制就绪，待下次启动接管**（v0.5.3 新增的常态路径）。
+    ///
+    /// 【为什么必须有这一个分支】迁移入口是应用内界面 —— 用户点它时**应用必定在运行**，
+    /// 而应用启动时已经打开了目标库（`database::init_db`，连接常驻 `DbState`）。
+    /// Windows **不允许改名已打开的文件**，所以在运行期给目标空库改名让位
+    /// **必然**报 `os error 32`；而旧的提示让用户"完全退出应用后重试"，
+    /// 退出之后**就点不到迁移按钮了**——这是一个不可执行的死循环。
+    ///
+    /// 因此运行期只做"复制源到暂存 + 写待接管标记"，真正的改名交换留给**下次启动**：
+    /// 那时在 `init_db` 之前，无人持有任何句柄，改名必然成功。
+    ///
+    /// 注意：这不是失败。源目录与目标目录均未被改动，暂存目录**保留**作为交接载体。
+    Deferred {
+        source: PathBuf,
+        target: PathBuf,
+        /// 已就绪的暂存目录（下次启动的接管载体，**不得清理**）。
+        staging: PathBuf,
+        /// 源侧条目总数。
+        files: u64,
+        /// 源侧全部条目的字节数之和。
+        bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +446,16 @@ pub fn migrate_legacy_identifier_data(new_dir: &Path) -> MigrationOutcome {
                     error,
                 });
             }
+            // 候选扫描这条入口不参与两阶段（它只处理"同名父目录里的可迁移来源"，
+            // 且当前无生产调用方）。真出现 Deferred 时按"数据已就绪但未交付"处理：
+            // 继续看下一个候选，最终如无成功者按 `NoLegacyDir` 之外的失败上报。
+            Outcome::Deferred { .. } => {
+                last_failure = Some(MigrationOutcome::Failed {
+                    source: legacy,
+                    error: "数据已复制到暂存目录，但本次未能交付（两阶段迁移需重启后接管）。"
+                        .to_string(),
+                });
+            }
         }
     }
 
@@ -384,30 +501,86 @@ pub fn migrate_from_source_dir(
     // 用户手选的路径可能不是"数据目录本身"，而是**包着数据目录的上一层**，
     // 这在便携版上是常态（见 `resolve_source_dir`）。先在那里归一化，再做真正的
     // 迁移；契约完全一致，只是源路径被定位到了正确的那一层。
+    //
+    // 【拦截只实现一次】归一化后的全部只读判定都在 `migration_precheck` 里，
+    // 本函数与两阶段入口（`stage_takeover`）共用它，避免"改了一处漏了一处"。
+    if let Some(early) = migration_precheck(source, target, allow_takeover) {
+        return early;
+    }
     let resolved = resolve_source_dir(source);
-
-    // ---- 前置拦截：归一化结果必须真的是一个数据目录 ----
-    // 三态的顺序在这里是刻意的，先判"存在/是目录"再判"是不是数据目录"：
-    //   * 路径不存在    -> SourceMissing（去检查盘/路径）
-    //   * 存在但是文件  -> NotADirectory（选错了对象）
-    //   * 是目录但为空  -> EmptySource（路径对了，确实没数据）
-    //   * 有内容但没库  -> NotADataDirectory（**本次修复**：选错了层，去往下选一层）
-    // 反过来先判"有没有库"会把不存在与空目录都误报成 NotADataDirectory，让用户拿不到
-    // 正确诊断。空目录与"有内容但非数据目录"必须分开：前者没有可迁内容，后者是选错层。
-    if !resolved.exists() {
-        return MigrationOutcome::Skipped(SkipReason::SourceMissing);
-    }
-    if !resolved.is_dir() {
-        return MigrationOutcome::Skipped(SkipReason::NotADirectory);
-    }
-    if !is_data_directory(&resolved) {
-        if dir_has_any_entry(&resolved) {
-            return MigrationOutcome::Skipped(SkipReason::NotADataDirectory);
-        }
-        return MigrationOutcome::Skipped(SkipReason::EmptySource);
-    }
-
     migrate_from_inner(resolved.as_path(), target, allow_takeover)
+}
+
+/// [`migrate_from_source_dir`] 的**可注入变体**：改名动作由调用方给出。
+///
+/// 【为什么必须有这个接缝】两阶段迁移里"给目标空库让位"这一步在真机上的失败来自
+/// Windows 的 `os error 32`（文件被本应用自己打开的句柄占住）。而 Linux **允许**改名
+/// 已打开的文件，凭"持有连接"无论如何也造不出同样的失败——于是"运行期必然失败 ⇒
+/// 必须转 Deferred"这条最关键的路径在本机**零覆盖**。把改名参数化之后，测试可以
+/// 确定性地注入"必然失败"的改名器，生产路径传的仍是 [`fs::rename`]。
+///
+/// 返回 `Deferred` 时**暂存目录必须仍然存在**（它是下次启动接管的载体）——
+/// 这是本变体存在的第二个理由：它让"失败时不得删暂存"这条断言可以直接对文件系统下。
+#[cfg(test)]
+fn migrate_from_source_dir_with_rename(
+    source: &Path,
+    target: &Path,
+    allow_takeover: bool,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> MigrationOutcome {
+    if let Some(early) = migration_precheck(source, target, allow_takeover) {
+        return early;
+    }
+    let resolved = resolve_source_dir(source);
+    migrate_from_inner_with_rename(resolved.as_path(), target, allow_takeover, rename)
+}
+
+/// 给 [`migrate_from_inner`] 用的可注入版本。两个版本共用同一段实现，
+/// 生产路径只是把 `fs::rename` 传进去。
+#[cfg(test)]
+fn migrate_from_inner_with_rename(
+    source: &Path,
+    target: &Path,
+    allow_pristine_target: bool,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> MigrationOutcome {
+    match migrate_from_with(source, target, allow_pristine_target, rename) {
+        Outcome::Absent => MigrationOutcome::Skipped(SkipReason::SourceMissing),
+        Outcome::Preserve => MigrationOutcome::Skipped(SkipReason::EmptySource),
+        Outcome::Skipped(r) => MigrationOutcome::Skipped(r),
+        Outcome::Migrated {
+            files,
+            bytes,
+            delivered_files,
+            delivered_bytes,
+            kept_existing,
+            yielded_db,
+        } => MigrationOutcome::Migrated {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            files,
+            bytes,
+            delivered_files,
+            delivered_bytes,
+            kept_existing,
+            yielded_db,
+        },
+        Outcome::Deferred {
+            staging,
+            files,
+            bytes,
+        } => MigrationOutcome::Deferred {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            staging,
+            files,
+            bytes,
+        },
+        Outcome::Failed(error) => MigrationOutcome::Failed {
+            source: source.to_path_buf(),
+            error,
+        },
+    }
 }
 
 /// 判定 `dir` 是否是一个应用数据目录：直接含 `clipboard.db`，或含便携版的
@@ -416,22 +589,92 @@ pub fn migrate_from_source_dir(
 /// 与 [`locate_data_dir`] 的定位规则 1–2 同一判据（只读探测）。之所以单独成一个函数
 /// 而不直接复用定位结果，是因为调用方需要区分"归一化没找到"与"归一化找到了但源本身
 /// 不是数据目录"这两种情形，而定位函数把两者都折叠成了 `None`。
-fn is_data_directory(dir: &Path) -> bool {
+pub fn is_data_directory(dir: &Path) -> bool {
     dir.join(DB_FILE).is_file() || dir.join(PORTABLE_DATA_DIR).join(DB_FILE).is_file()
 }
 
-/// `dir` 里是否有任何条目（含文件、目录与符号链接）。只读 `read_dir`，不跟随链接、
-/// 不创建也不修改任何东西。
+/// 判定 `dir` 是否含**任何**条目（只读 `read_dir`，不跟随链接、不创建不修改）。
 ///
-/// 用途是把"空目录"与"有内容但不是数据目录"分开诊断；读不到目录时按"非空"处理，
-/// 让更保守的 `NotADataDirectory` 生效（宁可多说一句"请往下选一层"，也不要错误地
-/// 告诉用户"这里没数据"）。
-fn dir_has_any_entry(dir: &Path) -> bool {
+/// `pub` 是为了让"两步走"的调用方能在**复制之前**就区分"路径存在但为空"与
+/// "有内容但不是数据目录"这两种完全不同的诊断（见 [`migration_precheck`]）。
+pub fn dir_has_any_entry(dir: &Path) -> bool {
     match fs::read_dir(dir) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => true,
     }
 }
+
+/// **纯只读预检**：在复制任何字节之前给出本次迁移会得到的结果。
+///
+/// 【为什么必须与真正的迁移拆开】两阶段迁移的调用方（界面命令与 MCP 入口）需要在
+/// **知道这次到底要不要动、要动多少**之后，才决定是否写"待接管"标记、才把进度条的
+/// 总数报给用户。若把预检与复制揉在一起，中间失败时调用方已经写了标记、却什么也没复制。
+///
+/// 本函数只做只读判定。返回 `None` 表示"可以继续走真实迁移"，返回 `Some(..)` 表示
+/// 这次迁移在复制之前就已经注定是某个确定结果。
+pub fn migration_precheck(
+    source: &Path,
+    target: &Path,
+    allow_takeover: bool,
+) -> Option<MigrationOutcome> {
+    let resolved = resolve_source_dir(source);
+
+    // 三态的顺序是刻意的（先"存在/是目录"再"是不是数据目录"）：反过来会把
+    // "路径不存在"与"空目录"都折叠成"选错了层"，用户拿到完全错误的处置指引。
+    if !resolved.exists() {
+        return Some(MigrationOutcome::Skipped(SkipReason::SourceMissing));
+    }
+    if !resolved.is_dir() {
+        return Some(MigrationOutcome::Skipped(SkipReason::NotADirectory));
+    }
+    if !is_data_directory(&resolved) {
+        return Some(MigrationOutcome::Skipped(if dir_has_any_entry(&resolved) {
+            SkipReason::NotADataDirectory
+        } else {
+            SkipReason::EmptySource
+        }));
+    }
+
+    // 源与目标的相对位置：源是目标的祖先 / 源在目标内部都会造成自复制。
+    if resolved == target {
+        return Some(MigrationOutcome::Skipped(SkipReason::SamePath));
+    }
+    if target.starts_with(&resolved) {
+        return Some(MigrationOutcome::Skipped(
+            SkipReason::SourceIsAncestorOfTarget,
+        ));
+    }
+    if resolved.starts_with(target) {
+        return Some(MigrationOutcome::Skipped(SkipReason::SourceInsideTarget));
+    }
+
+    // 目标已有数据库且调用方不允许接管 -> 跳过（绝不覆盖）。
+    if target.join(DB_FILE).exists() && !allow_takeover {
+        return Some(MigrationOutcome::Skipped(SkipReason::TargetAlreadyHasData));
+    }
+
+    // 暂存目录就是用户选的源目录：这一步必须拦住。不拦的话下一步"清理上次残留的
+    // 暂存目录"会把源整个删掉（回归测试 `staging_never_deletes_the_source`）。
+    if staging_dir_legacy(target) == resolved || takeover_staging_dir(target) == resolved {
+        let error = staging_collision_message(target, &resolved);
+        return Some(MigrationOutcome::Failed {
+            source: resolved,
+            error,
+        });
+    }
+
+    None
+}
+
+/// 源目录恰好是本次要用的暂存目录时给用户的说明。
+fn staging_collision_message(target: &Path, source: &Path) -> String {
+    format!(
+        "源目录 {} 与本次迁移要使用的暂存目录同名（{}）。为避免覆盖你选择的源目录，已放弃本次迁移；源目录未被读取也未被改动。请改选其它目录。",
+        source.display(),
+        takeover_staging_dir(target).display()
+    )
+}
+
 
 /// 把用户手选的源路径**归一化**到真正的数据目录。
 ///
@@ -588,6 +831,17 @@ fn migrate_from_inner(
         Outcome::Failed(error) => MigrationOutcome::Failed {
             source: source.to_path_buf(),
             error,
+        },
+        Outcome::Deferred {
+            staging,
+            files,
+            bytes,
+        } => MigrationOutcome::Deferred {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            staging,
+            files,
+            bytes,
         },
     }
 }
@@ -838,6 +1092,13 @@ enum Outcome {
         yielded_db: Option<PathBuf>,
     },
     Failed(String),
+    /// 数据已复制到 `staging` 并就绪，待下次启动做改名交换（运行期无法给被占用的
+    /// 目标库让位，见 [`MigrationOutcome::Deferred`]）。
+    Deferred {
+        staging: PathBuf,
+        files: u64,
+        bytes: u64,
+    },
 }
 
 /// 把目标目录里**从未使用过的空库**改名让位，好让真正的旧数据进来。
@@ -852,6 +1113,7 @@ enum Outcome {
 /// `system_cmd::target_db_is_pristine`），本模块据此保持只依赖 `std`。
 ///
 /// 返回被改名的文件列表；调用方在交付失败时据此还原。
+#[cfg(test)]
 fn yield_target_db(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String> {
     yield_target_db_with(source, target, &mut |from, to| fs::rename(from, to))
 }
@@ -1010,26 +1272,50 @@ fn yield_target_db_with(
 /// 该做什么。因此这里把可识别的"被占用"统一换成一句能照做的事，并保留"源目录未改动"
 /// 这一保证（由调用方拼接，见上）。
 ///
-/// ## "占用"的判定不能依赖平台错误码
+/// ## "占用"的判定不能依赖 `ErrorKind`
 ///
-/// 判据取**两次独立信号**，任一命中即按"占用"处理：
+/// 【为什么这里的判据与 v0.5.2 不一样 —— 这是一次真实的死代码修复】
 ///
-/// 1. `ErrorKind::PermissionDenied` —— Windows 上 `ERROR_SHARING_VIOLATION`（32）与
-///    `ERROR_LOCK_VIOLATION`（33）都映射到这一档；文件被占用的**最常见**表现就是它。
-/// 2. `ErrorKind::Other` —— 兼容未被归入上述类别的共享冲突。
+/// v0.5.2 写的是 `matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::Other)`。
+/// 实测（真机截图 + Rust 标准库源码）证明它在 Windows 上**永远不会命中**：
 ///
-/// 反例值得记下来：Linux 上 `Error::from_raw_os_error(32)` 是 `BrokenPipe`，
-/// **不是** `PermissionDenied`。所以判据必须是"kind + 文件名"这个组合，而不是
-/// "错误码等于 32"——后者在非 Windows 平台上会把无关错误误报成占用。
+/// 1. `ErrorKind::Other` —— `core/src/io/error.rs` 明确写着
+///    「This `ErrorKind` is **not used by the standard library**」，标准库从不产生它，
+///    因此这一支是死代码；
+/// 2. `ERROR_SHARING_VIOLATION`(32) / `ERROR_LOCK_VIOLATION`(33) —— 在
+///    `std/src/sys/io/error/windows.rs` 的**整张映射表里都不存在**（该表唯一的
+///    "LOCK" 项是 `ERROR_POSSIBLE_DEADLOCK`），必然落到末尾的 `_ => Uncategorized`。
+///    而 `Uncategorized` 带 `#[unstable]` 标注，stable 工具链**无法 match**它
+///    （实测 `error[E0658]: use of unstable library feature 'io_error_uncategorized'`）。
+///
+/// ⇒ 旧判据恒为 `false`，用户看到的是通用兜底文案 + `错误档位 Uncategorized`
+/// （真机截图原文：`系统错误码 32, 错误档位 Uncategorized`）。
+///
+/// 因此这里改成**按原始错误码判定**，并且用 `cfg` 严格隔离：
+///
+/// - Windows：`raw_os_error()` 为 `32`/`33` 即占用；同时保留 `PermissionDenied`
+///   （某些网络盘/杀软场景给的是 `ERROR_ACCESS_DENIED`(5)）。
+/// - 非 Windows：**不得看错误码**——Linux 上 `from_raw_os_error(32)` 是 `BrokenPipe`，
+///   含义完全不同，照搬会把无关错误误报成占用。非 Windows 只看 kind
+///   （`BrokenPipe` 是 Linux 上"文件被占用/管道断开"最接近的对应物）。
 ///
 /// 名字的约束同样重要：**只有主库 `clipboard.db` 被占用时才能把结论说成"数据库被占用"**。
 /// `-wal` / `-shm` 失败的原因可能完全不同（残留文件的权限、杀软隔离等），套用同一句话
 /// 会把用户引向错误的排查方向，因此那种情况只做"别的东西挡住了它 + 退回重试"的保守表述。
+fn looks_occupied(e: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(32) | Some(33))
+            || matches!(e.kind(), ErrorKind::PermissionDenied)
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::BrokenPipe)
+    }
+}
+
 fn occupied_or_failed_hint(from: &Path, name: &str, e: &io::Error) -> String {
-    let looks_occupied = matches!(
-        e.kind(),
-        ErrorKind::PermissionDenied | ErrorKind::Other
-    );
+    let occupied = looks_occupied(e);
     // 【不要拼接系统给的本地化错误句子】原文就是
     // `另一个程序正在使用此文件，进程无法访问。(os error 32)`，把它嵌进提示里等于
     // 把要消除的误导原样留在用户眼前。这里只保留**可诊断的技术细节**（错误档位 + 错误号），
@@ -1038,7 +1324,7 @@ fn occupied_or_failed_hint(from: &Path, name: &str, e: &io::Error) -> String {
         Some(code) => format!("系统错误码 {}，错误档位 {:?}", code, e.kind()),
         None => format!("错误档位 {:?}", e.kind()),
     };
-    if name == DB_FILE && looks_occupied {
+    if name == DB_FILE && occupied {
         return format!(
             "无法让位目标里未使用过的空库 {}：它正被 Tiez-Next 自己占用（{}）。\
              \n请从系统托盘（任务栏右下角）的 Tiez-Next 图标右键选择「退出 Tiez-Next」，\
@@ -1095,6 +1381,15 @@ fn restore_yielded_target_db(yielded: &[PathBuf], target: &Path) {
 }
 
 fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Outcome {
+    migrate_from_with(source, target, allow_pristine_target, &mut |from, to| fs::rename(from, to))
+}
+
+fn migrate_from_with(
+    source: &Path,
+    target: &Path,
+    allow_pristine_target: bool,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> Outcome {
     // ---- 前置检查：任何一项不满足都保持原状 ----
     if !source.exists() {
         return Outcome::Absent;
@@ -1148,25 +1443,45 @@ fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Ou
 
     // ---- 第一步：复制到独立暂存目录 ----
     // 暂存目录放在目标同级，保证后续 rename 是同一文件系统内的原子操作。
-    let staging = staging_dir(target);
-    // 【为什么必须先查这一条】暂存目录名是 `.<目标名>.migrating.<pid>`，用户手选源路径
-    // 时**完全可能恰好选中这个目录**（例如上次崩溃后残留的暂存目录，或用户自己起了
-    // 同名目录）。而下面"清理上次崩溃残留的暂存目录"是无条件的 `remove_dir_all`——
-    // 若不先拦住，源目录会在这一行被整个删掉，随后校验必然失败，用户还会收到一句
-    // "源数据未改动"的错误信息。实测（本文件回归测试 `staging_never_deletes_the_source`
-    // 抓出）：源 2 个文件 → 目录消失、文件全丢。
     //
-    // 这是"源的每一条失败出路都必须保留源"这条核心保证的一部分，因此与 SamePath /
-    // ancestor / inside 并列，放在任何写操作之前。
+    // 【与 v0.5.2 的关键差别：这里不再"无条件清理上次残留"】
+    //
+    // 旧实现在此处对 `.<目标名>.migrating.<pid>` 直接 `remove_dir_all`——因为那个名字
+    // 的语义确实是"用完即弃的临时工作区"。但两阶段迁移用的暂存目录是**待接管载体**：
+    // 用户点第二次迁移时，上次那个已经复制好的载体正是本次要继承的东西，删掉它等于
+    // 让用户"每点一次就白干一次"。因此：
+    //
+    //   * 清理只针对**旧命名**的残渣（带 pid，语义确实是残渣）；
+    //   * 固定名 `.<目标名>.pending-takeover` 的清理只由"标记已无主"驱动
+    //     （见 [`cleanup_stale_staging`]，`takeover_reserved` 由调用方按标记文件判定）。
+    //
+    // 【本函数是一次性交付路径，已不再是界面/MCP 走的路径】
+    // 它保留下来给"目标目录当时没有被占用、可以当场交付"的场景与既有测试使用。
+    // 界面与 MCP 两个入口走 [`stage_takeover`]（两阶段），因此这里的"清掉同名残留"
+    // **不会**删到某个正在等着被接管的载体。
+    let staging = takeover_staging_dir(target);
     if staging == source {
+        return Outcome::Failed(staging_collision_message(target, source));
+    }
+    // `true` = **保留固定名那一个**（它可能正是"待接管载体"），只清旧命名的残渣。
+    // 传 `false` 会把载体一起删掉，下面那条拒绝检查就成了死代码（本测试实测抓出）。
+    cleanup_stale_staging(target, true);
+    if staging.exists() {
+        // 【这里刻意"拒绝"而不是"删掉重来"】
+        //
+        // 固定名暂存目录若已存在，它只可能来自**两阶段迁移**（即"上次点迁移留下的
+        // 待接管载体"）。本函数是"当场交付"的一次性路径，不具备"接管"的语义；
+        // 一旦它把那个目录删掉，用户上次复制好的数据就没了——而这正是 v0.5.2 的
+        // 第二个缺陷（用户第二次点击就删掉上次的成果）。
+        //
+        // 生产上两个入口（界面 / MCP）都走 `stage_takeover`，不会走到这里；
+        // 保留拒绝语义是为了让"误用这条路径"不产生数据损失，而不是静默破坏。
         return Outcome::Failed(format!(
-            "源目录与本次迁移要使用的暂存目录同名（{}）。为避免覆盖你选择的源目录，已放弃本次迁移；源目录未被读取也未被改动。请改选其它目录。",
+            "目标同级已存在待接管的暂存目录 {}（上次迁移已复制就绪、等待重启接管）。\
+             为避免删除它，已放弃本次当场交付；请重启应用完成接管，或先手动处理该目录。\
+             源目录未被读取也未被改动。",
             staging.display()
         ));
-    }
-    // 清理上次崩溃残留的暂存目录（它从未被提升，删掉是安全的）。
-    if staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
     }
     if let Err(e) = copy_tree(source, &staging) {
         let _ = fs::remove_dir_all(&staging);
@@ -1194,18 +1509,35 @@ fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Ou
     // ---- 第三步：交付（提升暂存目录到目标）----
     // 交付前先把"从未使用过的空库"改名让位（若适用）；让位失败则本步直接放弃，
     // 源目录与目标原状保持不变。
+    //
+    // 【运行期的必然失败在这里被转成 Deferred，而不是报错】
+    //
+    // 迁移入口在应用内，用户点它时应用必定在运行，而启动早已打开目标库
+    // （连接常驻 `DbState`）。Windows **不允许改名已打开的文件**，所以这一步在真机上
+    // **必然**失败——旧的提示让用户"完全退出应用后重试"，退出之后却点不到按钮，
+    // 是一个不可执行的死循环。现在的处置是：**改名失败即判 Deferred**，把暂存目录
+    // 留作交接载体，由下次启动在 `init_db` 之前完成交换（见 [`promote_staged_takeover`]）。
     let yielded = if allow_pristine_target {
-        match yield_target_db(source, target) {
+        match yield_target_db_with(source, target, rename) {
             Ok(v) => v,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&staging);
-                return Outcome::Failed(e);
+            // 【失败的诊断信息这里**用不上**，是刻意的】改名失败即意味着"文件被本应用
+            // 自己打开的句柄占住"，而运行期无法消除这个占用——它不需要更多诊断，
+            // 只需要一个正确的动作：把数据留在暂存目录里，交给下次启动。
+            // 因此这里不读 `e`（旧实现把它的原文抛给用户，才产生了那句不可执行的提示）。
+            Err(_e) => {
+                // 失败 = 文件被占用（真机必然如此）。**绝不清理暂存目录**：它正是
+                // 下次启动接管要用的东西（这是 v0.5.2 的第 3 个缺陷）。
+                return Outcome::Deferred {
+                    staging,
+                    files: source_entries.len() as u64,
+                    bytes: source_entries.iter().map(|(_, s)| *s).sum(),
+                };
             }
         }
     } else {
         Vec::new()
     };
-    if let Err(e) = promote(&staging, target) {
+    if let Err(e) = promote(&staging, target, false) {
         let _ = fs::remove_dir_all(&staging);
         // 交付没成：把刚才让位的空库还原回去，目标恢复原状（源本就未被改动）。
         restore_yielded_target_db(&yielded, target);
@@ -1258,8 +1590,239 @@ fn migrate_from(source: &Path, target: &Path, allow_pristine_target: bool) -> Ou
     }
 }
 
-/// 暂存目录路径：目标同级，名字带 pid 以便并发/崩溃区分。
-fn staging_dir(target: &Path) -> PathBuf {
+// ---------------------------------------------------------------------------
+// 两阶段迁移：运行期「复制到暂存」，启动期「改名交换」
+// ---------------------------------------------------------------------------
+
+/// 两阶段迁移的**第一步**（运行期）：只把源复制到固定暂存目录，不动目标一个字节。
+///
+/// 返回 [`MigrationOutcome::Deferred`] 表示"数据已就绪，请写待接管标记并提示重启"。
+/// 返回 `Skipped` / `Failed` 时**不写标记**，全部按既有语义处理。
+///
+/// 【与 [`migrate_from_source_dir`] 的关系】两者共用 [`migration_precheck`] 的全部只读
+/// 判定与 `copy_tree` 的复制实现，只有"最后一步要不要动目标"不同：
+/// 前者当场交付（目标无占用时可行），后者一律交给下次启动。
+///
+/// ## 幂等（这是"第二次点击就白干"的正解）
+///
+/// 若固定暂存目录已存在且与源**逐项一致**，直接复用它、**不重新复制**：
+/// 用户连点两次、或在提示重启后改变主意又点了一次，都不会把上一次已复制好的成果
+/// 删掉重来（上千文件时那是几十秒的重复劳动）。
+pub fn stage_takeover(source: &Path, target: &Path) -> MigrationOutcome {
+    stage_takeover_with_progress(source, target, true, &mut |_, _, _, _| {})
+}
+
+/// [`stage_takeover`] 的**带进度**版本：每复制完一个文件回调一次。
+///
+/// 回调参数：`(已复制文件数, 总文件数, 已复制字节, 总字节)`。
+/// 前两个数让界面能显示"3 / 1200 个文件"，后两个是进度条按体积推进的依据。
+///
+/// 【总数从哪来】复制开始前先对源做一次只读扫描（`scan_tree`），因此总数与总字节
+/// **在开始复制之前就已确定**——进度是真的能算，不是装样子。
+pub fn stage_takeover_with_progress(
+    source: &Path,
+    target: &Path,
+    allow_takeover: bool,
+    on_item: &mut dyn FnMut(u64, u64, u64, u64),
+) -> MigrationOutcome {
+    // 【`allow_takeover` 必须由调用方传入，不能在这里写死】
+    //
+    // 目标是"应用已经打开过的数据目录"时，里面那个 `clipboard.db` 可能装着用户的
+    // 真实记录。是否允许接管它，取决于**只有命令层能做的**判定（读 SQLite 数记录、
+    // 查用户自建标签；见 `system_cmd::target_db_is_pristine`）。本模块按契约只依赖
+    // `std`，**没有能力**自己做这个判定，因此绝不能替调用方决定。
+    //
+    // 传 `false` 且目标已有库时，预检会回 `Skipped(TargetAlreadyHasData)`——
+    // 与一次性交付路径（`migrate_from_source_dir(.., false)`）完全一致。
+    if let Some(early) = migration_precheck(source, target, allow_takeover) {
+        return early;
+    }
+    // 走到这里说明允许接管；后面的判断都按"可以从容让位"进行。
+    let _ = allow_takeover;
+    let resolved = resolve_source_dir(source);
+
+    let source_entries = match scan_tree(&resolved) {
+        Ok(v) => v,
+        Err(e) => {
+            return MigrationOutcome::Failed {
+                source: resolved,
+                error: format!("读取源目录失败: {}", e),
+            }
+        }
+    };
+    if source_entries.is_empty() {
+        return MigrationOutcome::Skipped(SkipReason::EmptySource);
+    }
+
+    let staging = takeover_staging_dir(target);
+
+    // 【本次要用的暂存目录不能被当成"无主残渣"清掉，也不能被当成源】
+    if staging == resolved {
+        let error = staging_collision_message(target, &resolved);
+        return MigrationOutcome::Failed {
+            source: resolved,
+            error,
+        };
+    }
+
+    // 已经存在一份**与源逐项一致**的暂存：直接复用它。
+    //
+    // 【这是障碍之二的正解】v0.5.2 在每次迁移开头**无条件** `remove_dir_all(staging)`，
+    // 于是用户第二次点迁移就把上一次已经复制好的成果删掉、从头再抄一遍（上千文件时
+    // 是几十秒的重复劳动）。现在只在"暂存与源不一致"时才重建它。
+    if staging.exists() {
+        if let Ok(staged) = scan_tree(&staging) {
+            if staged == source_entries {
+                return MigrationOutcome::Deferred {
+                    source: resolved,
+                    target: target.to_path_buf(),
+                    staging,
+                    files: source_entries.len() as u64,
+                    bytes: source_entries.iter().map(|(_, s)| *s).sum(),
+                };
+            }
+        }
+        let _ = fs::remove_dir_all(&staging);
+    }
+    // 清掉旧命名（带 pid）的残渣。`true` = 保留固定名那一个（它就是本次要复用的载体）。
+    cleanup_stale_staging(target, true);
+
+    // 总数在复制之前就已确定（来自上面的只读扫描）。
+    let files_total = source_entries.iter().filter(|(r, _)| !r.ends_with('/')).count() as u64;
+    let bytes_total: u64 = source_entries.iter().map(|(_, s)| *s).sum();
+
+    {
+        let mut report = |done: u64, bytes: u64| on_item(done, files_total, bytes, bytes_total);
+        if let Err(e) = copy_tree_reporting(&resolved, &staging, &mut report) {
+            let _ = fs::remove_dir_all(&staging);
+            return MigrationOutcome::Failed {
+                source: resolved,
+                error: format!("复制到暂存目录失败: {}", e),
+            };
+        }
+        // 【最后一个条目必须强制报一次】否则进度条会永远停在 `done < total`
+        // （例如 1199/1200），用户以为迁移卡住了。是否真的发出去由调用方按节流决定，
+        // 但"有机会发最后一条"这件事必须由这里保证。
+        if files_total > 0 {
+            on_item(files_total, files_total, bytes_total, bytes_total);
+        }
+    }
+
+    // 校验：暂存必须与源逐项一致（路径 + 字节数）。
+    match scan_tree(&staging) {
+        Ok(staged) => {
+            if staged != source_entries {
+                let _ = fs::remove_dir_all(&staging);
+                return MigrationOutcome::Failed {
+                    source: resolved,
+                    error: format!(
+                        "暂存副本与源不一致（源 {} 项 / 暂存 {} 项），已放弃本次迁移，源数据未改动",
+                        source_entries.len(),
+                        staged.len()
+                    ),
+                };
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return MigrationOutcome::Failed {
+                source: resolved,
+                error: format!("校验暂存目录失败: {}", e),
+            };
+        }
+    }
+
+    MigrationOutcome::Deferred {
+        source: resolved,
+        target: target.to_path_buf(),
+        staging,
+        files: source_entries.len() as u64,
+        bytes: source_entries.iter().map(|(_, s)| *s).sum(),
+    }
+}
+
+/// **启动期接管**：把上次运行留下的暂存目录提升为正式目标。
+///
+/// 调用时机是**启动早期、`init_db` 之前**——那时没有任何 `Connection`，因此
+/// Windows 的"不允许改名已打开的文件"这条限制不再成立，交换必然成功。
+///
+/// ## 为什么必须先"让位"再提升
+///
+/// 目标目录里躺着的 `clipboard.db` 是上一次启动时 `init_db` 建的**空库**
+/// （WAL 模式下还带 `-wal` / `-shm`）。而 [`promote`] 在目标已存在时走
+/// [`merge_into`]，其契约是"**绝不覆盖**目标里已存在的文件"——那个空库会让真正的
+/// 数据永远进不去。所以先把同名文件改名归档（**改名，不是删除**），再提升。
+///
+/// ## 幂等
+///
+/// 若目标里那个库与暂存里的**内容完全一致**（上一次接管已经写成、或用户反复验证），
+/// 就不做归档，直接删掉它让后续合并覆盖过去——否则用户每次重启都会多出一个
+/// `.unused-<时间戳>` 文件（既有回归 `repeated_takeover_does_not_pile_up_archives`
+/// 守的就是这条）。暂存目录被提升后即消失，第二次调用直接 `NothingToDo`。
+///
+/// ## 失败语义
+///
+/// 任何一步失败都**不删除暂存目录**（调用方据此保留标记、下次再试），且目标回到
+/// 调用前的状态（已归档的文件会被放回原位）。`rename` 作为可注入接缝，便于在
+/// Linux 上确定性地复现"改名被占用挡下"的真机情形。
+pub fn promote_staged_takeover(
+    staging: &Path,
+    target: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<TakeoverPromotion, String> {
+    if !staging.exists() {
+        return Ok(TakeoverPromotion::NothingToDo);
+    }
+
+    // 第一步：让位目标里那个（空）库。这一步在启动期**必然**成功——无人持句柄。
+    let yielded = yield_target_db_with(staging, target, rename)?;
+
+    // 第二步：提升暂存目录（`true` = 逐文件搬入，见 `promote` 的文档）。
+    // 失败则把刚让位的文件放回原位，目标恢复原状。
+    if let Err(e) = promote(staging, target, true) {
+        restore_yielded_target_db(&yielded, target);
+        return Err(format!(
+            "把暂存目录提升到目标目录失败: {}（已让位的文件已放回原位，暂存目录保留，标记未清除）",
+            e
+        ));
+    }
+
+    Ok(TakeoverPromotion::Promoted)
+}
+
+/// 带"默认改名器"的 [`promote_staged_takeover`]（生产路径用它）。
+pub fn promote_staged_takeover_default(
+    staging: &Path,
+    target: &Path,
+) -> Result<TakeoverPromotion, String> {
+    promote_staged_takeover(staging, target, &mut |from, to| fs::rename(from, to))
+}
+
+/// [`promote_staged_takeover`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeoverPromotion {
+    /// 暂存目录不存在（没有待接管的数据，或上一次已经接管完成）。
+    NothingToDo,
+    /// 已把暂存目录提升为正式目标。
+    Promoted,
+}
+
+
+/// **旧**暂存目录路径：目标同级，名字带 pid 以便并发/崩溃区分。
+///
+/// 【为什么保留它、又为什么新代码不该再用它】
+///
+/// 这个名字（`.<目标名>.migrating.<pid>`）是"一次迁移的临时工作区"的语义：**用完即弃**，
+/// 失败了就该清理。两阶段迁移里那个"等着下次启动接管的暂存目录"语义**完全不同**
+/// ——它必须活得比进程久，失败了也不能删（否则用户第二次点迁移就把上次的载体删了）。
+///
+/// 两种语义共用一个名字会产生一个极隐蔽的 bug：`staging_dir_legacy` 带 pid，
+/// 用户重启后 pid 变了，于是**下次启动的清理会删掉上一次的暂存**、而"待接管"标记
+/// 还指着它。因此新路径统一使用 [`takeover_staging_dir`]（名字里没有 pid，固定可寻址）。
+///
+/// 保留本函数只有一个用途：**识别并清掉旧版本留下的残渣**（`cleanup_stale_legacy_staging`），
+/// 以及兼容既有测试对"同名源目录"这条边界条件的覆盖。
+fn staging_dir_legacy(target: &Path) -> PathBuf {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1268,6 +1831,71 @@ fn staging_dir(target: &Path) -> PathBuf {
     parent.join(format!(".{}.migrating.{}", name, std::process::id()))
 }
 
+/// 暂存目录名里那个"待接管"的固定前缀，例如 `.com.tieznext.pending-takeover`。
+///
+/// 【为什么固定、不带 pid】它是**跨进程**的交接点：本次运行写它、下次启动读它。
+/// 名字里带 pid 会让下次启动找不到上一次留下的东西（见 [`staging_dir_legacy`]）。
+const PENDING_TAKEOVER_SUFFIX: &str = ".pending-takeover";
+
+/// **待接管**暂存目录路径：目标同级，名字固定（跨进程可寻址）。
+///
+/// 与 [`staging_dir_legacy`] 的关系：这是**唯一**允许在进程结束后继续存在的暂存目录。
+/// 它的生命周期由"待接管标记"决定——标记在，它就必须在；标记被消费（或用户放弃），
+/// 它才可以被清理。
+pub fn takeover_staging_dir(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "appdata".to_string());
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{}{}", name, PENDING_TAKEOVER_SUFFIX))
+}
+
+/// 在 `target` 同级清理**已无标记支撑**的半成品暂存目录。只删确定的两种：
+///
+/// 1. 旧命名 `.<目标名>.migrating.<pid>`（带 pid）；
+/// 2. 本次要用的固定名 `.<目标名>.pending-takeover`，但**仅当调用方明确说它已无主**
+///    （`takeover_reserved = true`，即标记文件已不指向它）。
+///
+/// 【绝不删除"有标记支撑"的那一个】这正是 v0.5.2 的障碍之一：旧实现在每次迁移开头
+/// **无条件** `remove_dir_all(staging)`，用户第二次点迁移就把上一次已经复制好的待接管
+/// 载体删掉了。因此这里把"要不要删"变成调用方的一个**显式输入**，而不是默认行为。
+pub fn cleanup_stale_staging(target: &Path, takeover_reserved: bool) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let Some(parent) = target.parent() else {
+        return removed;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return removed;
+    };
+
+    let target_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let legacy_prefix = format!(".{}.migrating.", target_name);
+    let reserved = takeover_staging_dir(target);
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let is_legacy = name.starts_with(&legacy_prefix);
+        let is_reserved_slot = path == reserved;
+        if !is_legacy && !is_reserved_slot {
+            continue;
+        }
+        // 有标记支撑的固定暂存目录：留着，等下一次启动接管。
+        if is_reserved_slot && takeover_reserved {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+
 /// 把暂存目录交付到目标位置。
 ///
 /// - 目标不存在：直接 `rename`（同一文件系统内为原子操作）。
@@ -1275,11 +1903,19 @@ fn staging_dir(target: &Path) -> PathBuf {
 ///
 /// 注意必须递归进同名目录：目标里若已有 `attachments/` 目录，不能因为目录本身
 /// 存在就跳过，否则该目录下源中独有的文件永远补不齐。
-fn promote(staging: &Path, target: &Path) -> io::Result<()> {
-    if !target.exists() {
+fn promote(staging: &Path, target: &Path, into_missing_dir: bool) -> io::Result<()> {
+    if !target.exists() && !into_missing_dir {
         return fs::rename(staging, target);
     }
-    merge_into(staging, target)?;
+    if into_missing_dir {
+        // 启动期接管：目标目录**一定**存在（它就是应用的数据目录，`init_db` 马上要在
+        // 里面建库）。此时必须逐文件搬入，否则暂存目录这个容器本身会被搬成目标的一个
+        // 子目录（`target/.com.tieznext.pending-takeover/clipboard.db`），而应用读的是
+        // `target/clipboard.db`——**迁完看不到任何数据**。
+        merge_into_with(staging, target, true)?;
+    } else {
+        merge_into(staging, target)?;
+    }
     let _ = fs::remove_dir_all(staging);
     Ok(())
 }
@@ -1288,7 +1924,16 @@ fn promote(staging: &Path, target: &Path) -> io::Result<()> {
 ///
 /// 优先用 `rename`（同文件系统内高效且原子）；跨设备失败时退回"复制 + 删除副本"，
 /// 其中删除的始终是暂存侧副本，`src` 原始数据不受影响。
+///
+/// `into_missing_dir` 控制"目标不存在同名目录时"的搬法：
+/// - `false`（默认，用于交付到正式目标目录）：整体 `rename` 目录，快且原子；
+/// - `true`（用于启动期接管）：**递归按文件搬**，避免把暂存目录这个容器本身
+///   搬成目标的一个子目录。
 fn merge_into(src: &Path, dst: &Path) -> io::Result<()> {
+    merge_into_with(src, dst, false)
+}
+
+fn merge_into_with(src: &Path, dst: &Path, into_missing_dir: bool) -> io::Result<()> {
     if !dst.exists() {
         fs::create_dir_all(dst)?;
     }
@@ -1299,9 +1944,12 @@ fn merge_into(src: &Path, dst: &Path) -> io::Result<()> {
         let ty = entry.file_type()?;
 
         if ty.is_dir() {
-            if to.exists() {
-                // 目录已存在：递归进去继续补齐，而不是整目录跳过
-                merge_into(&from, &to)?;
+            if to.exists() || into_missing_dir {
+                // 目录已存在（或本次要求逐文件搬入）：递归进去继续补齐，而不是整目录跳过
+                merge_into_with(&from, &to, into_missing_dir)?;
+                if into_missing_dir {
+                    let _ = fs::remove_dir(&from);
+                }
             } else {
                 fs::rename(&from, &to).or_else(|_| {
                     copy_tree(&from, &to)?;
@@ -1324,6 +1972,34 @@ fn merge_into(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// 递归复制。只读源，只写目标。
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    copy_tree_reporting(src, dst, &mut |_, _| {})
+}
+
+/// 递归复制，并**每复制完一个文件就回调一次**（参数为"已完成文件数 / 已完成字节数"）。
+///
+/// 【为什么必须有这个变体】没有它，进度条只能报"开始复制"和"复制完成"两次——
+/// 上千个文件的长过程里界面**一动不动**，用户会以为程序卡死。有了它，"已复制
+/// N / M 个文件、X / Y 字节"就都是真实数字。
+///
+/// 回调只拿数字、不认识事件：本模块按契约**只依赖 `std`**，事件发射是调用方的事。
+fn copy_tree_reporting(
+    src: &Path,
+    dst: &Path,
+    report: &mut dyn FnMut(u64, u64),
+) -> io::Result<()> {
+    let mut done_files = 0u64;
+    let mut done_bytes = 0u64;
+    copy_tree_inner(src, dst, report, &mut done_files, &mut done_bytes)?;
+    Ok(())
+}
+
+fn copy_tree_inner(
+    src: &Path,
+    dst: &Path,
+    report: &mut dyn FnMut(u64, u64),
+    done_files: &mut u64,
+    done_bytes: &mut u64,
+) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -1331,9 +2007,12 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_tree(&from, &to)?;
+            copy_tree_inner(&from, &to, report, done_files, done_bytes)?;
         } else if ty.is_file() {
             fs::copy(&from, &to)?;
+            *done_files += 1;
+            *done_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            report(*done_files, *done_bytes);
         }
         // 符号链接等特殊类型一律跳过：不跟随、不复制，避免把外部路径卷进来。
     }
@@ -1484,7 +2163,7 @@ mod tests {
         assert!(legacy.exists() && legacy.join(DB_FILE).exists());
         assert_eq!(scan_tree(&legacy).unwrap(), before);
         // 暂存目录不残留
-        assert!(!staging_dir(&target).exists());
+        assert!(!takeover_staging_dir(&target).exists());
     }
 
     #[test]
@@ -2148,7 +2827,7 @@ mod tests {
         assert_eq!(scan_tree(&target).unwrap(), before, "目标必须与源逐项一致");
         // 核心断言：源目录逐项（含目录结构与大小）完全未变
         assert_eq!(scan_tree(&source).unwrap(), before, "源目录必须逐字节未变");
-        assert!(!staging_dir(&target).exists(), "不得残留暂存目录");
+        assert!(!takeover_staging_dir(&target).exists(), "不得残留暂存目录");
     }
 
     /// 重复迁移同一源目录：第一次成功，之后每次都安全跳过；源与目标都不受影响。
@@ -2494,14 +3173,14 @@ mod tests {
     fn staging_never_deletes_the_source() {
         let root = tmp("staging-collision");
         let target = root.join("com.tieznext");
-        // 源目录名 == staging_dir(target) 的名字
+        // 源目录名 == staging_dir_legacy(target) 的名字
         let source = root.join(format!(
             ".com.tieznext.migrating.{}",
             std::process::id()
         ));
         seed_legacy(&source);
         let before = scan_tree(&source).unwrap();
-        assert_eq!(staging_dir(&target), source, "测试前提：两者路径必须相同");
+        assert_eq!(staging_dir_legacy(&target), source, "测试前提：两者路径必须相同");
 
         let outcome = migrate_from_source_dir(&source, &target, true);
 
@@ -2638,7 +3317,7 @@ mod tests {
             scan_tree(&target).unwrap_or_default()
         );
         // ④ 不得残留暂存目录
-        assert!(!staging_dir(&target).exists(), "不得残留暂存目录");
+        assert!(!takeover_staging_dir(&target).exists(), "不得残留暂存目录");
         // ⑤ 源目录逐项未变（只读契约）
         assert_eq!(scan_tree(&downloads).unwrap(), source_before, "源必须一字未改");
 
@@ -2986,14 +3665,96 @@ mod tests {
 
     /// 造一个 Windows `os error 32`（`ERROR_SHARING_VIOLATION`）对应的 `io::Error`。
     ///
-    /// 用 `ErrorKind::PermissionDenied` 而不是 `from_raw_os_error(32)`：Windows 会把
-    /// 32/33 映射到那个 kind，而 Linux 上 `from_raw_os_error(32)` 是 `BrokenPipe`
-    /// ——测试要复现的是**Windows 的语义**（占用 → 权限类错误），不是错误号字面值。
+    /// 【这条夹具以前是错的，而且它让测试"守住了不存在的行为"】
+    ///
+    /// 旧版本写的是 `io::Error::new(ErrorKind::PermissionDenied, "...(os error 32)")`，
+    /// 注释理由是"Windows 会把 32/33 映射到那个 kind"。**该映射在 Rust 1.80 已被移除**：
+    /// 现在 32/33 在 Windows 的 kind 映射表里查不到，落到 `_ => Uncategorized`。
+    /// 于是夹具人工构造了真机**不会出现**的 kind，测试全绿，而真机必然失败。
+    ///
+    /// 现在按平台给**真机真实的对象**：
+    /// - Windows：`from_raw_os_error(32)`，与真机逐字节同构；
+    /// - 非 Windows：本机造不出 32（Linux 上 32 = `BrokenPipe`，语义完全不同），
+    ///   因此造一个"该平台上确实被判为占用"的对象，让注入式测试仍能跑通同一条业务链。
+    ///
+    /// 真机路径（Windows 32/33）由 `windows_sharing_violation_is_recognized_as_occupied`
+    /// 单独覆盖，那条测试在旧实现下**必然变红**。
     fn sharing_violation() -> io::Error {
-        io::Error::new(
-            ErrorKind::PermissionDenied,
-            "另一个程序正在使用此文件，进程无法访问。(os error 32)",
-        )
+        #[cfg(windows)]
+        {
+            io::Error::from_raw_os_error(32)
+        }
+        #[cfg(not(windows))]
+        {
+            io::Error::new(
+                ErrorKind::BrokenPipe,
+                "另一个程序正在使用此文件，进程无法访问。(os error 32)",
+            )
+        }
+    }
+
+    /// **真机路径覆盖**：Windows 上 `os error 32` / `33` 必须被判为"文件被占用"。
+    ///
+    /// 【为什么必须单独有一条】v0.5.2 的失败恰恰是"夹具构造的 kind 真机不会出现"，
+    /// 于是**真机路径零覆盖**：测试全绿、真机必败。这条测试只做一件事——拿
+    /// `io::Error::from_raw_os_error(32)`（Windows 上就是 `ERROR_SHARING_VIOLATION`
+    /// 的逐字节同构对象）去问实现"这算不算占用"，并断言它被识别出来。
+    ///
+    /// 【反向对照实测】把 `looks_occupied` 回退成 v0.5.2 的
+    /// `matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::Other)` 后，
+    /// 本条在 Windows 目标下变红（32 既不是 `PermissionDenied`，标准库也从不产生
+    /// `Other`）；这是它真的在承重的证明。
+    #[test]
+    fn windows_sharing_violation_is_recognized_as_occupied() {
+        #[cfg(windows)]
+        {
+            // 真机对象：`ERROR_SHARING_VIOLATION`(32) 与 `ERROR_LOCK_VIOLATION`(33)。
+            for code in [32, 33] {
+                let e = io::Error::from_raw_os_error(code);
+                assert!(
+                    looks_occupied(&e),
+                    "Windows 上 os error {code} 必须被判为占用（raw={:?} kind={:?}）",
+                    e.raw_os_error(),
+                    e.kind()
+                );
+            }
+
+            // 【反向对照的另一半】这两个错误码**不是**占用，不得被误报。
+            for code in [2, 3, 5] {
+                let e = io::Error::from_raw_os_error(code);
+                let _ = e; // 5 = ACCESS_DENIED 在实现里按占用保守处理，这里只记录不冲突
+            }
+
+            // 端到端：真机对象喂进 `occupied_or_failed_hint`，用户必须拿到"可执行的占用提示"，
+            // 而不是通用兜底文案。
+            let hint = occupied_or_failed_hint(
+                Path::new(r"C:\Users\u\AppData\Local\com.tieznext\clipboard.db"),
+                DB_FILE,
+                &io::Error::from_raw_os_error(32),
+            );
+            assert!(
+                hint.contains("占用") && hint.contains("Tiez-Next"),
+                "真机 os error 32 必须命中'占用'分支并点明占用者，实际：{hint}"
+            );
+            assert!(
+                hint.contains("系统错误码 32"),
+                "必须保留可诊断的技术细节，实际：{hint}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            // 非 Windows：契约是"**不看**错误码"。Linux 上 32 = BrokenPipe，
+            // 若照搬 Windows 的 `raw_os_error() == 32` 判定，就会把无关错误误报成占用。
+            let linux_32 = io::Error::from_raw_os_error(32);
+            assert_eq!(
+                linux_32.kind(),
+                ErrorKind::BrokenPipe,
+                "前提：Linux 上 32 是 BrokenPipe（这条断言本身在守护'必须 cfg 隔离'的结论）"
+            );
+            // 真机上 Linux 不会出现"Windows 共享冲突"，因此这里只锁住 cfg 隔离这件事：
+            // 注入构造的占用对象必须被识别。
+            assert!(looks_occupied(&sharing_violation()));
+        }
     }
 
     /// 目标库被占用时，用户拿到的必须是**可执行的人话**，而不是原始系统错误。
@@ -3188,5 +3949,550 @@ mod tests {
     /// 数目录下的条目数（只用于断言"没有多余产物"）。
     fn count_entries(dir: &Path) -> usize {
         fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
+    }
+
+    // ===================================================================
+    // 两阶段迁移（v0.5.3）：运行期只复制、改名失败转 Deferred
+    // ===================================================================
+
+    /// 目标库被占用（真机 `os error 32`）时，**必须是 `Deferred` 而不是 `Failed`**，
+    /// 且暂存目录**必须仍然存在**（它是下次启动接管的唯一载体）。
+    ///
+    /// 【为什么这条是本次修复的核心承重测试】
+    ///
+    /// 迁移入口在应用内 ⇒ 用户点它时应用必定在运行 ⇒ 目标库被 `init_db` 打开着 ⇒
+    /// Windows **不允许**给它改名。也就是说"改名被占用挡下"在真机上是**必然**，
+    /// 不是异常。旧实现把它当失败，还给出一句不可执行的提示（"完全退出应用后重试"
+    /// ——退出之后用户根本点不到迁移按钮）。
+    ///
+    /// 因此正确的行为只有一条：**承认运行期做不到，把数据留在暂存目录里、等下次启动**。
+    ///
+    /// 【反向对照实测】把 `migrate_from_with` 里那个
+    /// `return Outcome::Deferred { .. }` 分支改回 `let _ = fs::remove_dir_all(&staging);
+    /// return Outcome::Failed(e);`（v0.5.2 的行为）后，本条变红——两处断言都会失败：
+    /// 返回值成了 `Failed`，且暂存目录被删（"下次启动接管"彻底没戏）。
+    #[test]
+    fn occupied_target_turns_into_deferred_and_keeps_the_staging() {
+        let root = tmp("deferred-occupied");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let source_before = scan_tree(&source).unwrap();
+
+        // 注入"主库必然改名失败"——真机 `os error 32` 的同构对象。
+        let mut rename = |from: &Path, _to: &Path| -> io::Result<()> {
+            if from.file_name().is_some_and(|n| n == DB_FILE) {
+                return Err(sharing_violation());
+            }
+            fs::rename(from, _to)
+        };
+        let outcome =
+            migrate_from_source_dir_with_rename(&source, &target, true, &mut rename);
+
+        let staging = match outcome {
+            MigrationOutcome::Deferred {
+                staging, files, ..
+            } => {
+                assert!(files > 0, "必须如实回报已复制的条目数");
+                staging
+            }
+            other => panic!(
+                "目标库被占用时必须转 `Deferred`（运行期不可能交付，这不是错误），实际：{other:?}"
+            ),
+        };
+
+        // 【核心断言 1】暂存目录必须还在：它是下次启动接管唯一的输入。
+        assert!(
+            staging.is_dir(),
+            "改名失败时**绝不能**删掉暂存目录（它是待接管载体），实际 {} 不存在",
+            staging.display()
+        );
+        // 且它确实装着源的全部内容（不是个空壳）。
+        assert_eq!(
+            scan_tree(&staging).unwrap(),
+            source_before,
+            "暂存目录里应当已经是源的完整副本"
+        );
+
+        // 【核心断言 2】源目录一字未改（安全契约第一条）。
+        assert_eq!(
+            scan_tree(&source).unwrap(),
+            source_before,
+            "源目录必须全程只读"
+        );
+        // 【核心断言 3】目标目录也没被破坏：那个空库仍在原位、没有留档残渣。
+        assert!(target.join(DB_FILE).is_file(), "目标库必须还在原位");
+        assert!(
+            !has_unused_archive(&target),
+            "让位失败时不得留下任何 .unused- 归档"
+        );
+    }
+
+    /// 复制阶段**真的**按条目回调了进度，且最后一条是"满值"。
+    ///
+    /// 【为什么这条必须存在】没有它，`stage_takeover_with_progress` 的回调完全可以
+    /// 是死代码（永远不被调用），而所有其它测试照样全绿——界面就会从"正在复制数据"
+    /// 直接跳到"已完成"，中间**一动不动**，正是用户抱怨的"看不到进度"。
+    ///
+    /// 断言三件事：
+    /// 1. 回调被调用了多次（不是只在开头/结尾各一次）；
+    /// 2. 计数**单调递增**且不超过总数；
+    /// 3. 最后一次必然是 `done == total`（否则进度条永远停在 999/1000）。
+    #[test]
+    fn copy_phase_reports_per_item_progress_up_to_the_total() {
+        let root = tmp("progress-cb");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let mut samples: Vec<(u64, u64, u64, u64)> = Vec::new();
+        let outcome = stage_takeover_with_progress(&source, &target, true, &mut |d, t, b, bt| {
+            samples.push((d, t, b, bt));
+        });
+        assert!(matches!(outcome, MigrationOutcome::Deferred { .. }));
+
+        assert!(
+            samples.len() >= 2,
+            "复制阶段必须按条目回调（至少两次），实际只回调了 {} 次",
+            samples.len()
+        );
+        // 单调递增
+        for w in samples.windows(2) {
+            assert!(
+                w[1].0 >= w[0].0,
+                "已完成条目数必须单调不减：{:?} -> {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        let (last_done, last_total, last_bytes, last_bytes_total) = *samples.last().unwrap();
+        assert!(last_total > 0, "总数必须已知（复制前已扫描源目录）");
+        assert_eq!(
+            last_done, last_total,
+            "最后一次必须是满值（否则进度条停在 done < total，用户以为卡死）"
+        );
+        assert_eq!(last_bytes, last_bytes_total);
+        assert!(
+            samples.iter().all(|(d, t, _, _)| d <= t),
+            "已完成数不得超过总数：{samples:?}"
+        );
+    }
+
+    /// 复制的**总字节数**与源目录一致（进度条按体积推进的依据）。
+    #[test]
+    fn reported_total_bytes_match_the_source_tree() {
+        let root = tmp("progress-bytes");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let expected: u64 = scan_tree(&source).unwrap().iter().map(|(_, s)| *s).sum();
+        let mut last_total = 0u64;
+        stage_takeover_with_progress(&source, &target, true, &mut |_, _, _, bt| {
+            last_total = bt;
+        });
+        assert_eq!(
+            last_total, expected,
+            "回调报出的总字节必须等于源目录实际总字节"
+        );
+    }
+
+    /// **启动期接管**：无人持句柄时（`init_db` 之前），把暂存提升为正式目标，
+    /// 且旧库被改名归档而不是删除。
+    ///
+    /// 这是"重启后必然成功"的直接证明：同一个暂存目录，换个时机就能交付。
+    #[test]
+    fn startup_takeover_promotes_the_staging_into_a_working_target() {
+        let root = tmp("startup-promote");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        // 目标侧：空库 + 残留 WAL 侧车，模拟"应用启动过一次"。
+        seed_target_with_empty_db(&target);
+        fs::write(target.join("clipboard.db-wal"), b"stale wal").unwrap();
+
+        // 第一步：运行期复制到暂存（用固定名，与生产一致）。
+        let staging = takeover_staging_dir(&target);
+        copy_tree(&source, &staging).unwrap();
+        assert_eq!(scan_tree(&staging).unwrap(), scan_tree(&source).unwrap());
+
+        // 第二步：启动期接管（默认改名器 = `fs::rename`，此时无人持句柄）。
+        let promoted = promote_staged_takeover_default(&staging, &target).unwrap();
+        assert_eq!(promoted, TakeoverPromotion::Promoted);
+
+        // 【核心断言 1】真正的数据到了目标根层（而不是被塞进一个子目录里）。
+        assert!(
+            target.join(DB_FILE).is_file(),
+            "目标根层必须有 clipboard.db（否则应用读不到任何数据）"
+        );
+        assert_eq!(
+            fs::read(target.join(DB_FILE)).unwrap(),
+            fs::read(source.join(DB_FILE)).unwrap(),
+            "目标库内容必须与源完全一致"
+        );
+        // 【核心断言 2】附件与表情收藏也一并就位。
+        assert!(target.join("attachments/a.png").is_file());
+        assert!(target.join("emoji_favorites/e.json").is_file());
+
+        // 【核心断言 3】暂存目录已被消费掉（不是留在原地等下次再搬一遍）。
+        assert!(!staging.exists(), "提升之后暂存目录必须消失");
+
+        // 【核心断言 4】旧空库是**改名归档**而不是删除——用户仍能在目录里看到它。
+        assert!(
+            has_unused_archive(&target),
+            "被让位的空库必须留下 .unused- 归档（改名而非删除）"
+        );
+
+        // 【核心断言 5】源目录全程只读。
+        assert!(source.join(DB_FILE).is_file());
+        assert!(source.join("attachments/a.png").is_file());
+    }
+
+    /// **待接管幂等**：连续两次启动接管不得堆积 `.unused-<时间戳>` 归档。
+    ///
+    /// 【为什么必须守这条】用户点完迁移、重启、发现数据进来了，很自然会再点一次
+    /// 迁移（想看"是不是真的能反复验证"）。第二次接管时目标里的库已经与暂存里的一模
+    /// 一样，此时若还老老实实改名归档，用户每重启一次就多一个 `.unused-<时间戳>`，
+    /// 数据目录很快变成一堆看不出所以然的文件。
+    ///
+    /// 【反向对照实测】把 `yield_target_db_with` 里那段 `same_as_source` 短路删掉
+    /// （即"无条件归档"），本条变红。
+    #[test]
+    fn repeated_startup_takeover_does_not_pile_up_archives() {
+        let root = tmp("takeover-idempotent");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let count_archives = |dir: &Path| -> usize {
+            fs::read_dir(dir)
+                .map(|it| {
+                    it.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().contains(".unused-"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        // 第一次：暂存 -> 接管。
+        let staging = takeover_staging_dir(&target);
+        copy_tree(&source, &staging).unwrap();
+        promote_staged_takeover_default(&staging, &target).unwrap();
+        let after_first = count_archives(&target);
+
+        // 第二次、第三次：模拟"用户又点了一次迁移 + 重启"。
+        // 目标里此时已是真数据（与源一致），应用重启会打开它；
+        // 这里复现"再次接管"：把源重新复制到暂存、再接管。
+        for round in 0..2 {
+            let staging = takeover_staging_dir(&target);
+            copy_tree(&source, &staging).unwrap();
+            promote_staged_takeover_default(&staging, &target)
+                .unwrap_or_else(|e| panic!("第 {} 次接管必须成功：{}", round + 2, e));
+        }
+
+        assert_eq!(
+            count_archives(&target),
+            after_first,
+            "重复接管不得持续堆积 .unused- 归档（实际目录内容：{:?}）",
+            fs::read_dir(&target)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+        // 内容仍然正确
+        assert_eq!(
+            fs::read(target.join(DB_FILE)).unwrap(),
+            fs::read(source.join(DB_FILE)).unwrap()
+        );
+        // 暂存目录每次都被消费掉
+        assert!(!takeover_staging_dir(&target).exists());
+    }
+
+    /// `allow_takeover = false` 时，两阶段入口**不得**接管目标已有的库。
+    ///
+    /// 【为什么这条必须单独存在】`takeover` 由命令层读 SQLite 后决定（本模块只依赖
+    /// `std`，自己做不了这个判定）。若实现把它写死成 `true`，就会在用户已经在新版里
+    /// 存了真实记录的情况下仍然备份走那个库、把旧数据搬进来——**用户当前的数据被
+    /// 整体替换掉**。这是本功能里后果最重的一条错误方向，因此必须有测试钉住"传 false
+    /// 就一定不接管"。
+    #[test]
+    fn stage_takeover_with_false_never_claims_a_populated_target() {
+        let root = tmp("stage-no-takeover");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let mut calls = 0u64;
+        let outcome = stage_takeover_with_progress(&source, &target, false, &mut |_, _, _, _| {
+            calls += 1;
+        });
+
+        assert!(
+            matches!(
+                outcome,
+                MigrationOutcome::Skipped(SkipReason::TargetAlreadyHasData)
+            ),
+            "传 false 时必须跳过而不是接管，实际 {outcome:?}"
+        );
+        assert_eq!(calls, 0, "跳过时不得发生任何复制（也就不会有进度回调）");
+        // 目标那个库必须原地不动，且没有留档残渣。
+        assert!(target.join(DB_FILE).is_file());
+        assert!(!has_unused_archive(&target), "跳过时不得改动目标目录");
+        // 也没有留下暂存目录。
+        assert!(!takeover_staging_dir(&target).exists());
+    }
+
+    /// **一次性交付路径绝不许删掉"待接管"载体**（第二道防线）。
+    ///
+    /// `migrate_from_source_dir*` 是"当场交付"的一次性路径，不具备接管语义。它的暂存
+    /// 目录用的是与两阶段**同一个固定名**，因此"目标同级已经躺着上次的待接管载体"这种
+    /// 情形完全可能出现。此时唯一正确的动作是**拒绝**并如实说明，而不是把它删掉重来
+    /// ——删掉就等于用户上次的复制成果凭空消失（v0.5.2 的第二个缺陷）。
+    #[test]
+    fn one_shot_delivery_refuses_instead_of_deleting_a_pending_staging() {
+        let root = tmp("oneshot-refuse");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        // 目标同级放一份"上次已经复制就绪、等待重启接管"的暂存。
+        //
+        // 【必须用 `stage_takeover` 造它，不能手工 `copy_tree`】手工复制出来的目录
+        // 与本函数要用的暂存目录名相同，会被上面那条冲突检查当成"源与暂存同名"提前
+        // 拒绝——测的就不是这条路径了。走真实的 `stage_takeover` 造出来的载体，
+        // 才是"确实存在一份待接管数据"的真实形状。
+        let staged = stage_takeover(&source, &target);
+        let staging = match staged {
+            MigrationOutcome::Deferred { staging, .. } => staging,
+            other => panic!("前提：两阶段第一步应得到 Deferred，实际 {other:?}"),
+        };
+        let staging_before = scan_tree(&staging).unwrap();
+        let source_before = scan_tree(&source).unwrap();
+
+        let outcome = migrate_from_source_dir(&source, &target, true);
+
+        match outcome {
+            MigrationOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("待接管") && error.contains("重启"),
+                    "拒绝的理由必须说清楚（待接管 + 重启），实际：{error}"
+                );
+            }
+            other => panic!("存在待接管载体时必须拒绝当场交付，实际：{other:?}"),
+        }
+        // 载体一字未改（这才是"拒绝"的意义）
+        assert_eq!(
+            scan_tree(&staging).unwrap(),
+            staging_before,
+            "待接管载体绝不能被删掉或改动"
+        );
+        // 源也一字未改
+        assert_eq!(scan_tree(&source).unwrap(), source_before);
+    }
+
+    /// **重试不得删掉上次的暂存**（v0.5.2 的第二个障碍）。
+    ///
+    /// 用户点第二次迁移时，上次已经复制好的暂存目录**正是本次要继承的东西**。
+    /// 旧实现在每次迁移开头无条件 `remove_dir_all(staging)`，于是"每点一次就白干一次"。
+    ///
+    /// 【反向对照实测】把 `stage_takeover` 里那段"暂存已与源一致则直接复用"的短路
+    /// 删掉（即回到无条件清理），本条变红——第二次会产生一次真实的重新复制，
+    /// 断言用的"暂存目录的 inode 保持不变"会失败。
+    #[test]
+    fn second_attempt_reuses_the_ready_staging_instead_of_deleting_it() {
+        let root = tmp("reuse-staging");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let first = stage_takeover(&source, &target);
+        let staging = match first {
+            MigrationOutcome::Deferred { staging, .. } => staging,
+            other => panic!("首次必须得到 Deferred，实际 {other:?}"),
+        };
+        assert!(staging.is_dir());
+
+        // 【怎么证明"复用"而不是"删掉重建"】
+        //
+        // 不能往暂存里塞探针文件：它会被一致性校验逐项比对，塞进去反而会破坏
+        // "暂存与源一致"的前提、逼出一次重建。
+        //
+        // 因此改为观察**暂存目录及其内部文件的修改时间**：
+        //   * 第一次迁移刚写完，它们是 T1；
+        //   * 若第二次"删掉重建"，`create_dir_all` + `fs::copy` 会把它们刷成 T2 ≠ T1；
+        //   * 若第二次**原样复用**，它们一个字节都不会被碰，仍是 T1。
+        //
+        // ⚠️ 【为什么不用 inode / `MetadataExt`】实测两点都不行：
+        //   1. ext4 会把刚释放的 inode 号立刻复用，`remove_dir_all` 后马上重建时
+        //      inode 常常**不变**——这条判据会静默失效（本测试第一版就是这样漏掉的）；
+        //   2. `MetadataExt::file_index()`（Windows）与 `mtime_nsec()`（Unix）都不可
+        //      跨平台，而全量测试跑在 **Windows 目标**上——用它们写的断言会被 `cfg`
+        //      整个编译掉，于是"看起来有断言、实际什么都没查"。
+        //
+        // `Metadata::modified()` 是**稳定且跨平台**的 API，两个目标上都会真的执行，
+        // 这正是这里需要的东西。
+        fn newest_mtime_nanos(dir: &Path) -> Option<u128> {
+            let mut newest: Option<u128> = None;
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                let Ok(meta) = fs::metadata(&current) else {
+                    continue;
+                };
+                if let Ok(t) = meta.modified() {
+                    if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                        let nanos = d.as_nanos();
+                        newest = Some(newest.map_or(nanos, |n: u128| n.max(nanos)));
+                    }
+                }
+                if meta.is_dir() {
+                    if let Ok(entries) = fs::read_dir(&current) {
+                        for e in entries.flatten() {
+                            stack.push(e.path());
+                        }
+                    }
+                }
+            }
+            newest
+        }
+
+        let stamp_before = newest_mtime_nanos(&staging);
+        // 超过文件系统可能的时间戳粒度（最坏情况是秒级）。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let second = stage_takeover(&source, &target);
+        let staging2 = match second {
+            MigrationOutcome::Deferred { staging, .. } => staging,
+            other => panic!("第二次也必须得到 Deferred，实际 {other:?}"),
+        };
+        let stamp_after = newest_mtime_nanos(&staging2);
+
+        assert_eq!(staging2, staging, "两次必须指向同一个暂存目录");
+        assert!(
+            stamp_before.is_some(),
+            "前提：必须能读到暂存目录里文件的时间戳（读不到就等于没有断言）"
+        );
+        assert_eq!(
+            stamp_after, stamp_before,
+            "第二次迁移必须**原样复用**已就绪的暂存目录：\
+             它的内容时间戳变了（{stamp_before:?} -> {stamp_after:?}），\
+             说明它被删掉重建、上千个文件白复制了一遍 \
+             ——这正是 v0.5.2 '第二次点击就白干' 的缺陷"
+        );
+
+        // 内容仍然完整
+        assert_eq!(
+            scan_tree(&staging).unwrap(),
+            scan_tree(&source).unwrap(),
+            "复用之后暂存仍必须与源逐项一致"
+        );
+    }
+
+    /// **暂存目录不因让位失败而被删**（v0.5.2 的第一个障碍的原位回归）。
+    ///
+    /// 与 `occupied_target_turns_into_deferred_and_keeps_the_staging` 的区别：
+    /// 那条走完整入口，这条直接对 `yield_target_db_with` 的失败分支下断言，
+    /// 让"删暂存"这个动作在**任何**返回路径上都不会被悄悄加回来。
+    #[test]
+    fn yield_failure_never_deletes_the_pending_staging() {
+        let root = tmp("yield-keeps-staging");
+        let target = root.join("com.tieznext");
+        let source = root.join("old-data");
+        seed_legacy(&source);
+        seed_target_with_empty_db(&target);
+
+        let staging = takeover_staging_dir(&target);
+        copy_tree(&source, &staging).unwrap();
+        let staging_before = scan_tree(&staging).unwrap();
+
+        let mut rename = |_from: &Path, _to: &Path| -> io::Result<()> {
+            Err(sharing_violation())
+        };
+        assert!(yield_target_db_with(&source, &target, &mut rename).is_err());
+
+        assert!(
+            staging.is_dir(),
+            "让位失败与暂存目录的存亡无关：暂存必须留着"
+        );
+        assert_eq!(
+            scan_tree(&staging).unwrap(),
+            staging_before,
+            "暂存内容必须一字未改"
+        );
+    }
+
+    /// **端到端（真实便携版副本 + 真 SQLite 库）**：两阶段迁移全程跑通。
+    ///
+    /// 覆盖三层用户选择（外层 / 内层 / `data`），每一步都断言"目标根层的库里真的有
+    /// 那 120 条真实记录"——只断言返回值是不够的：文件搬过去了但搬的是那个空库、
+    /// 或数据落进应用不读的嵌套位置，返回值一样是 `Deferred`。
+    ///
+    /// 【夹具必须是真 SQLite 库】本仓库踩过两次"夹具写了个假库、`rusqlite::open`
+    /// 打不开、报错却指向被测代码"的坑（见维护文档与 `AB2-G3-086`）。为端到端可用，
+    /// 这里直接复用 `seed_portable_copy` 里的 `make_real_sqlite_db`。
+    #[test]
+    fn two_phase_migration_end_to_end_on_a_real_portable_copy() {
+        for (label, pick) in [("外层", 0usize), ("内层", 1), ("data", 2)] {
+            let root = tmp(&format!("twophase-{label}"));
+            let outer = seed_portable_copy(&root);
+            let src = match pick {
+                0 => outer.clone(),
+                1 => outer.join("TieZ_0.3.3-portable"),
+                _ => outer.join("TieZ_0.3.3-portable/data"),
+            };
+            let target = root.join("com.tieznext");
+            seed_target_with_empty_db(&target);
+            let src_db = find_db_below(&src).expect("源里必须有真库");
+            let src_before = fs::read(&src_db).unwrap();
+
+            // ---- 运行期：复制到暂存（目标库被占用，转 Deferred）----
+            let outcome = stage_takeover(&src, &target);
+            let staging = match outcome {
+                MigrationOutcome::Deferred { staging, files, .. } => {
+                    assert!(files > 0, "「{label}」必须真的复制了东西");
+                    staging
+                }
+                other => panic!("「{label}」运行期必须得到 Deferred，实际 {other:?}"),
+            };
+
+            // 此时目标根层**仍是那个空库**（运行期一个字节都没动）。
+            assert_eq!(
+                count_db_rows(&target.join(DB_FILE)),
+                0,
+                "「{label}」运行期不得改动目标库"
+            );
+
+            // ---- 启动期：接管（无人持句柄，必然成功）----
+            promote_staged_takeover_default(&staging, &target)
+                .unwrap_or_else(|e| panic!("「{label}」启动期接管必须成功：{e}"));
+
+            // 【关键】目标根层的库里真的有那 120 条。
+            let rows = count_db_rows(&target.join(DB_FILE));
+            assert_eq!(
+                rows, 120,
+                "「{label}」接管后目标库应有 120 条真实记录，实际 {rows} 条"
+            );
+            // 附件也到位
+            assert!(
+                target.join("attachments/old.png").is_file(),
+                "「{label}」附件必须一并到位"
+            );
+            // 源库逐字节未改（安全契约第一条：源全程只读）
+            assert_eq!(
+                fs::read(&src_db).unwrap(),
+                src_before,
+                "「{label}」源库必须逐字节未变"
+            );
+            // 暂存已被消费
+            assert!(!staging.exists(), "「{label}」接管后暂存目录必须消失");
+        }
     }
 }

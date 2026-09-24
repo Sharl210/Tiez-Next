@@ -4,6 +4,7 @@ import type { DefaultAppsMap, InstalledAppOption } from "../../features/app/type
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isTauriRuntime } from "../lib/tauriRuntime";
+import type { AutostartState } from "../lib/autostart";
 
 interface UseAppBootstrapOptions {
   fetchEffectiveTransferPath: () => void;
@@ -59,7 +60,12 @@ export const useAppBootstrap = ({
         console.error("Failed to scan apps:", err);
       });
 
-    invoke<boolean>("is_autostart_enabled").then(setAutoStart).catch(console.error);
+    // 自启动的初值：这里只取"是否生效"这一个布尔，用作设置页的首帧。
+    // 真正的判定与证据展示在设置页的开关组件里（它会在挂载时重新回读一次）。
+    // 后端返回的是**回读状态**（不是写入回话），因此这里读到 true 就是真的生效。
+    invoke<AutostartState>("is_autostart_enabled")
+      .then((s) => setAutoStart(s.enabled))
+      .catch(console.error);
 
 
     const types = ["text", "rich_text", "image", "video", "code", "url"];

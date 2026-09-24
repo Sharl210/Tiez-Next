@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, ChevronRight } from "lucide-react";
+import AutostartSetting from "../AutostartSetting";
 
 const isMacPlatform =
     /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent) || /Mac/i.test(navigator.platform);
@@ -89,24 +90,11 @@ const GeneralSettingsGroup = ({
         </div>
         {!collapsed && (
             <div className="group-content">
-                <div className="setting-item">
-                    <div className="item-label-group">
-                        <span className="item-label">{t('autostart')}</span>
-                    </div>
-                    <label className="switch">
-                        <input
-                            className="cb"
-                            type="checkbox"
-                            checked={autoStart}
-                            onChange={(e) => {
-                                const enabled = e.target.checked;
-                                setAutoStart(enabled);
-                                invoke("toggle_autostart", { enabled }).catch(console.error);
-                            }}
-                        />
-                        <div className="toggle"><div className="left" /><div className="right" /></div>
-                    </label>
-                </div>
+                <AutostartSetting
+                    t={t}
+                    initialEnabled={autoStart}
+                    onStateChange={setAutoStart}
+                />
 
                 <div className="setting-item">
                     <div className="item-label-group">

@@ -47,6 +47,69 @@ const DECL_RE = /(^|[\s;{'"`])(--[A-Za-z0-9_-]+)\s*:/g;
 const USE_RE = /var\(\s*(--[A-Za-z0-9_-]+)/g;
 
 /**
+ * 剥离**注释**，逐行保留行号。
+ *
+ * ## 为什么必须剥
+ *
+ * 本检查是文本正则式门禁：一行里出现 var(--x) 就记为使用点。而注释里也会出现这种字样
+ * —— 恰是最需要写示例的地方（解释令牌用法的注释、维护文档）。实测（未剥时）：只在测试
+ * 文件里写一行提到某个假令牌的注释，就会被报成"未定义变量"，且报错指向测试文件自己。
+ * 本仓库因此踩过两次。危害不只是多一条误报：报告指向写注释的文件，会诱导人去改生产代码
+ * 或测试去迁就检查，而真正的缺陷在别处。
+ *
+ * ## 为什么**只**剥注释，不剥字符串
+ *
+ * 本文件第一版连字符串一起剥了，结果把**真实用法**也剥没了 ——
+ * 仓库里大量使用点写成 React 内联样式，令牌名**就在字符串字面量里**：
+ *
+ *     style={{ background: 'var(--bg-main, var(--bg-element))' }}
+ *
+ * 那个字符串会被浏览器解析成真实 CSS，是货真价实的使用点。一起剥掉会让 5 个仍在使用的
+ * 令牌被误判成"白名单过时"，而正确反应是**别剥字符串**。
+ *
+ * 反过来，注释里的 var(--x) 从来不会被解析。两者的区别是"会不会被解析"，不是"在不在引号里"。
+ *
+ * ## 策略
+ *
+ * 逐行独立处理，不用跨行状态机（字符串里出现注释起止符号时会误判）。行内双斜线之后丢弃；
+ * 行内成对出现的块注释丢弃；未闭合的块注释从其起点丢弃到行尾。宁可少报（把跨行注释的中段
+ * 当代码）也不误报，符合门禁的取向。
+ * （本注释刻意不写出会提前结束块注释的字符组合，第一版就是那样把语法搞坏的。）
+ */
+function stripComments(line) {
+  let out = "";
+  let i = 0;
+  let quote = null;
+  while (i < line.length) {
+    const ch = line[i];
+    const next = line[i + 1];
+    // 在字符串里：整段原样保留（其中的 var(--x) 是真实用法）
+    if (quote) {
+      out += ch;
+      if (ch === "\\") {
+        out += next ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "/") break; // 行注释：剩余整段丢弃
+    if (ch === "/" && next === "*") {
+      const endIdx = line.indexOf("*/", i + 2);
+      if (endIdx === -1) break; // 未闭合（跨行注释的起始行或中段）→ 丢弃到行尾
+      i = endIdx + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/**
  * 运行时注入的三种真实写法，全部来自本仓库现有代码：
  *   a) `el.style.setProperty("--x", ...)`
  *   b) React 的 style 对象键：`["--x"]: value` 或 `["--x" as string]: value`
@@ -69,14 +132,19 @@ for (const file of walk(SRC)) {
   const rel = path.relative(ROOT, file);
   const text = fs.readFileSync(file, "utf8");
   for (const [i, line] of text.split(/\r?\n/).entries()) {
-    for (const m of line.matchAll(DECL_RE)) {
+    // 【扫描用的是剥离注释后的文本】
+    // 否则"解释令牌用法的注释"会被当成使用点，误报指向写注释的文件自己。
+    // ⚠️ 字符串**不剥** —— React 内联样式里的 var() 是真实用法。
+    const code = stripComments(line);
+    for (const m of code.matchAll(DECL_RE)) {
       if (!defined.has(m[2])) defined.set(m[2], []);
       defined.get(m[2]).push(`${rel}:${i + 1}`);
     }
-    for (const m of line.matchAll(USE_RE)) {
+    for (const m of code.matchAll(USE_RE)) {
       if (!used.has(m[1])) used.set(m[1], []);
       used.get(m[1]).push(`${rel}:${i + 1}`);
     }
+    // 【注入检测同样跑在原始行上】与上面口径一致（都不剥字符串）。
     for (const re of INJECT_RES) {
       re.lastIndex = 0;
       for (const m of line.matchAll(re)) {
@@ -109,7 +177,10 @@ const FB_CACHE = new Map();
 function hasFallback(site) {
   if (FB_CACHE.has(site)) return FB_CACHE.get(site);
   const [rel, lineStr] = site.split(":");
-  const line = fs.readFileSync(path.join(ROOT, rel), "utf8").split(/\r?\n/)[Number(lineStr) - 1] ?? "";
+  const raw = fs.readFileSync(path.join(ROOT, rel), "utf8").split(/\r?\n/)[Number(lineStr) - 1] ?? "";
+  // 与扫描环节口径一致：只看代码部分。否则注释里的 `var(--x, 略)` 会被当成真 fallback，
+  // 把一条"变量缺失就整条声明消失"的高危用法误判成"有兜底"而放行。
+  const line = stripComments(raw);
   let v = false;
   for (const m of line.matchAll(/var\(\s*(--[A-Za-z0-9_-]+)([^)]*)\)/g)) {
     if (m[2].trimStart().startsWith(",")) v = true;

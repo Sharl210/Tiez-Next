@@ -1,0 +1,157 @@
+/* 迁移进度与迁移结果卡片（DataSettingsGroup 的「迁移中心」）。
+ *
+ * # 为什么需要这个文件
+ *
+ * 进度显示与结果状态原本全写在内联 style 里，于是：
+ *   - 无法表达"不可计量"这种**状态**（内联样式只能表达"某个值是多少"，
+ *     表达不了"这个值不存在"），结果是 `total === 0` 时算出的 `NaN%`
+ *     被直接写进 `width`；
+ *   - 结果成败的配色散落在模板字符串里（三元表达式硬拼 `rgba(200,80,80,.5)`），
+ *     新增一个"成功但需重启"的状态时无处安放，只能再拼一个颜色 —— 那正是
+ *     `deferred` 会被误做成红色警告的路径。
+ *
+ * # 配色来源
+ *
+ * 只用项目既有语义令牌（`--accent-color` / `--bg-input` / `--line-soft` /
+ * `--text-secondary`）。**不新增颜色定义**，也不使用 `--danger-color`：
+ * 进度条是中性信息，成败由结果卡片的类名区分（见下方 `.is-deferred`）。
+ * 这些令牌随主题解析，六套主题不需要各自写规则。
+ */
+
+.migration-progress {
+    margin-bottom: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--line-soft, rgba(128, 128, 128, 0.25));
+    border-radius: 6px;
+}
+
+.migration-progress-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    margin-bottom: 5px;
+}
+
+.migration-progress-label {
+    color: var(--text-primary);
+    /* 阶段名可能较长（后端产出的整句人话），允许换行而不是把右侧数值挤掉 */
+    min-width: 0;
+    word-break: break-word;
+}
+
+.migration-progress-value {
+    color: var(--text-secondary);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+}
+
+.migration-progress-track {
+    height: 3px;
+    width: 100%;
+    background: var(--bg-input);
+    border-radius: 99px;
+    overflow: hidden;
+}
+
+.migration-progress-bar {
+    height: 100%;
+    background: var(--accent-color);
+    border-radius: 99px;
+    transition: width 0.2s ease-out;
+}
+
+/* 不可计量（后端 `total === 0`，例如"数据已就绪，等待重启接管"）。
+   刻意**不是**一条 0% 的静止条：静止的 0% 无法与"卡死"区分，
+   而复运动表示"正在做，只是总量未知"。 */
+.migration-progress-bar.indeterminate {
+    width: 35%;
+    animation: migration-progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes migration-progress-slide {
+    0% {
+        transform: translateX(-100%);
+    }
+    100% {
+        transform: translateX(286%);
+    }
+}
+
+/* 关闭动画偏好下不往复运动，改为一条半透明的实心条：
+   仍然能与"0% 卡死"区分（它有可见填充），同时不产生持续运动。 */
+@media (prefers-reduced-motion: reduce) {
+    .migration-progress-bar.indeterminate {
+        width: 100%;
+        opacity: 0.45;
+        animation: none;
+    }
+}
+
+.migration-progress-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-top: 5px;
+    font-size: 10px;
+    color: var(--text-secondary);
+}
+
+.migration-progress-message {
+    margin-top: 5px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    word-break: break-all;
+}
+
+/* ------------------------------------------------------------------
+   迁移结果卡片
+   ------------------------------------------------------------------
+   三种归属状态各自的语义边界（冻结契约 §1）：
+     - `.is-done`      已完成，数据当前进程可用           → 成功
+     - `.is-deferred`  数据已复制就绪，重启后接管         → **成功**（不是失败）
+     - `.is-failed`    失败（源与目标均未被破坏）         → 错误
+
+   `.is-deferred` 与 `.is-done` 共用成功配色，这是**刻意的**：
+   两阶段迁移下 `deferred` 才是常态路径，把它做成黄色警告会让每次正常迁移
+   都长得像出了问题，用户会去"处理"一个本来不需要处理的提示。
+   （测试 `migrationDeferredStyle.test.tsx` 会断言 deferred 卡片上不出现
+   `--danger-color`，并在反向对照里验证那条断言真的会红。）
+   ------------------------------------------------------------------ */
+
+.migration-result {
+    border: 1px solid var(--line-soft, rgba(128, 128, 128, 0.25));
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    font-size: 10px;
+    line-height: 1.6;
+    word-break: break-all;
+}
+
+.migration-result.is-done,
+.migration-result.is-deferred {
+    border-color: rgba(64, 160, 96, 0.5);
+}
+
+.migration-result.is-failed {
+    border-color: rgba(200, 80, 80, 0.5);
+}
+
+.migration-result-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.migration-result-hint {
+    margin-top: 4px;
+    opacity: 0.85;
+}
+
+.migration-result-restart {
+    margin-top: 4px;
+    font-weight: 600;
+}

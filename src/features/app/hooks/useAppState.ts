@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { DEFAULT_THEME } from "../../../shared/config/themes";
+import { createAllCollapsedGroups } from "../../../shared/config/settingsGroups";
 import type { ClipboardEntry, Locale } from "../../../shared/types";
 import type {
   AppState,
@@ -19,20 +20,11 @@ export const useAppState = (): AppState => {
   const [settingsSubpage, setSettingsSubpage] = useState<SettingsSubpage>("home");
   const [showTagManager, setShowTagManager] = useState(false);
   const [tagManagerEnabled, setTagManagerEnabled] = useState(true);
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({
-    general: true,
-    clipboard: true,
-    advanced: true,
-    appearance: true,
-    sync: true,
-    cloud_sync: true,
-    ai: true,
-    file_transfer: true,
-    default_apps: true,
-    data: true,
-    auto_backup: true,
-    mcp: true
-  });
+  // 初值从共享清单派生：新增分组只改 `shared/config/settingsGroups.ts` 一处，
+  // 初值与设置页重置不会再各写一份（那正是 mcp/auto_backup 默认展开的成因）。
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>(
+    createAllCollapsedGroups
+  );
   const [history, setHistory] = useState<ClipboardEntry[]>([]);
   const [search, setSearch] = useState("");
   const [isComposing, setIsComposing] = useState(false);
@@ -89,7 +81,10 @@ export const useAppState = (): AppState => {
   const [showAppBorder, setShowAppBorder] = useState(false);
   const [winClipboardDisabled, setWinClipboardDisabled] = useState(false);
   const [registryWinVEnabled, setRegistryWinVEnabled] = useState(false);
-  const [pasteMethod, setPasteMethod] = useState("simulate");
+  // 初值必须与后端默认一致（`setup.rs` / 粘贴路径都按 `shift_insert` 兜底）。
+  // 原先是 `"simulate"`：那既不是后端的默认值，也不是下拉框里的任何一个选项，
+  // 于是在"设置还没加载完"的那一帧，下拉框会显示成一个空白的非法状态。
+  const [pasteMethod, setPasteMethod] = useState("shift_insert");
   const [theme, setTheme] = useState(DEFAULT_THEME);
   const [colorMode, setColorMode] = useState("system");
   const [showSourceAppIcon, setShowSourceAppIcon] = useState(true);

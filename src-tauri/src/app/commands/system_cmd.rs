@@ -5,6 +5,350 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json;
 use tauri::{AppHandle, Manager, State};
 
+// ---------------------------------------------------------------------------
+// 迁移进度：把"复制到暂存"的过程变成界面能显示的进度
+// ---------------------------------------------------------------------------
+
+/// 进度事件的发射器。
+///
+/// ## 为什么要有它（而不是就地 `emit`）
+///
+/// 三件事必须同时成立，散在各处几乎必然漏掉一件：
+///
+/// 1. **节流**：`copying` 阶段按条目推进，最快每 150ms 发一次。上千个小文件时
+///    逐条发事件会把通道刷爆，界面反而渲染不过来（比没有进度更糟）。
+/// 2. **末条强制**：最后一个条目必须无条件发一次，否则进度条永远停在
+///    `999/1000`，用户以为迁移卡住了（判据见 `migration_identifier::should_emit_progress`）。
+/// 3. **结束必发**：`migration-done` 无论成功、跳过、`deferred` 还是失败都要发一次，
+///    否则前端会永远停在"进行中"的禁用态。
+///
+/// 拿不到 `AppHandle` 时不报错、不阻断迁移（日志已留下全过程），只是界面看不到进度。
+pub struct MigrationProgressEmitter {
+    app: Option<AppHandle>,
+    last_emit: std::time::Instant,
+}
+
+impl MigrationProgressEmitter {
+    pub fn new(app: AppHandle) -> Self {
+        Self {
+            app: Some(app),
+            last_emit: std::time::Instant::now(),
+        }
+    }
+
+    /// 无宿主时的空实现（纯逻辑单测用）。
+    pub fn detached() -> Self {
+        Self {
+            app: None,
+            last_emit: std::time::Instant::now(),
+        }
+    }
+
+    fn emit_payload(&self, event: &str, p: &crate::migration_identifier::MigrationProgress) {
+        let Some(app) = self.app.as_ref() else {
+            return;
+        };
+        use tauri::Emitter;
+        if let Err(e) = app.emit(event, MigrateProgressPayload::from(p)) {
+            crate::error!("[MIGRATION] 进度事件发送失败（不影响迁移本身）：{}", e);
+        }
+    }
+
+    /// 阶段推进：**一定**发一次（阶段数量很少，不需要节流）。
+    pub fn stage(&mut self, p: crate::migration_identifier::MigrationProgress) {
+        self.last_emit = std::time::Instant::now();
+        self.emit_payload(crate::migration_identifier::EVENT_MIGRATION_PROGRESS, &p);
+    }
+
+    /// 条目推进：按 `PROGRESS_THROTTLE_MS` 节流；`is_last` 时强制发一次。
+    pub fn item(&mut self, p: crate::migration_identifier::MigrationProgress, is_last: bool) {
+        let elapsed = self.last_emit.elapsed().as_millis() as u64;
+        if !crate::migration_identifier::should_emit_progress(elapsed, is_last) {
+            return;
+        }
+        self.last_emit = std::time::Instant::now();
+        self.emit_payload(crate::migration_identifier::EVENT_MIGRATION_PROGRESS, &p);
+    }
+
+    /// 结束（成功 / 跳过 / deferred / 失败都调用它）。
+    pub fn finish(&mut self, p: crate::migration_identifier::MigrationProgress) {
+        self.emit_payload(crate::migration_identifier::EVENT_MIGRATION_PROGRESS, &p);
+        self.emit_payload(crate::migration_identifier::EVENT_MIGRATION_DONE, &p);
+    }
+}
+
+/// 进度事件的 payload（**冻结契约 §2**：字段名必须是 camelCase）。
+///
+/// `#[serde(rename_all = "camelCase")]` 漏了不会编译报错，只会让 `stageLabel` 变成
+/// `undefined`——用户看到一根没有说明文字的进度条，"迁移显示"这个核心诉求等于没做。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrateProgressPayload {
+    stage: &'static str,
+    stage_label: &'static str,
+    done: u64,
+    total: u64,
+    bytes: u64,
+    bytes_total: u64,
+    message: Option<String>,
+}
+
+impl From<&crate::migration_identifier::MigrationProgress> for MigrateProgressPayload {
+    fn from(p: &crate::migration_identifier::MigrationProgress) -> Self {
+        Self {
+            stage: p.stage,
+            stage_label: p.stage_label,
+            done: p.done,
+            total: p.total,
+            bytes: p.bytes,
+            bytes_total: p.bytes_total,
+            message: p.message.clone(),
+        }
+    }
+}
+
+/// 组装一条进度快照（阶段文案的唯一来源在 `migration_identifier::stage_label`）。
+fn progress(
+    stage: &'static str,
+    done: u64,
+    total: u64,
+    bytes: u64,
+    bytes_total: u64,
+    message: Option<String>,
+) -> crate::migration_identifier::MigrationProgress {
+    crate::migration_identifier::MigrationProgress {
+        stage,
+        stage_label: crate::migration_identifier::stage_label(stage),
+        done,
+        total,
+        bytes,
+        bytes_total,
+        message,
+    }
+}
+
+/// 带进度上报的两阶段迁移。
+///
+/// ## 为什么走 `stage_takeover`（运行期只复制、不交付）
+///
+/// 迁移入口是应用内界面 ⇒ 用户点它时应用必定在运行 ⇒ 目标库已被 `init_db` 打开、
+/// 连接常驻 `DbState`。Windows 不允许给已打开的文件改名，因此"给目标空库让位"在
+/// 运行期**必然**失败（os error 32）。所以运行期只做"复制到暂存 + 写标记"，
+/// 由下次启动在 `init_db` 之前完成交换。
+///
+/// `takeover == false`（目标里已有用户数据）时不进入两阶段：那本来就是"跳过"，
+/// 走既有入口以保持与 v0.5.2 相同的语义与原因码。
+///
+/// ## 进度是怎么算出来的（不是装样子）
+///
+/// 迁移**第一步就扫描源目录**（`scan_source_summary`），所以开始复制之前总数与总字节
+/// 都已已知。`precheck` 阶段报的就是这个总数。
+fn migrate_with_progress(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    takeover: bool,
+    sink: &mut MigrationProgressEmitter,
+) -> crate::migration_identifier::MigrationOutcome {
+    use crate::migration_identifier as mi;
+
+    // ---- 阶段 1：只读预检（总量在这里算出来）----
+    let scanned = mi::scan_source_summary(source);
+    let entries = scanned.map(|s| s.entries).unwrap_or(0);
+    let bytes_total = scanned.map(|s| s.bytes).unwrap_or(0);
+    sink.stage(progress("precheck", 0, entries, 0, bytes_total, None));
+
+    // ---- 阶段 2：复制到暂存（每复制完一个文件回调一次）----
+    //
+    // `takeover == false`（目标里已有用户数据）时，`stage_takeover_with_progress`
+    // 会在预检阶段就回 `Skipped(TargetAlreadyHasData)`——与一次性交付路径的语义
+    // 完全一致，因此这里不需要再分一次支。
+    sink.stage(progress("copying", 0, entries, 0, bytes_total, None));
+
+    // 判据：是否是最后一个条目。`stage_takeover_with_progress` 保证最后一定会用
+    // `files_total == done` 回调一次，这里据此把"末条强制发出"接上。
+    let outcome = {
+        let mut on_item = |done: u64, total: u64, bytes: u64, bytes_total: u64| {
+            // `total > 0 && done >= total` = "这是最后一个条目"：节流对它**无条件放行**，
+            // 保证进度条一定会走到 100%（否则它会停在 999/1000，用户以为卡死）。
+            let is_last = total > 0 && done >= total;
+            sink.item(
+                progress("copying", done, total, bytes, bytes_total, None),
+                is_last,
+            );
+        };
+        mi::stage_takeover_with_progress(source, target, takeover, &mut on_item)
+    };
+
+    match outcome {
+        mi::MigrationOutcome::Deferred {
+            source,
+            target,
+            staging,
+            files,
+            bytes,
+        } => {
+            // ---- 阶段 3：校验（暂存已与源逐项比对过，这里只做呈现）----
+            sink.stage(progress("verifying", files, files, bytes, bytes_total, None));
+            sink.finish(progress(
+                "deferred",
+                0,
+                0,
+                0,
+                0,
+                Some("源数据已复制就绪。重启应用后自动完成接管，无需其他操作。".to_string()),
+            ));
+            mi::MigrationOutcome::Deferred {
+                source,
+                target,
+                staging,
+                files,
+                bytes,
+            }
+        }
+        other => {
+            sink.finish(finish_progress(&other, entries, bytes_total));
+            other
+        }
+    }
+}
+
+/// 非 `Deferred` 结果对应的结束进度。
+fn finish_progress(
+    outcome: &crate::migration_identifier::MigrationOutcome,
+    total: u64,
+    bytes_total: u64,
+) -> crate::migration_identifier::MigrationProgress {
+    use crate::migration_identifier::MigrationOutcome as M;
+    match outcome {
+        M::Migrated { files, bytes, .. } => progress(
+            "done",
+            *files,
+            total.max(*files),
+            *bytes,
+            bytes_total.max(*bytes),
+            None,
+        ),
+        M::Deferred { files, bytes, .. } => progress(
+            "deferred",
+            0,
+            0,
+            0,
+            0,
+            Some(format!("{} 项 / {} 字节已就绪", files, bytes)),
+        ),
+        M::Skipped(reason) => progress(
+            "done",
+            0,
+            total,
+            0,
+            bytes_total,
+            Some(format!("无需迁移：{}", skip_reason_human(*reason))),
+        ),
+        M::Failed { error, .. } => {
+            progress("failed", 0, total, 0, bytes_total, Some(error.clone()))
+        }
+    }
+}
+
+/// 原因码 → 人话（**只用于进度事件的 `message`**；界面上的正式文案仍按 `skipReason`
+/// 查多语言词条，两者互不替代）。
+fn skip_reason_human(reason: crate::migration_identifier::SkipReason) -> String {
+    use crate::migration_identifier::SkipReason as R;
+    match reason {
+        R::TargetAlreadyHasData => "新版数据目录里已经有你自己的记录".to_string(),
+        R::NoLegacyDir => "没有找到可迁移的旧数据目录".to_string(),
+        R::SamePath => "源目录与目标目录是同一个".to_string(),
+        R::SourceMissing => "源目录不存在".to_string(),
+        R::NotADirectory => "所选路径不是目录".to_string(),
+        R::EmptySource => "源目录里没有数据".to_string(),
+        R::NotADataDirectory => "所选目录不是数据目录，请往下选一层".to_string(),
+        R::SourceIsAncestorOfTarget => "源目录是目标目录的上级".to_string(),
+        R::SourceInsideTarget => "源目录在目标目录内部".to_string(),
+    }
+}
+
+/// 把 `Deferred` 结果落成"待接管"标记；标记写失败时**如实改为失败**。
+///
+/// 【为什么失败必须改状态】标记是下次启动唯一能知道"有活要干"的凭据。若对用户说
+/// "重启后自动完成"、而标记其实没写成功，用户重启后什么都没发生，只会认为这个功能
+/// 又一次骗了他。此时唯一诚实的表达是"这次没成"，并保留暂存目录（下次还能重试）。
+///
+/// 非 `Deferred` 的结果原样返回，不做任何处理。
+fn finalize_deferred(
+    report: &mut crate::app::IdentifierMigrationReport,
+    native_dir: Option<&std::path::Path>,
+    source: &std::path::Path,
+    target: &std::path::Path,
+) {
+    if report.status != "deferred" {
+        return;
+    }
+    let Some(native) = native_dir else {
+        report.status = "failed".to_string();
+        report.pending_until_restart = false;
+        report.error = Some(
+            "取不到应用的原生数据目录，无法记录「待接管」状态；已复制到暂存的数据仍保留，请重试本次迁移。"
+                .to_string(),
+        );
+        return;
+    };
+
+    let staging = crate::migration_identifier::takeover_staging_dir(target);
+    // 【必须记**归一化之后**的源目录，不能记用户原选的那一层】
+    //
+    // 用户常常停在便携版的**外层**目录上（解压出来是两层同名目录，真正的数据在
+    // `外层/内层/data/`）。接管之后要按"源 → 目标"改写库里记录的附件/表情绝对路径，
+    // 而记录里写的是**内层 `data/`** 的绝对路径。
+    //
+    // 若这里记的是外层：`source.join("attachments")` 与外层不匹配 ⇒ 一条都改不到
+    // （路径改写静默无效）；更糟的是若外层恰好也有个 `attachments/` 目录，改写会把
+    // 记录指向一个**不存在**的位置。两种后果都表现为"数据在、图片全打不开"。
+    //
+    // 归一化结果与 `stage_takeover` 内部用的那一个完全一致（同一个只读函数），
+    // 因此记它才是"真正被复制的那一层"。
+    let resolved_source = crate::migration_identifier::resolve_source_dir(source);
+    let pending = crate::migration_pending::PendingMigration::new(
+        resolved_source,
+        staging,
+        target.to_path_buf(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    match crate::migration_pending::write(native, &pending) {
+        Ok(path) => {
+            crate::info!(">>> [MIGRATION] 已写入待接管标记：{:?}", path);
+            report.pending_until_restart = true;
+        }
+        Err(e) => {
+            crate::error!("[MIGRATION] 待接管标记写入失败：{}", e);
+            report.status = "failed".to_string();
+            report.pending_until_restart = false;
+            report.error = Some(format!(
+                "数据已复制到暂存目录，但「待接管」状态未能记下（{}）；请重试本次迁移。源目录未被改动。",
+                e
+            ));
+        }
+    }
+}
+
+/// 供界面在 `listen` 之后拉一次当前快照的命令。
+///
+/// 【为什么需要它】冻结契约只规定了两个**事件**，没规定"初值怎么拉"。若前端只
+/// `listen` 不拉初值，那一轮里已经发过的事件会永久丢失，用户看到进度条卡在第一帧。
+/// 本命令返回**最近一次**进度快照；从未有过迁移时返回 `None`（前端据此显示空闲态，
+/// **不伪造进度**）。
+///
+/// 快照在内存里，进程重启即清空——这是对的：迁移进度本来就是"本次运行"的状态。
+#[tauri::command]
+pub fn get_migration_progress() -> AppResult<Option<serde_json::Value>> {
+    let guard = LAST_MIGRATION_PROGRESS.lock().unwrap();
+    Ok(guard.clone())
+}
+
+/// 最近一次进度快照（`serde_json::Value`，与事件 payload 同构）。
+static LAST_MIGRATION_PROGRESS: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
+
+
 #[tauri::command]
 pub fn get_data_path(state: State<'_, AppDataDir>) -> AppResult<String> {
     let path = state.0.lock().unwrap();
@@ -344,6 +688,7 @@ fn can_remove_source_safely(target: &std::path::Path) -> Result<(), String> {
 /// 数据库连接在启动时已建立，界面应提示用户重启以加载新数据。
 #[tauri::command]
 pub fn migrate_from_data_dir(
+    app: AppHandle,
     state: State<'_, AppDataDir>,
     path: String,
 ) -> AppResult<crate::app::IdentifierMigrationReport> {
@@ -390,9 +735,30 @@ pub fn migrate_from_data_dir(
         );
     }
 
-    let outcome =
-        crate::migration_identifier::migrate_from_source_dir(&source, &current, takeover);
-    let report = crate::app::apply_identifier_migration(&source, &current, outcome);
+    // 进度发射器：阶段推进必发，`copying` 按条目节流（最快 150ms 一次），结束必发。
+    let mut sink = MigrationProgressEmitter::new(app.clone());
+
+    let outcome = migrate_with_progress(&source, &current, takeover, &mut sink);
+    let mut report = crate::app::apply_identifier_migration(&source, &current, outcome);
+
+    // 拿到 Deferred（数据已复制就绪、待下次启动接管）时**必须**写标记：
+    // 标记是下次启动唯一能知道"有活要干"的凭据。写失败要如实回报为失败——
+    // 不能对用户说"重启就行"，而重启后什么都没发生。
+    let native = app.path().app_data_dir().ok();
+    finalize_deferred(&mut report, native.as_deref(), &source, &current);
+
+    // 快照：让晚一步连上 `listen` 的界面也能拿到当前状态（否则它会卡在第一帧）。
+    if let Ok(value) = serde_json::to_value(MigrateProgressPayload::from(&progress(
+        report_status_stage(&report),
+        0,
+        0,
+        0,
+        0,
+        report.error.clone(),
+    ))) {
+        *LAST_MIGRATION_PROGRESS.lock().unwrap() = Some(value);
+    }
+
     match report.status.as_str() {
         "migrated" => crate::info!(
             ">>> [MIGRATION] 手动迁移完成：源 {:?} 已复制 {} 项 / {} 字节到 {:?}；源目录未被改动，可重复验证。",
@@ -400,6 +766,10 @@ pub fn migrate_from_data_dir(
             report.files,
             report.bytes,
             report.target
+        ),
+        "deferred" => crate::info!(
+            ">>> [MIGRATION] 数据已复制就绪，等待下次启动接管：源 {:?}（标记已写入）。",
+            report.source
         ),
         "skipped" => crate::info!(
             ">>> [MIGRATION] 手动迁移跳过（源与目标均未被改动）：源={:?} 原因码={:?}",
@@ -410,6 +780,15 @@ pub fn migrate_from_data_dir(
     }
 
     Ok(report)
+}
+
+/// 报告状态 → 进度事件里对应的阶段名（快照用）。
+fn report_status_stage(report: &crate::app::IdentifierMigrationReport) -> &'static str {
+    match report.status.as_str() {
+        "deferred" => "deferred",
+        "failed" => "failed",
+        _ => "done",
+    }
 }
 
 #[tauri::command]
@@ -433,46 +812,284 @@ pub fn open_file_location(file_path: String) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn toggle_autostart(enabled: bool) -> AppResult<()> {
+// ---------------------------------------------------------------------------
+// 开机自启动：写后回读（消灭"界面显示已开、实际没生效"的静默失败）
+// ---------------------------------------------------------------------------
+
+/// `HKCU\...\Run` 下本应用使用的键名。
+///
+/// - `AUTOSTART_VALUE_NAME` 是**当前版本写入**的名字，也是唯一被认作"已开启"的名字；
+/// - 另外两个是**旧版遗留名**（改名前的 `TieZ` / `tie-z`）。它们只在关闭时被顺手清理，
+///   **不参与"是否已开启"的判定**——判定要认值内容，见 [`autostart_state_from`]。
+const AUTOSTART_VALUE_NAME: &str = "Tiez-Next";
+const AUTOSTART_LEGACY_NAMES: [&str; 2] = ["TieZ", "tie-z"];
+
+/// 读回的注册表自启动状态：界面据此显示"真的生效了吗"，而不是乐观置位。
+///
+/// 【为什么要把原始值也回传】"设置成功"的唯一可信证据是注册表里那串命令本身。
+/// 只回一个 `bool` 时，用户看到的仍然是一个开关——那正是缺陷的形态：开关亮了，
+/// 但没人能证明系统真的会在开机时拉起这个路径。回传 `registeredCommand` 后，
+/// 界面可以把**读回来的原文**显示给用户，或至少给出"指向哪里"的说明。
+
+/// `is_autostart_enabled` 的返回形状（camelCase，与前端 `AutostartState` 对应）。
+///
+/// 【为什么不让前端自己判断"指向是否正确"】判据只允许存在一处。前端若复制一份
+/// "剥引号 + 比路径"的逻辑，两处迟早分叉（比如后端支持了正反斜杠混用而前端没跟上），
+/// 于是同一台机器上开关与实际状态出现第二种矛盾。前端只负责**展示**回读结果。
+#[derive(Debug, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AutostartState {
+    pub enabled: bool,
+    pub registered_command: Option<String>,
+    pub current_exe: String,
+    pub stale_names: Vec<String>,
+    pub readable: bool,
+}
+
+/// 判定一个注册表自启动值是否**指向当前这个 exe**。
+///
+/// 【为什么不能只看值是否存在】改名/换安装位置/便携版搬目录之后，注册表里会留下
+/// 指向**已失效旧路径**的值。只要它在，老判据就报"已开启"，而系统开机时拉起的是一个
+/// 不存在的文件——用户看到开关是亮的，实际什么都没发生。
+///
+/// 匹配方式：把命令串里的引号剥掉，取其中的路径部分与当前 exe 做**大小写无关**比较
+/// （Windows 路径大小写不敏感）。参数（如 `--minimized`）不参与比较。
+fn command_targets_current_exe(command: &str, current_exe: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || current_exe.is_empty() {
+        return false;
+    }
+    // 逐段比较优于字符串相等：注册表里可能用 `C:/` 而进程报 `C:\`，也可能正反斜杠混用。
+    let norm = |s: &str| s.replace('/', "\\").to_lowercase();
+
+    // 情况 1：整串就是那个路径（没有参数、也没有引号）。含空格的路径常被这样写，
+    // 直接整体比一次，避免被下面的"按空白切第一段"切坏。
+    if norm(trimmed) == norm(current_exe) {
+        return true;
+    }
+
+    // 情况 2：`"路径" 参数...` —— 引号内的才是路径（含空格路径的唯一可靠写法）。
+    let path_part = if let Some(rest) = trimmed.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    } else {
+        // 情况 3：`路径 参数...`（无引号）。此时路径本身不能含空格，
+        // 否则无法与参数区分——这种写法本身就是无效的，不予猜测。
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+
+    if path_part.is_empty() {
+        return false;
+    }
+    norm(path_part) == norm(current_exe)
+}
+
+/// 由"注册表读到的原始值"判定自启动状态（**纯函数**，可在任何平台上单测）。
+///
+/// 输入是 `(值名, 值内容)` 列表与当前 exe 路径，输出是判定结果。把判定从注册表读取里
+/// 拆出来，是为了让"旧名残留不该算已开启""指向旧路径不该算已开启"这两条关键判据
+/// 能在没有 Windows 注册表的机器上被真正断言——否则它们只能靠真机人工验证。
+pub fn autostart_state_from(entries: &[(String, String)], current_exe: &str) -> AutostartState {
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+
+    // 已开启 = **当前键名存在** 且 **值指向当前 exe**。旧名不参与这个判定。
+    let own = find(AUTOSTART_VALUE_NAME);
+    let enabled = own
+        .as_deref()
+        .map(|v| command_targets_current_exe(v, current_exe))
+        .unwrap_or(false);
+
+    let stale_names = AUTOSTART_LEGACY_NAMES
+        .iter()
+        .filter(|n| find(n).is_some())
+        .map(|n| n.to_string())
+        .collect();
+
+    AutostartState {
+        enabled,
+        // 只有**判定为生效**时才把命令原文当作"生效证据"回传；否则回传它也没意义，
+        // 反而会让界面把一条失效的旧命令当成成功证据显示出来。
+        registered_command: if enabled { own } else { None },
+        current_exe: current_exe.to_string(),
+        stale_names,
+        readable: true,
+    }
+}
+
+/// 读取 `HKCU\...\Run` 下与自启动相关（本应用名与旧版遗留名）的全部值。
+#[cfg(target_os = "windows")]
+fn read_autostart_entries() -> Result<Vec<(String, String)>, String> {
     use winreg::enums::*;
     use winreg::RegKey;
-
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key = hkcu
         .open_subkey_with_flags(
             "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            KEY_WRITE | KEY_READ,
+            KEY_READ | KEY_WRITE,
         )
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let app_path = std::env::current_exe()
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .to_string_lossy()
-        .to_string();
-    let cmd = format!("\"{}\" --minimized", app_path);
+        .map_err(|e| e.to_string())?;
 
-    if enabled {
-        key.set_value("Tiez-Next", &cmd)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    } else {
-        let _ = key.delete_value("Tiez-Next");
-        let _ = key.delete_value("TieZ");
-        let _ = key.delete_value("tie-z");
+    let mut out = Vec::new();
+    let mut names = vec![AUTOSTART_VALUE_NAME.to_string()];
+    names.extend(AUTOSTART_LEGACY_NAMES.iter().map(|s| s.to_string()));
+    for name in names {
+        if let Ok(value) = key.get_value::<String, _>(&name) {
+            out.push((name, value));
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
+#[cfg(not(target_os = "windows"))]
+fn read_autostart_entries() -> Result<Vec<(String, String)>, String> {
+    // 非 Windows 目标没有这个注册表位置。返回空表（= 未开启）而不是报错：
+    // 报错会让界面把"这个平台没有开机自启动"显示成一次故障。
+    Ok(Vec::new())
+}
+
+/// 当前进程 exe 路径（判定基准）。取不到时回空串，判定会安全地落到"未开启"。
+fn current_exe_string() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// 读一次自启动状态（含回读证据）。
+pub fn read_autostart_state() -> AutostartState {
+    let exe = current_exe_string();
+    match read_autostart_entries() {
+        Ok(entries) => autostart_state_from(&entries, &exe),
+        Err(e) => {
+            crate::error!("[AUTOSTART] 读取 Run 键失败：{}", e);
+            AutostartState {
+                enabled: false,
+                registered_command: None,
+                current_exe: exe,
+                stale_names: Vec::new(),
+                readable: false,
+            }
+        }
+    }
+}
+
+/// 开关开机自启动，并**在写入之后立即回读注册表**确认真的生效。
+///
+/// ## 为什么必须回读（这条命令的存在理由）
+///
+/// 旧实现 `key.set_value(...)` 成功即 `Ok(())`，前端拿到成功就把开关点亮。但
+/// "写 API 没报错"与"系统真的会在开机时拉起这个路径"是两件事：值可能被组策略、
+/// 安全软件或权限问题挡住，也可能被写成了一个**指向已失效旧路径**的内容。用户看到的
+/// 是一个亮着的开关，实际什么都没发生——这正是用户反馈的"纯应用里面显示设置了
+/// 不一定生效"。
+///
+/// 因此本命令的返回值是**回读后的真实状态**（[`AutostartState`]）：
+/// - 期望开启但回读不通过 → 返回 `Err`，并把回读到的内容写进错误里；
+/// - 期望关闭但回读仍为开启 → 同样返回 `Err`（不能谎报关闭成功）。
+///
+/// 判据与 `hotkey_cmd::test_hotkey_available`（注册→读回→注销）同源：
+/// **一步不省，成功后立刻验证**。
 #[tauri::command]
-pub fn is_autostart_enabled() -> AppResult<bool> {
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(key.get_value::<String, _>("Tiez-Next").is_ok()
-        || key.get_value::<String, _>("TieZ").is_ok()
-        || key.get_value::<String, _>("tie-z").is_ok())
+pub fn toggle_autostart(enabled: bool) -> AppResult<AutostartState> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = hkcu
+            .open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                KEY_WRITE | KEY_READ,
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let app_path = std::env::current_exe()
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .to_string_lossy()
+            .to_string();
+        let cmd = format!("\"{}\" --minimized", app_path);
+
+        if enabled {
+            key.set_value(AUTOSTART_VALUE_NAME, &cmd)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        } else {
+            let _ = key.delete_value(AUTOSTART_VALUE_NAME);
+            // 关闭时顺手清掉旧版遗留值：它们会让系统在开机时多拉一个已失效的旧路径。
+            // 清理失败**不算失败**（那不是本次操作的判据），但会被回读如实报出。
+            for legacy in AUTOSTART_LEGACY_NAMES {
+                let _ = key.delete_value(legacy);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 非 Windows 平台永远无法真正注册开机自启动：如实返回失败，
+        // 而不是让界面把开关点亮成一个假的"已开启"。
+        return Err(AppError::Internal(
+            "当前平台不支持开机自启动设置".to_string(),
+        ));
+    }
+
+    // ── 写后回读：唯一能证明"真的生效"的步骤 ──
+    let state = read_autostart_state();
+    if !state.readable {
+        return Err(AppError::Internal(
+            "自启动设置已写入，但回读注册表失败，无法确认是否生效".to_string(),
+        ));
+    }
+
+    if enabled {
+        if !state.enabled {
+            // 回读到的内容要如实带回：用户据此能判断是"没写进去"还是"写进去了但指向旧路径"。
+            let actual = read_autostart_entries()
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|(n, _)| n == AUTOSTART_VALUE_NAME)
+                        .map(|(_, v)| v)
+                })
+                .unwrap_or_else(|| "（注册表里没有该值）".to_string());
+            return Err(AppError::Internal(format!(
+                "自启动写入后回读未通过：期望指向 {}，实际 {}",
+                state.current_exe, actual
+            )));
+        }
+    } else if state.enabled {
+        return Err(AppError::Internal(
+            "自启动关闭后回读仍显示已开启".to_string(),
+        ));
+    }
+
+    crate::info!(
+        "[AUTOSTART] 设置 enabled={} 已回读确认；注册表命令={:?}；旧版残留值={:?}",
+        enabled,
+        state.registered_command,
+        state.stale_names
+    );
+
+    Ok(state)
+}
+
+/// 查询当前自启动状态（含回读证据，供界面显示"真的生效了"的凭据）。
+#[tauri::command]
+pub fn is_autostart_enabled() -> AppResult<AutostartState> {
+    Ok(read_autostart_state())
+}
+
+/// 兼容旧调用点：只要布尔值的自启动查询。
+///
+/// 保留它是为了让 `useAppBootstrap` 这类只关心一个开关的地方不必解析结构体；
+/// 但**界面显示"是否真的生效"必须用 `is_autostart_enabled`**，因为只有它能给出
+/// 注册表原文与旧版残留值。
+pub fn autostart_enabled_bool() -> bool {
+    read_autostart_state().enabled
 }
 
 #[tauri::command]
@@ -676,15 +1293,42 @@ pub fn get_registry_win_v_optimized_status() -> bool {
     false
 }
 
+/// 重启 Windows 资源管理器，让 `DisabledHotkeys` 这类注册表改动真正生效。
+///
+/// ## 为什么不再吞掉错误
+///
+/// `DisabledHotkeys`（Win+V 接管用的就是它）**只在 explorer 启动时读一次**。改了注册表
+/// 而不重启 explorer，等于什么都没发生——而界面文案却写着"会重启资源管理器"。
+/// 旧实现 `let _ = ...spawn(); Ok(())` 把失败也变成成功：用户点完开关看到"已开启"，
+/// 实际系统仍然占用着 Win+V，且没有任何提示。
+///
+/// 现在：spawn 失败如实返回错误。**但要说清"重启失败不等于设置失败"**——
+/// 注册表已经写好了，只是要等用户下次登录（explorer 自然会重启）才生效，
+/// 所以这里是可降级的告知，不是致命错误（错误文案由调用方按此措辞）。
 #[tauri::command]
 pub fn restart_explorer() -> AppResult<()> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
-    let _ = Command::new("cmd")
-        .args(["/C", "taskkill /F /IM explorer.exe & start explorer.exe"])
-        .creation_flags(0x08000000)
-        .spawn();
-    Ok(())
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "taskkill /F /IM explorer.exe & start explorer.exe"])
+            .creation_flags(0x08000000)
+            .spawn()
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "重启资源管理器失败：{}。注册表改动已写入，下次登录后会自动生效。",
+                    e
+                ))
+            })?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(AppError::Internal(
+            "当前平台没有资源管理器".to_string(),
+        ))
+    }
 }
 
 #[tauri::command]
@@ -1526,6 +2170,325 @@ mod migration_pristine_tests {
         dir
     }
 
+    // ------------------------------------------------------------------
+    // 进度：payload 字段名与节流判据（都是前后端并行实施的接缝）
+    // ------------------------------------------------------------------
+
+    /// 进度 payload 的**字段名必须是契约里的 camelCase**。
+    ///
+    /// 【为什么值得一条独立测试】`#[serde(rename_all = "camelCase")]` 漏了**不会编译
+    /// 报错**，只会让 `stageLabel` 变成 `undefined`——于是用户看到一根没有说明文字的
+    /// 进度条，而"迁移显示"这个核心诉求恰恰是"要有人话说明现在在干什么"。
+    /// 这种缺陷在编译期与类型检查里都抓不到，只能靠对序列化结果下断言。
+    #[test]
+    fn progress_payload_uses_the_contract_field_names() {
+        let payload = MigrateProgressPayload::from(&progress(
+            "copying",
+            12,
+            40,
+            4096,
+            65536,
+            Some("正在复制".to_string()),
+        ));
+        let value = serde_json::to_value(&payload).unwrap();
+        let obj = value.as_object().expect("payload 必须是 JSON 对象");
+
+        // 契约 §2 的七个字段，一个不能少、一个不能多。
+        for key in [
+            "stage",
+            "stageLabel",
+            "done",
+            "total",
+            "bytes",
+            "bytesTotal",
+            "message",
+        ] {
+            assert!(obj.contains_key(key), "payload 缺少契约字段 `{key}`：{value}");
+        }
+        assert_eq!(
+            obj.len(),
+            7,
+            "payload 只应有契约里的 7 个字段，多出来的是没约定的内部信息：{value}"
+        );
+        // snake_case 拼写**不得**出现（那正是漏加 rename_all 时的症状）。
+        for wrong in ["stage_label", "bytes_total"] {
+            assert!(
+                !obj.contains_key(wrong),
+                "字段名必须是 camelCase，出现了 `{wrong}`：{value}"
+            );
+        }
+        // 阶段文案由后端产出人话，界面原样显示。
+        assert_eq!(obj["stageLabel"], "正在复制数据");
+    }
+
+    /// 结束事件的阶段文案与"是否可计量"必须与契约表一致。
+    #[test]
+    fn stage_labels_match_the_frozen_contract() {
+        use crate::migration_identifier::stage_label;
+        assert_eq!(stage_label("precheck"), "正在检查源目录");
+        assert_eq!(stage_label("copying"), "正在复制数据");
+        assert_eq!(stage_label("verifying"), "正在校验完整性");
+        assert_eq!(stage_label("deferred"), "数据已就绪，等待重启接管");
+        assert_eq!(stage_label("done"), "迁移完成");
+        assert_eq!(stage_label("failed"), "迁移失败");
+    }
+
+    /// `copying` 的节流判据：未到窗口**不发**，最后一条**必发**。
+    ///
+    /// 【两个方向的错都有真实后果】
+    /// - 不节流：上千个小文件逐条发事件，通道被刷爆，界面反而渲染不过来；
+    /// - 末尾不强制：进度条永远停在 `999/1000`，用户以为迁移卡死了。
+    #[test]
+    fn throttling_is_skipped_until_the_window_but_the_last_item_always_goes_out() {
+        use crate::migration_identifier::{should_emit_progress, PROGRESS_THROTTLE_MS};
+
+        assert!(!should_emit_progress(0, false), "刚发过就不该再发");
+        assert!(
+            !should_emit_progress(PROGRESS_THROTTLE_MS - 1, false),
+            "窗口内不得发"
+        );
+        assert!(
+            should_emit_progress(PROGRESS_THROTTLE_MS, false),
+            "到窗口就该发"
+        );
+        assert!(
+            should_emit_progress(0, true),
+            "最后一个条目必须**无条件**发一次（否则进度条停在 done < total）"
+        );
+    }
+
+    /// 无宿主时进度发射器不得 panic（MCP / 单测场景走 `detached`）。
+    #[test]
+    fn detached_progress_emitter_is_a_silent_no_op() {
+        let mut sink = MigrationProgressEmitter::detached();
+        sink.stage(progress("precheck", 0, 0, 0, 0, None));
+        sink.item(progress("copying", 1, 2, 10, 20, None), false);
+        sink.item(progress("copying", 2, 2, 20, 20, None), true);
+        sink.finish(progress("done", 2, 2, 20, 20, None));
+    }
+
+    /// **快照命令的语义**：没有进行过迁移时返回 `None`，**绝不伪造进度**。
+    ///
+    /// 前端按契约在 `listen` 之后调它拉初值；若这里返回一个"0%"的假快照，
+    /// 用户一进设置页就会看到一根停在 0% 的进度条——比什么都不显示更糟。
+    #[test]
+    fn progress_snapshot_is_empty_before_any_migration() {
+        *LAST_MIGRATION_PROGRESS.lock().unwrap() = None;
+        let snapshot = get_migration_progress().unwrap();
+        assert!(snapshot.is_none(), "从未迁移过时必须返回 None，不得伪造进度");
+
+        // 写入一次之后应能读回同一份。
+        *LAST_MIGRATION_PROGRESS.lock().unwrap() =
+            Some(serde_json::json!({"stage": "copying", "stageLabel": "正在复制数据"}));
+        let snapshot = get_migration_progress().unwrap().unwrap();
+        assert_eq!(snapshot["stageLabel"], "正在复制数据");
+        *LAST_MIGRATION_PROGRESS.lock().unwrap() = None;
+    }
+
+    /// 造一个**真 SQLite 库**并写入 `rows` 条剪贴板记录。
+    ///
+    /// 【为什么必须是真库】本仓库踩过两次"夹具写了个假库（100 字节文件头）、
+    /// `rusqlite::open` 打不开、报错却指向被测代码"的坑（见维护文档与候选记忆
+    /// `AB2-G3-086`）。端到端测试里一旦有"打开并读一下"的动作，假库就会以
+    /// `file is not a database` 失败，而那与用户真实遇到的问题**不是同一件事**。
+    /// 因此这里一律走产品自己的 `init_db` 建库。
+    fn seeded_source(dir: &std::path::Path, rows: usize) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        let db = dir.join("clipboard.db");
+        let conn = crate::database::init_db(&db.to_string_lossy()).unwrap();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview) \
+                     VALUES ('text', ?, 'OldApp', ?, '')",
+                )
+                .unwrap();
+            for i in 0..rows {
+                stmt.execute(rusqlite::params![
+                    format!("旧版第 {i} 条"),
+                    1_700_000_000i64 + i as i64
+                ])
+                .unwrap();
+            }
+        }
+        drop(conn);
+        std::fs::write(dir.join("attachments/old.png"), vec![b'a'; 512]).unwrap();
+        dir.to_path_buf()
+    }
+
+    fn count_rows(db: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0))
+            })
+            .unwrap_or(-1)
+    }
+
+    /// **端到端：一次完整的"两阶段迁移 + 重启接管"**（不经过 Tauri 运行时）。
+    ///
+    /// 这条测试直接复现用户真机上的完整时序：
+    ///
+    /// ```text
+    /// 1. 用户点迁移          -> stage_takeover：只复制到暂存，返回 Deferred
+    /// 2. 后端写"待接管"标记   -> finalize_deferred：status = deferred，标记落盘
+    /// 3. 用户重启应用        -> run_startup_takeover：在开库之前完成交换
+    /// 4. 应用打开库          -> 120 条真实记录就在目标根层
+    /// ```
+    ///
+    /// 【为什么这条最重要】真机上"必然失败"的那一步（给被占用的目标库改名）在这里
+    /// 被**真的执行了一次**——只不过时机换到了"无人持句柄"的启动期。若两阶段设计有
+    /// 任何一环接不上（标记没写、暂存被删、提升进了子目录、路径没改写），本条会红。
+    #[test]
+    fn two_phase_migration_survives_a_simulated_restart() {
+        let root = tmp_root("two-phase-e2e");
+        let native = root.join("native-appdata");
+        std::fs::create_dir_all(&native).unwrap();
+        let target = seeded_dir(&root); // 应用已启动过：空库躺在目标里（真实 init_db）
+        let source = seeded_source(&root.join("old-data"), 120);
+
+        // ---- 第 1 步：运行期只复制到暂存 ----
+        let outcome = crate::migration_identifier::stage_takeover(&source, &target);
+        let mut report = crate::app::apply_identifier_migration(&source, &target, outcome);
+        assert_eq!(
+            report.status, "deferred",
+            "运行期必须得到 deferred（目标库被占用，当场交付不可能）"
+        );
+
+        // ---- 第 2 步：写"待接管"标记 ----
+        finalize_deferred(&mut report, Some(&native), &source, &target);
+        assert_eq!(report.status, "deferred", "标记写成功后状态仍是 deferred");
+        assert!(
+            report.pending_until_restart,
+            "必须告诉界面'待重启接管'（否则界面会以为迁移失败了）"
+        );
+        assert!(
+            crate::migration_pending::marker_path(&native).is_file(),
+            "待接管标记必须真的落盘——它是下次启动唯一的线索"
+        );
+        let staging = crate::migration_identifier::takeover_staging_dir(&target);
+        assert!(staging.is_dir(), "暂存目录必须保留");
+
+        // 此刻目标根层的库里**一条都没有**（运行期一个字节都没动过目标）。
+        assert_eq!(count_rows(&target.join("clipboard.db")), 0);
+
+        // ---- 第 3 步：模拟重启，在"开库之前"完成接管 ----
+        let outcome = crate::migration_pending::run_startup_takeover(
+            &native,
+            &mut |staging: &std::path::Path, target: &std::path::Path| {
+                crate::migration_identifier::promote_staged_takeover_default(staging, target)
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::migration_pending::TakeoverOutcome::Promoted { .. }
+            ),
+            "启动期接管必须成功（此时无人持句柄），实际 {outcome:?}"
+        );
+
+        // ---- 第 4 步：数据真的在目标根层 ----
+        assert_eq!(
+            count_rows(&target.join("clipboard.db")),
+            120,
+            "接管后目标根层的库里必须有那 120 条真实记录"
+        );
+        assert!(
+            target.join("attachments/old.png").is_file(),
+            "附件也必须一并到位（否则图片全打不开）"
+        );
+        // 标记已被消费、暂存已被提升
+        assert!(
+            !crate::migration_pending::marker_path(&native).exists(),
+            "接管成功后标记必须清除，否则每次启动都会白跑一遍"
+        );
+        assert!(!staging.exists(), "接管成功后暂存目录必须消失");
+        // 源目录全程只读
+        assert_eq!(count_rows(&source.join("clipboard.db")), 120, "源库必须完好");
+    }
+
+    /// **标记里记的源目录必须是归一化之后那一层**（否则便携版用户图片全打不开）。
+    ///
+    /// 【这条守的是一个静默失败】用户选便携版**外层**目录时，真正的数据在
+    /// `外层/内层/data/`。接管成功后要按"源 → 目标"改写库里记录的附件绝对路径，
+    /// 而那些记录写的是内层 `data/` 的路径。
+    ///
+    /// 若标记里记的是外层：`外层/attachments` 与记录前缀**不匹配** ⇒ 一条也改不到
+    /// （静默无效）。后果是"记录都在、图片全打不开"——用户一定会报"迁移把图片弄丢了"，
+    /// 而实际上数据全在、只是指针没改。
+    #[test]
+    fn marker_records_the_resolved_data_dir_not_the_layer_the_user_picked() {
+        let root = tmp_root("marker-resolved-source");
+        let native = root.join("native-appdata");
+        std::fs::create_dir_all(&native).unwrap();
+        let target = seeded_dir(&root);
+
+        // 造一份真实的便携版两层同名目录：外层 / 内层 / data。
+        let outer = root.join("TieZ_0.3.3-portable");
+        let inner = outer.join("TieZ_0.3.3-portable");
+        let data = inner.join("data");
+        seeded_source(&data, 30);
+
+        // 用户点的是**外层**。
+        let outcome = crate::migration_identifier::stage_takeover(&outer, &target);
+        let mut report = crate::app::apply_identifier_migration(&outer, &target, outcome);
+        finalize_deferred(&mut report, Some(&native), &outer, &target);
+        assert_eq!(report.status, "deferred");
+
+        let pending = crate::migration_pending::read(&native).expect("标记必须写得进");
+        assert_eq!(
+            pending.source_dir,
+            crate::migration_identifier::resolve_source_dir(&outer),
+            "标记必须记归一化之后的那一层"
+        );
+        // 归一化的结果就是内层的 `data/`。
+        assert!(
+            pending.source_dir.ends_with("data"),
+            "便携版外层应被归一化到内层的 data/，实际记的是 {}",
+            pending.source_dir.display()
+        );
+        // 且这个位置上**确实有** attachments（路径改写要有东西可改）。
+        assert!(
+            pending.source_dir.join("attachments").is_dir(),
+            "记录下来的源目录下必须真的有 attachments/，否则改写必然落空"
+        );
+    }
+
+    /// 标记**写不进去**时，`Deferred` 必须如实降级成 `failed`。
+    ///
+    /// 【为什么不能含糊】若对界面说"重启后自动完成"、而标记其实没写成功，用户重启后
+    /// 什么都不会发生——那正是 v0.5.2 那个"提示不可执行"的老毛病换了个形式。
+    /// 唯一诚实的表达是"这次没成"，并保留暂存目录（下次还能重试）。
+    #[test]
+    fn deferred_without_a_writable_marker_becomes_failed_not_a_false_promise() {
+        let root = tmp_root("marker-unwritable");
+        let target = seeded_dir(&root);
+        let source = seeded_source(&root.join("old-data"), 5);
+
+        let outcome = crate::migration_identifier::stage_takeover(&source, &target);
+        let mut report = crate::app::apply_identifier_migration(&source, &target, outcome);
+        assert_eq!(report.status, "deferred");
+
+        // 原生数据目录取不到（`None`）＝标记无从写入。
+        finalize_deferred(&mut report, None, &source, &target);
+
+        assert_eq!(
+            report.status, "failed",
+            "标记写不下时必须如实报失败，不能给一个不可执行的承诺"
+        );
+        assert!(!report.pending_until_restart);
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("待接管") || e.contains("暂存")),
+            "错误里必须说清'数据已复制但状态没记下'，实际：{:?}",
+            report.error
+        );
+        // 暂存必须保留（它是重试的唯一输入）
+        assert!(crate::migration_identifier::takeover_staging_dir(&target).is_dir());
+    }
+
     /// 造一个"刚装好的新版"数据目录：走真实的 init_db（迁移 + seed_defaults）。
     fn seeded_dir(root: &std::path::Path) -> std::path::PathBuf {
         let dir = root.join("fresh-install");
@@ -1726,5 +2689,171 @@ mod migration_pristine_tests {
         .unwrap();
         drop(conn);
         assert!(can_remove_source_safely(&dir).is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 开机自启动：写后回读的判据测试
+//
+// 这一组测试守护的是用户反馈里最核心的那句话：「纯应用里面显示设置了不一定生效」。
+// 旧判据是"三个名字任一存在即算已开启"，它有两个方向的错：
+//   - **误报开启**：旧版残留名（`TieZ` / `tie-z`）还在，就报"已开启"，
+//     哪怕新值根本没写成功；
+//   - **误报开启（更隐蔽）**：值存在但指向**改名/搬家前的旧路径**，
+//     系统开机时拉起的是一个不存在的文件，用户看到的开关却是亮的。
+//
+// 【为什么用纯函数 + 构造的注册表快照，而不是真注册表】
+// 判定逻辑与"读注册表"是两件事：把判定抽成 `autostart_state_from` 后，
+// 这些关键判据可以在任何平台上被真正断言，而不是只能靠真机人工点一遍。
+// 读注册表那一段（`read_autostart_entries`）没有可移植的模拟物，
+// 因此在非 Windows 目标上不冒充覆盖——见本模块末尾的说明。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod autostart_readback_tests {
+    use super::*;
+
+    const EXE: &str = r"C:\Program Files\Tiez-Next\tiez-next.exe";
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 值存在且指向当前 exe → 判定为已开启，并把命令原文作为证据回传。
+    #[test]
+    fn enabled_only_when_the_value_points_at_this_exe() {
+        let state = autostart_state_from(
+            &entries(&[("Tiez-Next", &format!("\"{}\" --minimized", EXE))]),
+            EXE,
+        );
+        assert!(state.enabled, "值指向当前 exe 时必须判定为已开启");
+        assert_eq!(
+            state.registered_command.as_deref(),
+            Some(format!("\"{}\" --minimized", EXE).as_str()),
+            "必须把读回的注册表原文作为证据回传（界面要显示的就是它）"
+        );
+        assert!(state.readable);
+        assert!(state.stale_names.is_empty());
+    }
+
+    /// **旧名残留绝不等于已开启**。
+    ///
+    /// 这是旧判据（`Tiez-Next` / `TieZ` / `tie-z` 任一存在即为 true）的直接反例：
+    /// 机器上只剩改名前留下的 `TieZ`，而新版的值**根本没写成功**。
+    /// 用户此时的真实处境是"开机不会自启"，开关不能是亮的。
+    #[test]
+    fn legacy_leftovers_alone_do_not_count_as_enabled() {
+        for legacy in ["TieZ", "tie-z"] {
+            let state = autostart_state_from(
+                &entries(&[(legacy, r"C:\Old\TieZ\tiez.exe")]),
+                EXE,
+            );
+            assert!(
+                !state.enabled,
+                "只剩旧版残留名 `{}` 时必须判为**未开启**（旧判据会在此误报）",
+                legacy
+            );
+            assert!(
+                state.registered_command.is_none(),
+                "未开启时不得回传命令原文，否则界面会把失效的旧命令当成生效证据"
+            );
+            assert_eq!(
+                state.stale_names,
+                vec![legacy.to_string()],
+                "旧名要如实列出（界面据此提示用户可顺手清理）"
+            );
+        }
+    }
+
+    /// 值指向**旧路径**时不算已开启（改名 / 换安装位置 / 便携版搬目录之后）。
+    #[test]
+    fn value_pointing_at_a_stale_path_is_not_enabled() {
+        let state = autostart_state_from(
+            &entries(&[(
+                "Tiez-Next",
+                r#""C:\Old\Tiez-Next\tiez-next.exe" --minimized"#,
+            )]),
+            EXE,
+        );
+        assert!(
+            !state.enabled,
+            "指向已失效旧路径自启动会在开机时拉起一个不存在的文件，不得判为已开启"
+        );
+        assert!(state.registered_command.is_none());
+    }
+
+    /// 路径比较必须是**大小写无关、分隔符无关**的（Windows 语义），
+    /// 否则同一台机器上会因大小写差异被判成"未生效"。
+    #[test]
+    fn path_comparison_is_case_and_separator_insensitive() {
+        for variant in [
+            r#""c:\program files\tiez-next\tiez-next.exe" --minimized"#,
+            r#""C:/Program Files/Tiez-Next/Tiez-Next.exe" --minimized"#,
+        ] {
+            let state = autostart_state_from(&entries(&[("Tiez-Next", variant)]), EXE);
+            assert!(state.enabled, "`{}` 应被认作指向当前 exe", variant);
+        }
+    }
+
+    /// 空 exe（`current_exe()` 取不到）时必须安全地落到"未开启"，
+    /// 而不是因为"路径比较两边都空"而误判为相等 → 报已开启。
+    #[test]
+    fn empty_current_exe_never_reports_enabled() {
+        let state = autostart_state_from(&entries(&[("Tiez-Next", r#""C:\a.exe" --minimized"#)]), "");
+        assert!(!state.enabled, "取不到当前 exe 时不得声称已开启");
+        let empty_value = autostart_state_from(&entries(&[("Tiez-Next", "")]), EXE);
+        assert!(!empty_value.enabled, "空值不得判为已开启");
+    }
+
+    /// 旧名与新名**同时存在**且新名正确时才为已开启；旧名不参与判定，只被列出。
+    #[test]
+    fn stale_names_are_reported_without_affecting_the_verdict() {
+        let state = autostart_state_from(
+            &entries(&[
+                ("TieZ", r"C:\Old\TieZ\tiez.exe"),
+                ("tie-z", r"C:\Old\tie-z\tiez.exe"),
+                ("Tiez-Next", &format!("\"{}\" --minimized", EXE)),
+            ]),
+            EXE,
+        );
+        assert!(state.enabled);
+        assert_eq!(state.stale_names, vec!["TieZ".to_string(), "tie-z".to_string()]);
+    }
+
+    /// 带引号与不带引号的命令串都要能取出路径；参数不参与比较。
+    #[test]
+    fn command_target_matching_handles_quotes_and_arguments() {
+        assert!(command_targets_current_exe(
+            &format!("\"{}\" --minimized", EXE),
+            EXE
+        ));
+        assert!(command_targets_current_exe(EXE, EXE));
+        assert!(!command_targets_current_exe(
+            &format!("\"{}\" --minimized", EXE),
+            r"C:\Other\app.exe"
+        ));
+    }
+
+    /// **反向对照锚点**：若把判据回退成"任一名字存在即为真"，
+    /// `legacy_leftovers_alone_do_not_count_as_enabled` 与
+    /// `value_pointing_at_a_stale_path_is_not_enabled` 必须变红。
+    ///
+    /// 这里用同一份快照把"老判据会给出的答案"显式写出来，作为该反向对照的**书面依据**
+    /// （老判据的实现是 `exists(a) || exists(b) || exists(c)`）。
+    #[test]
+    fn old_loose_criterion_would_have_reported_these_as_enabled() {
+        let snapshot = entries(&[("TieZ", r"C:\Old\Tiez.exe")]);
+        let loose = snapshot.iter().any(|(n, _)| {
+            n == "Tiez-Next" || n == "TieZ" || n == "tie-z"
+        });
+        assert!(loose, "老判据在这份快照上确实会给出 true（这正是它误报的场景）");
+        let strict = autostart_state_from(&snapshot, EXE);
+        assert!(
+            !strict.enabled,
+            "严格判据必须与老判据给出**不同**的答案，否则这条测试就没有区分力"
+        );
     }
 }

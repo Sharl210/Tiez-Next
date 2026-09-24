@@ -227,9 +227,11 @@ const App = () => {
     setShowAppBorder,
     winClipboardDisabled: _winClipboardDisabled,
     setWinClipboardDisabled,
-    registryWinVEnabled: _registryWinVEnabled,
+    // `registryWinVEnabled` / `pasteMethod` 不再在这里解构为局部变量：它们作为
+    // `appState` 的一部分整体传给设置页（见下方 `state: appState`），单独解构却没人读
+    // 只会触发 noUnusedLocals——而用下划线压掉警告，正是这个 state 早先
+    // "存在但无人消费"被掩盖的方式。写入口仍然需要（设置初始化会用到）。
     setRegistryWinVEnabled,
-    pasteMethod: _pasteMethod,
     setPasteMethod,
     theme,
     setTheme,

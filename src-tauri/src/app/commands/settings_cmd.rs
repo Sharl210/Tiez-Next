@@ -226,6 +226,45 @@ pub fn get_settings(
     state.settings_repo.get_all().map_err(AppError::from)
 }
 
+/// 粘贴方案是否真的会在当前权限下生效。
+///
+/// ## 为什么必须有这个命令（而不只是启动时改一次设置）
+///
+/// 「游戏模式」需要管理员权限。旧实现的做法是：启动时发现未提权就**把用户设置改回
+/// 默认方案**——于是用户永远不知道自己的选择被改掉了，只看到"设置保存不住"。
+///
+/// 现在后端只回答事实（配置了什么、是否已提权、在当前权限下是否生效），
+/// 由界面把"未生效"和一个一键提权重启入口摆在用户面前。**本命令是只读的**：
+/// 它不会写 `app.paste_method`，也不会改任何其他设置。
+#[tauri::command]
+pub fn get_paste_method_status(state: State<'_, DbState>) -> AppResult<PasteMethodStatusPayload> {
+    let method = state
+        .settings_repo
+        .get("app.paste_method")
+        .unwrap_or(Some("shift_insert".to_string()))
+        .unwrap_or_else(|| "shift_insert".to_string());
+    let status = crate::app::setup::paste_method_status_from(
+        &method,
+        crate::app::commands::system_cmd::check_is_admin(),
+    );
+    Ok(PasteMethodStatusPayload {
+        method: status.method,
+        is_admin: status.is_admin,
+        effective: status.effective,
+        requires_admin: status.requires_admin,
+    })
+}
+
+/// `get_paste_method_status` 的线上形状（camelCase，与前端 `invoke` 返回类型一致）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteMethodStatusPayload {
+    pub method: String,
+    pub is_admin: bool,
+    pub effective: bool,
+    pub requires_admin: bool,
+}
+
 #[tauri::command]
 pub fn set_file_server_auto_close(
     state: State<'_, crate::app_state::SettingsState>,

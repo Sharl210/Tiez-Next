@@ -5,6 +5,8 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { getHotkeyDisplayTokens } from "../../../../shared/lib/hotkeyDisplay";
 import { isMacPlatform } from "../../../../shared/lib/platform";
 import type { QuickPasteModifier } from "../../../app/types";
+import WinVShortcutSetting from "../WinVShortcutSetting";
+import PasteMethodSetting from "../PasteMethodSetting";
 
 interface LabelWithHintProps {
     label: string;
@@ -77,6 +79,12 @@ interface ClipboardSettingsGroupProps {
     appSettings: Record<string, string>;
     theme: string;
     colorMode: string;
+    /** 注册表 Win+V 接管是否已生效（由后端 `is_registry_win_v_optimized` 回读）。 */
+    registryWinVEnabled: boolean;
+    setRegistryWinVEnabled: (val: boolean) => void;
+    /** 粘贴方案（游戏模式需要提权才能生效）。 */
+    pasteMethod: string;
+    setPasteMethod: (val: string) => void;
 }
 
 const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
@@ -744,7 +752,39 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                         </div>
                     </div>
 
-                    {/* macOS cleanup: Removed Win+V Shortcut switch */}
+                    {/*
+                      Win+V 接管开关。
+                      【为什么它回来了】上游「macos -> windows 对齐」那次改动把这个开关
+                      连同它唯一的写入点一起删掉了，但**后端 6 个命令一直完好可用**——
+                      于是功能成了"有后端、无入口"，键 `app.use_win_v_shortcut` 从此
+                      永不被写，后端那个启动优化分支（setup.rs）**永不可达**。
+                      用户明确要求保留这个功能，故此处按 git 历史恢复，并把两个分叉的
+                      键名统一到 `app.use_win_v_shortcut`。
+                    */}
+                    <WinVShortcutSetting
+                        t={props.t}
+                        enabled={props.registryWinVEnabled}
+                        setEnabled={props.setRegistryWinVEnabled}
+                        hotkey={props.hotkey}
+                        updateHotkey={props.updateHotkey}
+                        saveAppSetting={props.saveAppSetting}
+                        appSettings={props.appSettings}
+                        theme={props.theme}
+                        colorMode={props.colorMode}
+                    />
+
+                    {/*
+                      粘贴方案（含游戏模式）。
+                      【为什么它必须存在】「游戏模式」需要管理员权限。旧实现的做法是：
+                      启动时发现未提权就**把用户的设置静默改回默认方案**——用户永远
+                      不知道自己的选择被改掉了（表现成"设置保存不住"）。现在保留用户的
+                      选择，把"未生效"和"一键提权重启"摆在明面上。
+                    */}
+                    <PasteMethodSetting
+                        t={props.t}
+                        method={props.pasteMethod}
+                        setMethod={props.setPasteMethod}
+                    />
                 </div>
             )}
         </div>

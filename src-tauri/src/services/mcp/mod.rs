@@ -322,9 +322,26 @@ impl TauriEffects {
                 current.display()
             ));
         }
-        let outcome =
-            crate::migration_identifier::migrate_from_source_dir(&source, &current, takeover);
-        let report = crate::app::apply_identifier_migration(&source, &current, outcome);
+        // —— 两阶段迁移第一步：运行期只把源复制到暂存，**目标一个字节都不动** ——
+        //
+        // 【为什么 MCP 入口也必须走两阶段】迁移的动作里包含"给目标里那个
+        // `clipboard.db` 改名让位"。MCP 服务跑在应用进程内，而应用启动时
+        // `init_db` 已经打开过那个库、连接常驻 `DbState`——Windows **不允许**给已
+        // 打开的文件改名（`os error 32`）。这与"谁触发的迁移"无关，因此两个入口
+        // 面对的是同一个平台限制，必须共用同一条实现，否则行为会漂移。
+        //
+        // `true` = 允许接管：上面的安全闸已经确认过目标库从未被使用（读 SQLite 的
+        // 判定只能在命令层做，本模块只依赖 `std`）。
+        //
+        // 不传进度回调：MCP 没有事件通道，调用方拿到的是**最终报告**而不是过程。
+        let outcome = crate::migration_identifier::stage_takeover_with_progress(
+            &source,
+            &current,
+            takeover,
+            &mut |_, _, _, _| {},
+        );
+        let mut report = crate::app::apply_identifier_migration(&source, &current, outcome);
+        finalize_mcp_deferred(&mut report, &self.app, &source, &current);
         Ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({ "status": "unknown" })))
     }
 
@@ -585,6 +602,59 @@ fn target_db_is_pristine(target: &std::path::Path) -> bool {
     drop(conn);
     let _ = std::fs::remove_dir_all(&probe_dir);
     clips == Some(0) && tags == Some(0)
+}
+
+/// 供 MCP 入口使用的"待接管标记"落盘。
+///
+/// 【为什么 MCP 与界面各有一份】两者的宿主耦合点不同：界面命令拿得到 `AppHandle`
+/// 与 `State<AppDataDir>`，MCP 入口只有一个 `AppHandle`。但**契约必须一致**——
+/// 两边都要在拿到 `Deferred` 时写同一个标记、返回同一个 `status = "deferred"`。
+/// 标记文件的路径与格式由 `migration_pending` 单点持有，这里只负责"取原生目录 + 写"。
+///
+/// 写失败时**如实改为失败**：标记是下次启动唯一能知道"有活要干"的凭据，若对调用方
+/// 说"重启后自动完成"而标记没写成功，重启后什么都不会发生。
+fn finalize_mcp_deferred(
+    report: &mut crate::app::IdentifierMigrationReport,
+    app: &AppHandle,
+    source: &std::path::Path,
+    target: &std::path::Path,
+) {
+    if report.status != "deferred" {
+        return;
+    }
+    let Some(native) = app.path().app_data_dir().ok() else {
+        report.status = "failed".to_string();
+        report.pending_until_restart = false;
+        report.error = Some(
+            "取不到应用的原生数据目录，无法记录「待接管」状态；已复制到暂存的数据仍保留，请重试本次迁移。"
+                .to_string(),
+        );
+        return;
+    };
+
+    // 必须记归一化之后的源目录（理由见界面入口同处的说明：便携版用户常停在外层，
+    // 库里记录的却是内层 `data/` 的绝对路径）。
+    let pending = crate::migration_pending::PendingMigration::new(
+        crate::migration_identifier::resolve_source_dir(source),
+        crate::migration_identifier::takeover_staging_dir(target),
+        target.to_path_buf(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    match crate::migration_pending::write(&native, &pending) {
+        Ok(path) => {
+            crate::info!(">>> [MCP] 已写入待接管标记：{:?}", path);
+            report.pending_until_restart = true;
+        }
+        Err(e) => {
+            crate::error!("[MCP] 待接管标记写入失败：{}", e);
+            report.status = "failed".to_string();
+            report.pending_until_restart = false;
+            report.error = Some(format!(
+                "数据已复制到暂存目录，但「待接管」状态未能记下（{}）；请重试本次迁移。源目录未被改动。",
+                e
+            ));
+        }
+    }
 }
 
 /// 表情 dataUrl 落盘：**与界面命令 `save_emoji_favorite_data_url` 同一套判定顺序**

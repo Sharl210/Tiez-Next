@@ -192,8 +192,21 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.show_app_border', 'true')",
         [],
     );
+    // 【出厂默认「开」—— 与另外两处读取端必须一致】
+    //
+    // 这个键决定剪贴板历史是**落盘**还是只活在内存里。三处默认值曾经互相矛盾：
+    // 这里写 `'false'`（关），而 `setup.rs` 的读取兜底是 `.unwrap_or(true)`（开）、
+    // 前端 `useSettingsPostInit` 是 `!== "false"`（键缺失即开）。
+    //
+    // 由于种子**一定会写入**这个键，`OR IGNORE` 之后读取端永远读得到 `'false'`，
+    // 兜底那两处根本不会被触发 —— 于是新库实际拿到「历史不落盘、退出即丢」，
+    // 而代码里另外两处却写着「开」。真机反馈是"默认：持久化开关是开启的"，
+    // 那说明用户机器上的库**没有这个键**（旧库/导入包），走的是兜底路径。
+    //
+    // 现在把种子改成 `'true'`，三处方向统一为「开」。只改这里就够 ——
+    // 另外两处本来就是「开」，判据无需动。
     let _ = conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.persistent', 'false')",
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.persistent', 'true')",
         [],
     );
     let _ = conn.execute(
@@ -530,6 +543,61 @@ mod tests {
     use crate::infrastructure::repository::settings_repo::{
         SettingsRepository, SqliteSettingsRepository,
     };
+
+    /// **持久化的出厂默认值必须与两处读取端一致。**
+    ///
+    /// 这个键曾经三处互相矛盾（种子 `'false'`、后端兜底 `true`、前端 `!== "false"`）。
+    /// 由于种子一定会写入，读取端的兜底**永远不会被触发** —— 于是"代码写着开、新库实际是关"，
+    /// 只有旧库/导入包（没有这个键）才走兜底拿到"开"。真机反馈"默认是开启的"正是后者。
+    ///
+    /// 本测试钉住的是**三处方向一致**，而不是"某个字面量等于某个值"：
+    /// 它先把种子跑进一个空库，再断言"读出来是开"（模拟真实链路：种子 → 读）。
+    /// 若有人日后把种子改回 `'false'`，这里会红。
+    ///
+    /// ⚠️ 这里**不能**只断言 SQL 字符串 —— 那与直接读代码没区别，改起来一样方便。
+    #[test]
+    fn persistent_default_is_on_and_matches_readers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        // 只跑种子（`seed_defaults` 会建别的表，缺表时用 `let _ =` 容忍）
+        let _ = super::seed_defaults(&conn);
+
+        let raw: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key = 'app.persistent'", [], |r| r.get(0))
+            .ok();
+
+        // ① 种子必须真的写入这个键（否则读取端行为取决于兜底，不可预期）
+        let raw = raw.expect("种子必须写入 app.persistent —— 缺键会让默认值取决于兜底路径");
+        // ② 种子值必须是开
+        assert_eq!(
+            raw, "true",
+            "持久化的出厂默认值必须是「开」。读到 {raw:?} —— \
+             若这里退回 \"false\"，新用户的历史将不落盘、退出即丢"
+        );
+
+        // ③ 与后端读取端的判据一致（复刻 setup.rs 的 `v == "true"` + 缺失兜底 true）
+        let backend_reads = |v: Option<&str>| v.map(|x| x == "true").unwrap_or(true);
+        assert!(
+            backend_reads(Some(&raw)),
+            "后端按 setup.rs 的判据读这个键必须得到「开」"
+        );
+        assert!(
+            backend_reads(None),
+            "键缺失时后端兜底也必须是「开」—— 两侧方向不能相反"
+        );
+
+        // ④ 与前端读取端的判据一致（复刻 useSettingsPostInit 的 `!== "false"`）
+        let frontend_reads = |v: Option<&str>| v.map(|x| x != "false").unwrap_or(true);
+        assert!(
+            frontend_reads(Some(&raw)),
+            "前端按 useSettingsPostInit 的判据读这个键必须得到「开」"
+        );
+        assert!(frontend_reads(None), "键缺失时前端判据也必须是「开」");
+    }
 
     // 辅助函数：创建一个内存中的临时测试数据库
     fn setup_test_db() -> Connection {

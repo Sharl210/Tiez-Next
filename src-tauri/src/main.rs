@@ -10,6 +10,7 @@ pub mod infrastructure;
 pub mod logger;
 pub mod migration;
 pub mod migration_identifier;
+pub mod migration_pending;
 pub mod services;
 
 use crate::app::setup;
@@ -131,6 +132,9 @@ fn main() {
             app::commands::list_legacy_data_dirs,
             app::commands::remove_legacy_data_dir,
             app::commands::migrate_from_data_dir,
+            // 迁移进度的当前快照：前端先 `listen` 再 `invoke` 这个命令拉初值，
+            // 否则"事件先于监听"的那一段会永久丢失，进度条卡在第一帧。
+            app::commands::get_migration_progress,
             app::commands::backup_preflight,
             app::commands::suggest_backup_path,
             app::commands::reveal_path,
@@ -153,6 +157,8 @@ fn main() {
             app::commands::set_data_path,
             app::commands::toggle_autostart,
             app::commands::is_autostart_enabled,
+            // 「粘贴方案是否真的生效」的只读查询：未提权时如实报告，不再静默改用户设置。
+            app::commands::get_paste_method_status,
             app::commands::set_windows_clipboard_history,
             app::commands::get_windows_clipboard_history,
             app::commands::set_win_clipboard_disabled,

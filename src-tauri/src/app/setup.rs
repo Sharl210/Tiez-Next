@@ -72,12 +72,49 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GLOBAL_APP_HANDLE for Win32 hooks
     let _ = GLOBAL_APP_HANDLE.set(app_handle.clone());
 
+    // 0. 原生数据目录（**必须在 `resolve_data_dir` 之前取**）
+    //
+    // 「待接管」标记写在这里，而不是 `AppDataDir`：`AppDataDir` 是**当前生效**的数据
+    // 目录，而它可能正是"待接管"的那一个（用户改过数据目录或用便携版时）。把标记放进
+    // 待接管的目录里，会与接管动作本身互相踩——接管的第一步就是动那个目录里的库。
+    //
+    // 原生数据目录由 identifier 推导、位置稳定，且永远不是被接管的那个。
+    // 取不到时退化为 `None`：此时接管功能整体不可用（只记日志），**绝不用猜测的路径兜底**。
+    let native_data_dir = app.path().app_data_dir().ok();
+
+    // 本次启动是否真的完成了一次"待接管"提升（供 3.1 决定要不要改写库内路径）。
+    let mut promoted: Option<std::path::PathBuf> = None;
+
     // 1. Data Directory & Migration
     let app_dir = resolve_data_dir(app)?;
 
     // 2. Logger Initialization
     crate::logger::init(app_dir.join("tiez.log"));
     info!(">>> [STARTUP] Tiez-Next starting up...");
+
+    // 2.1 **待接管迁移的启动期执行点**（顺序敏感，勿移动）
+    //
+    // 这是整条迁移链的落点，位置由三个约束共同决定，缺一不可：
+    //
+    // 1. **必须在 `init_db`（第 3 步）之前** —— 接管的动作是给目标目录里的
+    //    `clipboard.db`（及 `-wal`/`-shm`）改名让位。Windows 不允许改名已打开的
+    //    文件，一旦 `init_db` 跑过，这一步就必然报 `os error 32`。在它之前执行时
+    //    进程内**尚无任何 `Connection`**，交换必然成功。
+    // 2. **必须在 `resolve_data_dir` 之后** —— 需要知道目标数据目录是谁。它内部调用的
+    //    `perform_migration_v028` 带 `remove_dir_all`（`migration.rs:93`），
+    //    排在那之前会让 V0.2.8 迁移删掉刚放好的文件。
+    // 3. **必须在 logger 初始化之后** —— 失败只记日志、不阻断启动，需要有地方记。
+    //
+    // 失败**绝不阻断启动**：迁移是附加功能，最坏情况是"这次没迁成"，源目录与暂存
+    // 目录都还在，标记也还在（下次启动再试）。因此这里只记日志，不 `?`。
+    if let Some(native) = native_data_dir.as_deref() {
+        promoted = run_pending_takeover(native);
+    } else {
+        error!(
+            "[MIGRATION] 取不到原生应用数据目录，本次跳过「待接管」检查；\
+             已复制就绪的迁移数据会保留到下次启动重试。"
+        );
+    }
 
     // 3. Database Initialization
     let db_path = app_dir.join("clipboard.db");
@@ -89,6 +126,18 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let conn_arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
     let settings_repo = SqliteSettingsRepository::new(conn_arc.clone());
+
+    // 3.1 接管成功后补一次数据库内路径改写
+    //
+    // 【为什么必须在这里、不能在上面的 2.1 里做】`rewrite_data_paths_in_db` 自己
+    // 打开数据库写字符串，必须等 `init_db` 把表建好之后。放在这里正好符合顺序，
+    // 且此时连接刚刚建立、尚无任何读取。
+    //
+    // 【为什么必须做】接管把旧库整体搬进来了，但库里的附件/表情/自定义背景记录的仍是
+    // **旧数据目录**下的绝对路径。不改写的话，用户看到的是"记录都在、图片全打不开"。
+    if let Some(source) = promoted.as_deref() {
+        rewrite_paths_after_takeover(source, &app_dir, &db_path);
+    }
 
     // 4. Initial Settings & Reset Safety
     apply_startup_resets(&settings_repo);
@@ -143,6 +192,92 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 /// （`app_data_dir()`）。因此读取也必须只认这一处，不另找第二个指针位置——两个指针
 /// 同时存在时无法裁决谁更新，只会让"数据到底在哪"变成猜谜。
 const DATA_DIR_REDIRECT_FILE: &str = "datapath.txt";
+
+// ---------------------------------------------------------------------------
+// 两阶段迁移的启动期一半
+// ---------------------------------------------------------------------------
+
+/// **启动期接管**：把上次运行留下的"待接管"暂存目录提升为正式数据目录。
+///
+/// 返回 `Some(源目录)` 表示本次启动真的完成了一次接管（调用方据此决定要不要在
+/// `init_db` 之后改写库内路径）；`None` 表示没有待接管任务，或接管失败。
+///
+/// ## 为什么必须在 `init_db` 之前（这一条是整个方案成立的前提）
+///
+/// 接管的动作是给目标目录里的 `clipboard.db`（及 `-wal`/`-shm`）**改名让位**。
+/// Windows 不允许给已打开的文件改名（`ERROR_SHARING_VIOLATION`，os error 32）。
+/// 应用一启动就会 `init_db` 打开那个库，连接随后常驻 `DbState`、被 3 个 repo 与
+/// `McpStore` 多处持有，**运行期不可能释放**——所以这件事必须在开库之前做完。
+///
+/// ## 为什么不能在运行期"热替换"连接
+///
+/// Tauri 的 `app.manage` 对同一类型已存在的状态会**丢弃新值并 `assert!` panic**
+/// （`tauri-2.10.2/src/state.rs`），而 `Arc<Mutex<Connection>>` 同时被 `DbState`、
+/// 三个 repo 与 `McpStore` 持有，引用计数不可能归零。⇒ **重启是唯一正解**。
+///
+/// ## 失败绝不阻断启动
+///
+/// 迁移是附加功能。任何失败都只记日志并**保留标记**（下次启动再试）；暂存目录与源
+/// 目录都不会被删。因此本函数没有返回值意义上的错误，调用方无需 `?`。
+fn run_pending_takeover(
+    native_data_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let outcome = crate::migration_pending::run_startup_takeover(
+        native_data_dir,
+        &mut |staging: &std::path::Path, target: &std::path::Path| {
+            crate::migration_identifier::promote_staged_takeover_default(staging, target)
+                .map(|_| ())
+        },
+    );
+
+    match outcome {
+        crate::migration_pending::TakeoverOutcome::NotPending => None,
+        crate::migration_pending::TakeoverOutcome::Promoted {
+            source_dir,
+            target_dir,
+        } => {
+            info!(
+                ">>> [MIGRATION] 已接管待迁移数据：暂存目录已提升为 {:?}（源 {:?} 保持只读、未被改动）。",
+                target_dir, source_dir
+            );
+            Some(source_dir)
+        }
+        crate::migration_pending::TakeoverOutcome::Failed { reason } => {
+            // 【必须只记日志、不阻断启动】迁移失败最多是"这次没迁成"，数据都还在。
+            // 标记被保留，下次启动会自动重试。
+            error!(
+                "[MIGRATION] 待接管的数据本次未能接管（不影响正常使用，下次启动会自动重试）：{}",
+                reason
+            );
+            None
+        }
+    }
+}
+
+/// 接管成功后改写数据库里的绝对路径（附件、表情收藏、自定义背景）。
+///
+/// 【为什么必须做】接管把旧库整体搬进来了，但库里记录的仍是**旧数据目录**下的绝对
+/// 路径。不改写的话，用户看到的是"记录都在、图片全打不开"。
+///
+/// 【为什么必须在这里】`rewrite_data_paths_in_db` 自己开连接写字符串，必须等
+/// `init_db` 把表建好之后才能跑。而接管本身必须在 `init_db` 之前，所以这两件事
+/// 天然分处启动流程的两端：接管在前，改写路径在后。
+///
+/// 改写失败不影响数据本身（记录都已就位），只记日志。
+fn rewrite_paths_after_takeover(
+    source: &std::path::Path,
+    app_dir: &std::path::Path,
+    db_path: &std::path::Path,
+) {
+    match crate::app::commands::system_cmd::rewrite_data_paths_in_db(db_path, source, app_dir) {
+        Ok(()) => info!(">>> [MIGRATION] 接管后已在数据库内改写绝对路径。"),
+        Err(e) => error!(
+            "[MIGRATION] 接管后库内路径改写失败（记录均已就位，仅引用未更新）：{}",
+            e
+        ),
+    }
+}
+
 
 /// 判定"这个目录里确实有本应用的数据"的标志文件。
 ///
@@ -441,7 +576,21 @@ fn resolve_data_dir_impl(
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentifierMigrationReport {
-    /// `migrated` | `skipped` | `failed`
+    /// 迁移的最终归属状态（**v0.5.3 冻结契约 §1**）。
+    ///
+    /// - `"done"` —— 已完成，数据在当前进程里可用；
+    /// - `"deferred"` —— 数据已复制就绪，**待下次启动接管**（v0.5.3 新增的常态路径）；
+    /// - `"skipped"` —— 无需迁移（既有语义）；
+    /// - `"failed"` —— 失败（源与目标均未被破坏）。
+    ///
+    /// 另有历史值 `"migrated"`：只有内部候选扫描入口（`migrate_legacy_identifier_data`，
+    /// 当前无生产调用方）会回它，表示"当场交付成功"。两个对用户暴露的入口
+    /// （界面命令与 MCP）只回契约里的四个值。
+    ///
+    /// 【为什么两阶段迁移是 `deferred` 而不是 `failed`】用户点迁移时应用必定在运行，
+    /// 目标库已被 `init_db` 打开着，Windows 不允许给它改名——这在运行期是
+    /// **不可避免**的，不是错误。把它当失败呈现会让用户以为功能坏了，而实际上一切
+    /// 正常、只差一次重启。`deferred` 是同一件事的诚实表达，界面**不得**用错误样式呈现。
     pub status: String,
     /// 实际被读取的源目录（用户手选或白名单候选）。
     pub source: String,
@@ -485,6 +634,16 @@ pub struct IdentifierMigrationReport {
     ///
     /// 只在本次接管了空的新版数据目录时出现；界面据此说明"新版原先的空数据已留档"。
     pub superseded_db: Option<String>,
+    /// 已复制就绪、等待下次启动接管的暂存目录（仅 `deferred` 时非空）。
+    ///
+    /// 【为什么必须回报它】它是"重启后接管"的唯一载体。用户或支持人员需要它来核对
+    /// "数据到底复制到哪了"，而在排障时最忌讳的是"后端知道但没说"。
+    pub staging_dir: Option<String>,
+    /// 是否处于"已复制就绪、待下次启动接管"的状态。
+    ///
+    /// 与 `status == "deferred"` 是同一件事的两种表达，两个字段由后端一并给出：
+    /// 界面既可以按 `status` 分支，也可以直接看这个布尔量。
+    pub pending_until_restart: bool,
 }
 
 /// 标识符变更迁移的**共享核心**：白名单候选与用户手选路径都走这里。
@@ -503,7 +662,6 @@ pub fn apply_identifier_migration(
     use crate::migration_identifier::MigrationOutcome;
 
     let mut report = IdentifierMigrationReport {
-        status: "skipped".to_string(),
         source: source.to_string_lossy().to_string(),
         target: new_dir.to_string_lossy().to_string(),
         files: 0,
@@ -518,6 +676,11 @@ pub fn apply_identifier_migration(
         source_untouched: true,
         restart_required: false,
         superseded_db: None,
+        staging_dir: None,
+        // 冻结契约 §1 的取值域是 `done|deferred|skipped|failed`。
+        // 先给 `skipped` 兜底，随后按 outcome 覆盖。
+        status: "skipped".to_string(),
+        pending_until_restart: false,
     };
 
     match &outcome {
@@ -531,6 +694,11 @@ pub fn apply_identifier_migration(
             yielded_db,
             ..
         } => {
+            // 契约 §1：成功且数据**在当前进程可用**时是 `done`。
+            //
+            // 这里同时保留 `"migrated"` 这个值：`migrate_legacy_identifier_data` 这条
+            // 旧入口（当前无调用方，仅测试使用）走的就是它。改成 `done` 会让它无从区分
+            // "当场交付成功"与"待接管"。真正对外暴露的两个入口都只回契约里的四个值。
             report.status = "migrated".to_string();
             report.source = source.to_string_lossy().to_string();
             report.files = *files;
@@ -571,6 +739,32 @@ pub fn apply_identifier_migration(
             report.skip_reason = Some(reason.code().to_string());
             info!(">>> [MIGRATION] 无需迁移标识符数据：{:?}", reason);
         }
+        MigrationOutcome::Deferred {
+            source,
+            staging,
+            files,
+            bytes,
+            ..
+        } => {
+            // 【这不是失败】用户点迁移时应用必定在运行 ⇒ 目标库被 `init_db` 持有 ⇒
+            // Windows 不允许给它改名 ⇒ 运行期不可能当场交付。数据已完整复制到暂存，
+            // 只差"下次启动在开库之前做交换"这一步。
+            report.status = "deferred".to_string();
+            report.source = source.to_string_lossy().to_string();
+            report.files = *files;
+            report.bytes = *bytes;
+            report.delivered_files = *files;
+            report.delivered_bytes = *bytes;
+            // 暂存目录要如实回报：它是"下次启动接管"的载体，用户与支持人员都可能需要它。
+            report.staging_dir = Some(staging.to_string_lossy().to_string());
+            info!(
+                ">>> [MIGRATION] 两阶段迁移第一步完成：{:?} 已复制 {} 项（{} 字节）到暂存 {:?}；等待下次启动接管。",
+                source,
+                files,
+                bytes,
+                staging
+            );
+        }
         MigrationOutcome::Failed { source, error } => {
             report.status = "failed".to_string();
             report.source = source.to_string_lossy().to_string();
@@ -587,14 +781,73 @@ pub fn apply_identifier_migration(
     report
 }
 
+/// 启动期的安全复位。
+///
+/// ## 这里**不再**修改用户的粘贴方案设置（曾经会，那是个静默失败）
+///
+/// 旧实现：读到 `app.paste_method == "game_mode"` 且当前进程未提权时，**直接把设置改回
+/// `shift_insert`**，只留一行 `info!` 日志。
+///
+/// 为什么那是错的（而不是"保守"）：
+/// 1. **它是静默的**——用户没有任何途径知道自己的选择被改掉了。设置页上看到的
+///    "游戏模式"在下次启动后变成了别的东西，且没有任何解释。
+/// 2. **它每次启动都执行**——用户改回去、重启、又没了，表现成"设置保存不住"。
+/// 3. **它把用户的选择当成可由应用单方面推翻的东西**。而提权与否是用户的环境选择，
+///    不是用户表达"不要游戏模式"。
+///
+/// ## 现在的行为
+///
+/// **保留用户的选择**，把"当前未提权、游戏模式可能不生效"这个事实交给界面告知，
+/// 并提供一键提权重启入口（`restart_as_admin`）。判定按需计算、不落库，
+/// 因此用户在设置页里改回标准方案后，告知会自然消失，不需要额外的清理逻辑。
+///
+/// 【为什么不留一个"自动回退"的兜底】兜底会让"用户以为开着"与"实际生效"继续分叉，
+/// 只是把分叉藏得更深：粘贴行为看着正常了，但设置页显示的仍是游戏模式。
+/// 告知 + 提权入口才是把分叉摆到明面上。
 fn apply_startup_resets(repo: &impl SettingsRepository) {
     let paste_method = repo
         .get("app.paste_method")
         .unwrap_or(Some("shift_insert".to_string()))
         .unwrap_or("shift_insert".to_string());
     if paste_method == "game_mode" && !crate::app::commands::system_cmd::check_is_admin() {
-        info!(">>> [STARTUP] Game Mode active without Admin privileges. Resetting to default.");
-        let _ = repo.set("app.paste_method", "shift_insert");
+        // 只记录，不改设置。界面会用同一个判据把这件事告诉用户。
+        info!(
+            ">>> [STARTUP] 检测到粘贴方案为 game_mode 且当前未提权：\
+             保持用户设置不变（不再静默改回），改由界面告知并提供一键提权重启入口。"
+        );
+    }
+}
+
+/// 粘贴方案的实际生效状态（供界面如实告知，不改任何设置）。
+///
+/// 【为什么要有这个命令】"用户选了游戏模式"与"游戏模式真的能用"是两件事，差别就在
+/// 当前进程有没有提权。这个差别以前被后端悄悄抹平（改回默认方案），用户因此永远
+/// 看不到真相。现在后端只回答事实，界面负责告知。
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteMethodStatus {
+    /// 用户当前配置的粘贴方案（原样回传，不做任何替换）。
+    pub method: String,
+    /// 当前进程是否已提权。
+    pub is_admin: bool,
+    /// 该配置在当前权限下是否按用户预期生效。
+    pub effective: bool,
+    /// 该方案是否**需要**提权才完整生效（目前只有 `game_mode`）。
+    pub requires_admin: bool,
+}
+
+/// 计算粘贴方案状态（纯函数，便于在任意平台上断言"未提权时不改设置只报告"）。
+///
+/// 界面用同一套判据（`app.paste_method` + `check_is_admin` 命令）决定要不要显示告知，
+/// 因此这里不新增命令、也不落任何状态：状态是**按需推导**的，用户改回标准方案后
+/// 告知会自然消失。
+pub fn paste_method_status_from(method: &str, is_admin: bool) -> PasteMethodStatus {
+    let requires_admin = method == "game_mode";
+    PasteMethodStatus {
+        method: method.to_string(),
+        is_admin,
+        effective: !requires_admin || is_admin,
+        requires_admin,
     }
 }
 
@@ -1070,16 +1323,83 @@ fn start_services(app: &App, s: &StartupSettings, app_handle: AppHandle) {
     // Register active hotkeys based on current settings.
     let _ = crate::app::commands::register_hotkey(app_handle.clone(), s.main_hotkey.clone());
 
+    // Win+V 键名统一：先把历史上分叉的旧键搬到唯一真键上，再按真键执行优化。
+    migrate_win_v_setting_key_once(&db_state.settings_repo);
+
     // Win+V Optimization
+    //
+    // 【为什么只认 `app.use_win_v_shortcut`】历史上这个功能有两个键名同时存在
+    // （`app.use_win_v_shortcut` 与 `app.registry_win_v_enabled`，分别由后端与前端的
+    // 不同年代代码读写）。两处各写各的，结果**永远是同一个功能有两份可能矛盾的状态**：
+    // 界面上开关亮着，后端却按另一个键判定为关闭，于是优化分支永不执行。
+    // 统一到一个键之后，"界面显示的"与"后端触发的"才可能是同一件事。
     if db_state
         .settings_repo
-        .get("app.use_win_v_shortcut")
+        .get(WIN_V_SETTING_KEY)
         .unwrap_or(Some("false".to_string()))
         == Some("true".to_string())
     {
         if !crate::app::commands::system_cmd::get_registry_win_v_optimized_status() {
             let _ = crate::app::commands::trigger_registry_win_v_optimization(true);
+            crate::info!(
+                ">>> [WINV] 已按设置启用 Win+V 接管（若 Win+V 仍被系统占用，需要重启资源管理器才会生效）。"
+            );
         }
+    }
+}
+
+/// Win+V 设置的**唯一真键**。
+///
+/// 前端开关、后端启动优化、云同步快照一律只认它。改这里等于改契约，需同步前端
+/// `useSettingsPostInit.ts` 的读取点。
+pub const WIN_V_SETTING_KEY: &str = "app.use_win_v_shortcut";
+
+/// 历史上被另一处代码使用的分叉键名（只作为一次性迁移的**输入**，不再被读写）。
+pub const WIN_V_LEGACY_SETTING_KEY: &str = "app.registry_win_v_enabled";
+
+/// 一次性迁移：把旧键的值搬到新键（**只在新键缺失时**）。
+///
+/// ## 为什么必须做，且必须是"缺失才搬"
+///
+/// 已经用过这个版本的用户库里可能只存在旧键。不搬的话，用户先前打开的开关在升级后
+/// 会**静默变成关闭**——而用户看不出任何原因（设置页上那个开关本来就是刚恢复的）。
+///
+/// 但反向也要防：若用户已经在新键上表达过意愿（新键存在），旧键的值就是陈旧残留，
+/// **绝不能覆盖**新键——否则升级会把用户最近的选择回退成很久以前的旧值。
+///
+/// 迁移完成后旧键保留（不删）：删改用户数据的方向上是不可逆的，而留一个不再被读取的
+/// 键没有任何行为代价。真需要清理时，它会在下一次全量重写设置时自然消失。
+fn migrate_win_v_setting_key_once(repo: &impl SettingsRepository) {
+    let existing_new = repo.get(WIN_V_SETTING_KEY).unwrap_or(None);
+    if existing_new.is_some() {
+        return; // 新键已在，用户的最近意愿优先，旧键不动也不覆盖
+    }
+    let legacy = match repo.get(WIN_V_LEGACY_SETTING_KEY) {
+        Ok(Some(v)) => v,
+        Ok(None) => return, // 两个键都没有：全新用户，无事可做
+        Err(e) => {
+            crate::error!("[WINV] 读取旧键失败，跳过迁移（不改任何设置）：{}", e);
+            return;
+        }
+    };
+    match repo.set(WIN_V_SETTING_KEY, &legacy) {
+        Ok(()) => {
+            // 写后回读：迁移也必须能被证明真的落地了。
+            match repo.get(WIN_V_SETTING_KEY) {
+                Ok(Some(read_back)) if read_back == legacy => crate::info!(
+                    ">>> [WINV] 已把旧键 {}={} 迁移到唯一真键 {}（回读一致）。",
+                    WIN_V_LEGACY_SETTING_KEY,
+                    legacy,
+                    WIN_V_SETTING_KEY
+                ),
+                other => crate::error!(
+                    "[WINV] 旧键迁移后回读不一致：写入={:?} 回读={:?}（保留原状，不重试）",
+                    legacy,
+                    other
+                ),
+            }
+        }
+        Err(e) => crate::error!("[WINV] 旧键迁移写入失败：{}", e),
     }
 }
 
@@ -1895,6 +2215,61 @@ mod setup_tests {
         ));
     }
 
+    /// **启动顺序守卫（v0.5.3 新增）**：待接管迁移必须在 `init_db` **之前**执行。
+    ///
+    /// # 为什么必须用源码顺序断言，而不是行为测试
+    ///
+    /// 这条顺序是**整个两阶段方案成立的前提**：接管的动作是给目标目录里的
+    /// `clipboard.db` 改名让位，而 Windows **不允许**给已打开的文件改名
+    /// （`ERROR_SHARING_VIOLATION`）。`init_db` 一跑，那个库就被打开、连接常驻
+    /// `DbState`（还被 3 个 repo 与 `McpStore` 共享），**运行期不可能释放**。
+    ///
+    /// 而这件事没有可观察的运行时行为可供断言：在 Linux 上给已打开的文件改名照样
+    /// 成功（所以即便顺序错了、本机的行为测试也会全绿），在 Windows 上则表现为
+    /// "用户重启后数据没进来"——一个**只出现在真机、只在错误顺序下发生**的静默失败。
+    /// 换句话说，行为测试在这个平台上**原理上抓不到它**。
+    ///
+    /// 因此这里直接对源码的**文本顺序**下断言：这是"锁住一个不可在本机观测的顺序
+    /// 约束"唯一可靠的办法。断言很粗（比较两个字符串的位置），但它守的是一条
+    /// 一旦被破坏就会让功能在真机上彻底失效的约束——粗略但有效，远好过没有。
+    ///
+    /// 【反向对照实测】把 `init` 里那段 `run_pending_takeover(native)` 移动到
+    /// `let conn = database::init_db(...)` **之后**，本条失败。
+    #[test]
+    fn startup_takeover_runs_before_the_database_is_opened() {
+        // 只取 `init` 函数体：它内部的顺序才是被守的对象。
+        let source = include_str!("setup.rs");
+        let init_start = source.find("pub fn init(app: &mut App)").expect("init 必须存在");
+        let body = &source[init_start..];
+
+        let takeover_at = body
+            .find("promoted = run_pending_takeover(")
+            .expect("init 必须调用 run_pending_takeover");
+        let init_db_at = body
+            .find("database::init_db(&db_path_str)")
+            .expect("init 必须调用 database::init_db");
+
+        assert!(
+            takeover_at < init_db_at,
+            "待接管迁移必须在 `database::init_db` **之前**执行：\
+             一旦库被打开，Windows 就不允许给它改名（os error 32），\
+             而连接会常驻 DbState、运行期不可能释放——顺序错了功能在真机上必然失效。\
+             （takeover 偏移 {takeover_at}，init_db 偏移 {init_db_at}）"
+        );
+
+        // `resolve_data_dir` 必须在两者之前：它内部会调用
+        // `perform_migration_v028`，后者含 `remove_dir_all`（`migration.rs:93`），
+        // 排在接管之后会把刚放好的文件删掉。
+        let resolve_at = body
+            .find("let app_dir = resolve_data_dir(app)?")
+            .expect("init 必须调用 resolve_data_dir");
+        assert!(
+            resolve_at < takeover_at,
+            "数据目录必须在接管之前解析（perform_migration_v028 带 remove_dir_all，\
+             排错顺序会让它删掉刚接管进来的数据）"
+        );
+    }
+
     #[test]
     fn dock_threshold_stays_below_auto_placement_margin() {
         // 5px 停靠阈值与 40px 自动摆位留白必须不相等，否则「程序摆到边缘」= 「用户拖到边缘」
@@ -2302,5 +2677,177 @@ mod data_dir_separation_tests {
             // Linux 上大小写敏感，两种写法确实是不同的目录，不算包含。
             assert!(!inside);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 启动期行为：不改用户设置、Win+V 键名统一
+//
+// 【三处必须守住的契约】
+// 1. 未提权时**不得**修改 `app.paste_method`（这就是"静默改用户设置"本身）；
+// 2. Win+V 只认 `app.use_win_v_shortcut` 一个键；
+// 3. 旧键的值要能被搬到新键上，但**新键已存在时绝不覆盖**（用户的最近意愿优先）。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod startup_safety_tests {
+    use super::*;
+    use crate::infrastructure::repository::settings_repo::SettingsRepository;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// 内存版 settings 仓库：让这三条契约能在不碰真库的情况下被断言。
+    ///
+    /// 用真实的 `SqliteSettingsRepository` 也可以，但那会把"启动期不写设置"这条断言
+    /// 与 SQLite 的行为耦合在一起；这里要验证的是**调用方有没有发出写入**，
+    /// 因此一个能记录写入的内存实现更直接，也更能暴露"偷偷改了一笔"。
+    #[derive(Default)]
+    struct MemRepo {
+        rows: Arc<Mutex<HashMap<String, String>>>,
+        writes: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl MemRepo {
+        fn with(rows: &[(&str, &str)]) -> Self {
+            let me = Self::default();
+            for (k, v) in rows {
+                me.rows.lock().unwrap().insert(k.to_string(), v.to_string());
+            }
+            me
+        }
+        fn writes(&self) -> Vec<(String, String)> {
+            self.writes.lock().unwrap().clone()
+        }
+        fn value(&self, key: &str) -> Option<String> {
+            self.rows.lock().unwrap().get(key).cloned()
+        }
+    }
+
+    impl SettingsRepository for MemRepo {
+        fn set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.to_string()));
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        fn get(&self, key: &str) -> rusqlite::Result<Option<String>> {
+            Ok(self.rows.lock().unwrap().get(key).cloned())
+        }
+        fn get_all(&self) -> rusqlite::Result<HashMap<String, String>> {
+            Ok(self.rows.lock().unwrap().clone())
+        }
+        fn clear(&self) -> rusqlite::Result<()> {
+            self.rows.lock().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    /// **游戏模式未提权时不得静默改设置**（本任务的核心反向对照目标）。
+    ///
+    /// 【为什么这条测试在非 Windows 上依然有意义】它断言的不是"是否提权"，
+    /// 而是"启动路径有没有发出对 `app.paste_method` 的写入"。在 Linux 目标上
+    /// `check_is_admin()` 走非 Windows 分支（返回 false），恰好等于"未提权的真机"，
+    /// 因此这条断言在交叉编译目标上仍然真实覆盖到"未提权"这一侧。
+    #[test]
+    fn startup_never_silently_rewrites_the_paste_method() {
+        let repo = MemRepo::with(&[("app.paste_method", "game_mode")]);
+        apply_startup_resets(&repo);
+
+        let writes = repo.writes();
+        assert!(
+            writes.is_empty(),
+            "启动期**不得**写任何设置（旧实现会把 game_mode 改成 shift_insert）：{:?}",
+            writes
+        );
+        assert_eq!(
+            repo.value("app.paste_method").as_deref(),
+            Some("game_mode"),
+            "用户的选择必须原样保留：未提权不构成「应用替用户改设置」的理由"
+        );
+    }
+
+    /// 已提权时同样不改设置（提权只影响"是否生效"的判定，不影响设置本身）。
+    #[test]
+    fn startup_leaves_other_methods_untouched_too() {
+        for method in ["shift_insert", "ctrl_v", "game_mode"] {
+            let repo = MemRepo::with(&[("app.paste_method", method)]);
+            apply_startup_resets(&repo);
+            assert!(
+                repo.writes().is_empty(),
+                "settings 写入必须为空（method={}）",
+                method
+            );
+        }
+    }
+
+    /// 粘贴方案状态：只有 `game_mode` 是"需要提权"的方案。
+    #[test]
+    fn paste_method_status_marks_only_game_mode_as_admin_dependent() {
+        let game = paste_method_status_from("game_mode", false);
+        assert!(game.requires_admin);
+        assert!(!game.effective, "未提权时游戏模式不算生效");
+        assert_eq!(game.method, "game_mode", "配置原样回传，不做替换");
+
+        let game_admin = paste_method_status_from("game_mode", true);
+        assert!(game_admin.effective, "提权后游戏模式生效");
+        assert!(game_admin.is_admin);
+
+        for plain in ["shift_insert", "ctrl_v"] {
+            let s = paste_method_status_from(plain, false);
+            assert!(!s.requires_admin, "{} 不需要提权", plain);
+            assert!(s.effective, "{} 在未提权下也应生效", plain);
+        }
+    }
+
+    /// 唯一真键的常量值：前端 `useSettingsPostInit.ts` 读的是同一个字符串。
+    /// 值一旦被改，前后端会立刻分叉成"界面显示的"与"后端触发的"两回事。
+    #[test]
+    fn win_v_key_constants_are_the_agreed_contract() {
+        assert_eq!(WIN_V_SETTING_KEY, "app.use_win_v_shortcut");
+        assert_eq!(WIN_V_LEGACY_SETTING_KEY, "app.registry_win_v_enabled");
+    }
+
+    /// 旧键迁移：新键缺失时把旧值搬过来，且写完要能回读一致。
+    #[test]
+    fn legacy_win_v_key_is_migrated_when_the_new_key_is_absent() {
+        let repo = MemRepo::with(&[(WIN_V_LEGACY_SETTING_KEY, "true")]);
+        migrate_win_v_setting_key_once(&repo);
+        assert_eq!(
+            repo.value(WIN_V_SETTING_KEY).as_deref(),
+            Some("true"),
+            "老用户库里的旧键值必须被搬到新键，否则升级后开关会被静默关掉"
+        );
+    }
+
+    /// 新键已存在 → **绝不覆盖**（用户的最近意愿优先于陈旧残留）。
+    ///
+    /// 这条如果反了，升级会把用户最近关掉的开关用很久以前的 `true` 重新打开。
+    #[test]
+    fn existing_new_key_wins_over_the_legacy_key() {
+        let repo = MemRepo::with(&[
+            (WIN_V_SETTING_KEY, "false"),
+            (WIN_V_LEGACY_SETTING_KEY, "true"),
+        ]);
+        migrate_win_v_setting_key_once(&repo);
+        assert_eq!(
+            repo.value(WIN_V_SETTING_KEY).as_deref(),
+            Some("false"),
+            "新键已存在时不得被旧键覆盖（否则用户的最近选择会被回退）"
+        );
+        assert!(repo.writes().is_empty(), "无需迁移时不应产生任何写入");
+    }
+
+    /// 两个键都没有（全新用户）→ 不产生任何写入，也不凭空造一个键。
+    #[test]
+    fn fresh_install_creates_no_win_v_key() {
+        let repo = MemRepo::with(&[]);
+        migrate_win_v_setting_key_once(&repo);
+        assert!(repo.writes().is_empty());
+        assert_eq!(repo.value(WIN_V_SETTING_KEY), None);
     }
 }

@@ -1,8 +1,19 @@
 /* Modal & App Selector Styles */
+
+/*
+ * 遮罩的透明度。
+ *
+ * 原值是 `rgba(8, 12, 18, 0.56)` —— 实测把底下的界面压成了 (110,114,117)，
+ * 看上去就是「一团黑」。遮罩的职责是**把注意力收拢到弹窗上**，不是把界面压黑，
+ * 因此降到 0.42：仍能拉开层次，底下的内容看得出轮廓。
+ *
+ * 单独提成变量是为了让"遮罩"和"弹窗本体"两个透明度能被一起审视 ——
+ * 它们是一组（下面的 --modal-surface 是另一个）。改动其中任一个都要重新看配对效果。
+ */
 .modal-overlay {
   position: fixed;
   inset: -6px;
-  background: rgba(8, 12, 18, 0.56);
+  background: rgba(8, 12, 18, 0.42);
   backdrop-filter: blur(10px) saturate(115%);
   -webkit-backdrop-filter: blur(10px) saturate(115%);
   display: flex;
@@ -17,8 +28,28 @@ body:has(.modal-overlay) #root {
   border-color: transparent !important;
 }
 
+/*
+ * 弹窗本体的底色。
+ *
+ * # 为什么不能直接用 `--bg-panel` / `--bg-window`
+ *
+ * 那两个是**窗口/面板**的底色，在毛玻璃主题下**故意**是半透明的
+ * （`--bg-panel` 在 mica 下是 `rgba(255,255,255,0.48)`；`--bg-window` 在 acrylic 下
+ * 是 0.56）。窗口透出桌面壁纸是好看的 —— 那正是主题想要的效果。
+ *
+ * 但弹窗不一样：它叠在**自己的遮罩**之上，透出来的是"被压黑的自己"，没有任何美学价值。
+ * 真机反馈的原话是「最应该不透明的最顶层的这个列表弹窗是半透明，底下是黑色的」——
+ * 0.48 叠在 0.56 的深色遮罩上，就是这句描述的来源。
+ *
+ * 因此弹窗用**同一个底色的高不透明度**：沿用仓库既有的 `--bg-panel-rgb` 三元组
+ * （见 base.css 的注释，它本就是为"同一底色的另一个透明度"而拆的），
+ * 0.96 保留一点点材质感，但不再透出下层内容。
+ *
+ * ⚠️ 这个值必须对**两种弹窗类**同时生效：`.modal-content` 与 `.confirm-dialog`
+ * 各自用了不同的变量，只改一个会在另一个上复发。
+ */
 .modal-content {
-  background: var(--bg-window);
+  background: rgba(var(--bg-panel-rgb), 0.96);
   padding: 16px;
   border: var(--modal-border);
   border-radius: var(--modal-radius);
@@ -50,7 +81,8 @@ body:has(.modal-overlay) #root {
 
 /* Confirmation Dialog Styles */
 .confirm-dialog {
-  background: var(--bg-panel);
+  /* 与 .modal-content 同一处理：见上方注释（不能用半透明的 --bg-panel）。 */
+  background: rgba(var(--bg-panel-rgb), 0.96);
   padding: 24px;
   border: var(--modal-border);
   border-radius: var(--modal-radius);

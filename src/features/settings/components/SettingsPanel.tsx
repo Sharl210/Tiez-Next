@@ -77,6 +77,12 @@ interface SettingsPanelProps {
     appCleanupPolicies: AppCleanupPolicy[];
     setAppCleanupPolicies: (val: AppCleanupPolicy[]) => void;
     hotkey: string;
+    /** 注册表 Win+V 接管是否已生效（后端回读）。 */
+    registryWinVEnabled: boolean;
+    setRegistryWinVEnabled: (val: boolean) => void;
+    /** 粘贴方案（游戏模式需提权）。 */
+    pasteMethod: string;
+    setPasteMethod: (val: string) => void;
     showHotkeyHint: boolean;
     showSearchBox: boolean;
     setShowSearchBox: (val: boolean) => void;
@@ -272,6 +278,7 @@ const SettingsPanel = (props: SettingsPanelProps) => {
         setIsRecordingSearch, updateSearchHotkey,
         setPrivacyProtection,
         setIsRecording, isRecording, hotkey, hotkeyParts, updateHotkey,
+        registryWinVEnabled, setRegistryWinVEnabled, pasteMethod, setPasteMethod,
         setTheme, setColorMode, setLanguage, compactMode, setCompactMode, checkHotkeyConflict,
         clipboardItemFontSize, setClipboardItemFontSize, clipboardTagFontSize, setClipboardTagFontSize,
         emojiPanelEnabled, setEmojiPanelEnabled, tagManagerEnabled, setTagManagerEnabled,
@@ -598,6 +605,10 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 hotkeyParts={hotkeyParts}
                 updateHotkey={updateHotkey}
                 hotkey={hotkey}
+                registryWinVEnabled={registryWinVEnabled}
+                setRegistryWinVEnabled={setRegistryWinVEnabled}
+                pasteMethod={pasteMethod}
+                setPasteMethod={setPasteMethod}
                 appSettings={appSettings}
                 theme={theme}
                 colorMode={colorMode}

@@ -1,3 +1,14 @@
+/** 让验证台能渲染出真实进度条的固定快照（仅用于量样式，不代表真实时序）。 */
+const MIGRATION_PROGRESS = {
+  stage: "copying",
+  stageLabel: "正在复制数据",
+  done: 128,
+  total: 512,
+  bytes: 13002342,
+  bytesTotal: 50436504,
+  message: null,
+};
+
 const CONFIG = { enabled: true, intervalMinutes: 30, maxKeep: 20, backupOnStartup: true };
 const ENTRIES = [
   { archiveName: "Tiez-Next-auto-timed-20260923T120000-01.zip", path: "/home/u/.local/share/com.tiez.next/auto_backups/Tiez-Next-auto-timed-20260923T120000-01.zip", origin: "scheduled", createdAt: "2026-09-23T12:00:00+08:00", createdAtMs: 1758600000000, createdAtLocal: "2026-09-23 12:00:00", sizeBytes: 2048, pinned: false, seq: 1 },
@@ -33,6 +44,34 @@ export const invoke = async (cmd: string) => {
       { path: "/home/u/.local/share/com.tiez.next", identifier: "com.tiez.next", origin: "previous_tiez_next", bytes: 3174400, files: 12, has_database: true, canDelete: false },
       { path: "/home/u/.local/share/com.tiez", identifier: "com.tiez", origin: "legacy_tiez", bytes: 921600, files: 7, has_database: true, canDelete: true },
     ];
+    // 迁移进度快照：视觉验证台只用来量渲染与样式。
+    // ?mig=determinate 给一帧 `128/512` 的可计量进度；?mig=indeterminate 给 `total === 0`。
+    // ?result=deferred|done|failed 时让迁移命令返回对应报告，用来量结果卡片的**真实边框色**
+    // （类名对不代表颜色对，本仓库踩过 var() 静默失效的坑）。
+    case "migrate_from_data_dir": {
+      const kind = new URLSearchParams(location.search).get("result") ?? "deferred";
+      const base = {
+        source: "/home/u/.local/share/com.tiez",
+        target: "/home/u/.local/share/com.tiez.next",
+        files: 12, bytes: 9216000, deliveredFiles: 12, deliveredBytes: 9216000, keptExisting: 0,
+        skipReason: null, error: null, pathsRewritten: false, rewriteError: null,
+        sourceUntouched: true, restartRequired: false, supersededDb: null,
+      };
+      if (kind === "deferred") return { ...base, status: "deferred", pendingUntilRestart: true };
+      if (kind === "failed") return { ...base, status: "failed", error: "错误：目标数据库被占用（错误码 32）", pendingUntilRestart: false };
+      return { ...base, status: "done", pendingUntilRestart: false, pathsRewritten: true };
+    }
+    // 进度快照**只在显式要求时**才给：真实后端也只在进行中的迁移上回一帧。
+    // 一直回非终态会让"进行中"恒为真、迁移按钮永久禁用 —— 那是设计使然，
+    // 但会让结果卡片的量测点不到按钮。?mig=determinate 量可计量那一支；
+    // ?mig=indeterminate 量 `total === 0`（即"不确定进度"）那一支。
+    case "get_migration_progress": {
+      const mig = new URLSearchParams(location.search).get("mig");
+      if (mig === "indeterminate")
+        return { ...MIGRATION_PROGRESS, stage: "deferred", stageLabel: "数据已就绪，等待重启接管", done: 0, total: 0, bytes: 0, bytesTotal: 0 };
+      if (mig === "determinate") return MIGRATION_PROGRESS;
+      return null;
+    }
     default: return undefined;
   }
 };

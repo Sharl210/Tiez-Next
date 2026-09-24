@@ -13,6 +13,8 @@ import {
 } from "lucide-react";
 import { formatBytes } from "../../lib/formatBytes";
 import { backendErrorText as backupErrorText } from "../../lib/backendError";
+import { useMigrationProgress } from "../../hooks/useMigrationProgress";
+import MigrationProgressPanel from "../MigrationProgressPanel";
 
 interface DataSettingsGroupProps {
     t: (key: string) => string;
@@ -45,16 +47,26 @@ interface LegacyDir {
  *
  * `skipReason` / `error` 是**机器可读原因码**，不是给用户看的文案：界面负责把它们
  * 映射成当前语言的人话（见 `skipReasonText`），这样新增原因码时也不会出现"半英文"。
+ *
+ * # `migrated` 与 `done` 并列的原因（冻结契约 v1 §1）
+ *
+ * 契约把最终归属状态规定为 `"done" | "deferred" | "skipped" | "failed"`，
+ * 而**当前已上线的后端**回的是 `"migrated"`。后端正在并行改造，两边不可能同时落地。
+ * 因此这里同时接受两种拼写：任何一侧先到，界面都不会把一次**成功**的迁移显示成
+ * "未完成"（那会把用户吓到，让他去重做一件已经做完的事）。
+ * 契约里的字段名与取值前端一个都没有改，这只是过渡期的读取兼容 —— 已列入报告。
  */
+type MigrationStatus = "done" | "migrated" | "deferred" | "skipped" | "failed";
+
 interface MigrationReport {
-    status: "migrated" | "skipped" | "failed";
+    status: MigrationStatus;
     source: string;
     target: string;
     /** 源侧条目总数（含目录条目）——仅用于详情展示。 */
     files: number;
     /** 源侧全部条目字节数之和——仅用于详情展示。 */
     bytes: number;
-    /** 本次真正新交付的文件数（不含目录条目、不含沿用的文件）。 */
+    /** 本次真正新交付的文件数（不含目录条目、不含沿用文件）。 */
     deliveredFiles: number;
     /** 本次真正新交付的字节数。 */
     deliveredBytes: number;
@@ -67,7 +79,29 @@ interface MigrationReport {
     sourceUntouched: boolean;
     restartRequired: boolean;
     supersededDb: string | null;
+    /**
+     * 本轮新增：源数据已复制就绪、**待下次启动接管**。
+     *
+     * 与 `status === "deferred"` 是同一件事的两种表达（后端两个字段都会给）。
+     * 界面用**两者之一**为真即按"成功但需重启"呈现：任一字段因后端实现顺序尚未
+     * 落地时，用户仍能正确理解发生了什么，而不是看到"未完成"。
+     */
+    pendingUntilRestart?: boolean;
 }
+
+/** 成功（无论数据是当场可用还是等重启接管）。 */
+const isMigrationSuccess = (report: MigrationReport): boolean =>
+    report.status === "done" || report.status === "migrated" || report.status === "deferred";
+
+/**
+ * 待接管：源数据已复制好，等下次启动完成接管。
+ *
+ * `status` 与 `pendingUntilRestart` 任一为真即成立 —— 契约要求两个字段都来自后端，
+ * 但目前还没有任何一版后端同时给出它们。
+ */
+const isDeferred = (report: MigrationReport): boolean =>
+    report.status === "deferred" || report.pendingUntilRestart === true;
+
 
 /** 导出前的只读清点（对应后端 `backup_preflight`）。 */
 interface BackupPreflight {
@@ -173,6 +207,16 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
     const [lastRestore, setLastRestore] = useState<RestoreReport | null>(null);
     const [backupBusy, setBackupBusy] = useState<"export" | "import" | null>(null);
 
+    /**
+     * 迁移进度（用户明确要求"迁移过程需要有进度和迁移显示"）。
+     *
+     * 只在展开时订阅：折叠状态下迁移按钮不可见，挂着一对监听器没有意义。
+     * 两个事件名与 payload 形状来自冻结契约 §2，前端不做任何 stage→文案映射 ——
+     * `stageLabel` 由后端产出人话，直接渲染。
+     */
+    const { progress: migrationProgress, running: migrationRunning, markCommandSettled } =
+        useMigrationProgress(!collapsed);
+
     const refreshLegacyDirs = () => {
         invoke<LegacyDir[]>("list_legacy_data_dirs")
             .then(setLegacyDirs)
@@ -250,6 +294,11 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
         );
         if (!confirmed) return;
 
+        // 进行中禁止再次触发：迁移是两阶段的，重复点击会在后端叠加第二次拷贝。
+        // 事件驱动的 `migrationRunning` 已覆盖按钮的 disabled，这里再挡一层是因为
+        // 本函数也可能被「选择其它目录…」调用，那条路径不经过那个按钮。
+        if (migrationRunning) return;
+
         setBusyPath(sourcePath);
         setLastResult(null);
         try {
@@ -258,7 +307,22 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
             });
             setLastResult(report);
 
-            if (report.status === "migrated") {
+            if (isDeferred(report)) {
+                // `deferred` 是**成功**：源数据已复制就绪，重启后自动接管。
+                // 提示用 info 而不是 error —— 两阶段迁移下这是常态路径，
+                // 用错误弹窗会让用户以为出了问题去"处理"一件不需要处理的事。
+                await message(
+                    `${t("migration_deferred_title")}\n\n${t("migration_deferred_hint")}`,
+                    { title: t("notice"), kind: "info" }
+                );
+            } else if (report.status === "failed") {
+                await message(
+                    `${t("legacy_migrate_failed").replace("{e}", report.error || "")}\n\n${t(
+                        "legacy_migrate_source_safe"
+                    )}`,
+                    { title: t("error"), kind: "error" }
+                );
+            } else if (isMigrationSuccess(report)) {
                 await message(
                     `${report.deliveredFiles === 0 && report.keptExisting > 0
                         ? t("legacy_migrate_result_already_present")
@@ -268,13 +332,6 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                         "legacy_migrate_source_safe"
                     )}${report.restartRequired ? `\n\n${t("legacy_migrate_restart")}` : ""}`,
                     { title: t("notice"), kind: "info" }
-                );
-            } else if (report.status === "failed") {
-                await message(
-                    `${t("legacy_migrate_failed").replace("{e}", report.error || "")}\n\n${t(
-                        "legacy_migrate_source_safe"
-                    )}`,
-                    { title: t("error"), kind: "error" }
                 );
             } else {
                 await message(
@@ -291,6 +348,8 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
             });
         } finally {
             setBusyPath(null);
+            // 命令已返回 ⇒ 无论事件通道有没有送达终态帧，都解除"进行中"。
+            markCommandSettled();
         }
     };
 
@@ -762,7 +821,7 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                         <div style={{ display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' }}>
                             <button
                                 className="btn-icon"
-                                disabled={busyPath !== null}
+                                disabled={busyPath !== null || migrationRunning}
                                 onClick={handleChooseDir}
                                 style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '26px', display: 'flex', alignItems: 'center', gap: '6px' }}
                             >
@@ -784,6 +843,15 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                 {t('legacy_dir_none')}
                             </div>
                         )}
+
+                        {/*
+                          迁移进度：用户点完「从此目录迁移」之后，这里实时显示当前阶段与
+                          已复制量。`stageLabel` 由后端产出人话，这里原样渲染、不做映射 ——
+                          两边各翻一份必然在某次改动后不一致。
+                          不可计量（后端 total === 0）时显示"不确定进度"，**不显示 0%**：
+                          静止的 0% 与"卡死"无法区分，而"等待重启接管"这类阶段本就没有总量。
+                        */}
+                        <MigrationProgressPanel progress={migrationProgress} t={t} />
 
                         {legacyDirs.map((dir) => (
                             <div
@@ -828,11 +896,14 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                         </div>
                                     </div>
                                     <div style={{ display: 'flex', gap: '6px', flexShrink: 0, alignItems: 'center' }}>
-                                        {/* 主操作：迁移（只读源，不改动原版） */}
+                                        {/* 主操作：迁移（只读源，不改动原版）。
+                                            进行中必须禁用 —— 迁移是两阶段且会真的拷贝文件，
+                                            重复点击会在后端叠加第二次拷贝（`migrationRunning`
+                                            由进度事件驱动，覆盖"命令已返回但事件仍在跑"的情况）。 */}
                                         <button
                                             className="btn-icon"
                                             title={t('legacy_migrate_hint')}
-                                            disabled={busyPath !== null}
+                                            disabled={busyPath !== null || migrationRunning}
                                             onClick={() => handleMigrate(dir.path, dir.identifier)}
                                             style={{ width: 'auto', padding: '4px 10px', fontSize: '10px', height: '24px', display: 'flex', alignItems: 'center', gap: '6px' }}
                                         >
@@ -881,34 +952,34 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                             </div>
                         ))}
 
-                        {/* 迁移结果：用户点完按钮必须能核对具体发生了什么 */}
+                        {/* 迁移结果：用户点完按钮必须能核对具体发生了什么。
+                            三种归属状态由类名区分成败配色（见 `migration-progress.css`）。
+                            `deferred` 与 `done` 共用**成功**配色：两阶段迁移下"等重启接管"
+                            才是常态路径，做成黄色警告会让每次正常迁移都长得像出了问题。 */}
                         {lastResult && (
                             <div
-                                style={{
-                                    border: `1px solid ${
-                                        lastResult.status === "migrated"
-                                            ? "rgba(64,160,96,0.5)"
-                                            : lastResult.status === "failed"
-                                            ? "rgba(200,80,80,0.5)"
-                                            : "var(--border-color, rgba(128,128,128,0.25))"
-                                    }`,
-                                    borderRadius: '6px',
-                                    padding: '8px 10px',
-                                    marginBottom: '8px',
-                                    fontSize: '10px',
-                                    lineHeight: 1.6,
-                                    wordBreak: 'break-all',
-                                }}
+                                className={`migration-result ${
+                                    isDeferred(lastResult)
+                                        ? "is-deferred"
+                                        : isMigrationSuccess(lastResult)
+                                        ? "is-done"
+                                        : lastResult.status === "failed"
+                                        ? "is-failed"
+                                        : "is-skipped"
+                                }`}
+                                data-status={lastResult.status}
                             >
-                                <div style={{ fontWeight: 600, marginBottom: '4px' }}>
-                                    {lastResult.status === "migrated"
+                                <div className="migration-result-title">
+                                    {isDeferred(lastResult)
+                                        ? t('migration_deferred_title')
+                                        : isMigrationSuccess(lastResult)
                                         ? t('legacy_migrate_result_migrated')
                                         : lastResult.status === "failed"
                                         ? t('legacy_migrate_result_failed')
                                         : t('legacy_migrate_result_skipped')}
                                 </div>
                                 <div>
-                                    {lastResult.status === "migrated" &&
+                                    {isMigrationSuccess(lastResult) &&
                                     lastResult.deliveredFiles === 0 &&
                                     lastResult.keptExisting > 0
                                         ? t('legacy_migrate_result_already_present')
@@ -922,7 +993,7 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                                   formatBytes(lastResult.deliveredBytes)
                                               )}
                                 </div>
-                                {lastResult.status === "migrated" && lastResult.keptExisting > 0 && (
+                                {isMigrationSuccess(lastResult) && lastResult.keptExisting > 0 && (
                                     <div>
                                         {t('legacy_migrate_result_kept').replace(
                                             '{files}',
@@ -936,34 +1007,45 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                 <div>
                                     {t('legacy_migrate_result_target').replace('{path}', lastResult.target)}
                                 </div>
-                                {lastResult.status === "migrated" && (
+                                {isMigrationSuccess(lastResult) && (
                                     <>
                                         <div style={{ marginTop: '4px' }}>{t('legacy_migrate_source_safe')}</div>
-                                        <div>
-                                            {lastResult.pathsRewritten
-                                                ? t('legacy_migrate_paths_rewritten')
-                                                : t('legacy_migrate_paths_not_rewritten')}
-                                        </div>
-                                        {lastResult.supersededDb && (
-                                            <div>
-                                                {t('legacy_migrate_superseded').replace(
-                                                    '{path}',
-                                                    lastResult.supersededDb
+                                        {/* 待接管时**不显示**"路径未改写"这类中间态说明：
+                                            接管还没发生，路径改写本来就要等重启后由启动期补做。
+                                            把它显示出来只会让用户以为迁移漏了一步。 */}
+                                        {isDeferred(lastResult) ? (
+                                            <div className="migration-result-restart">
+                                                {t('migration_deferred_hint')}
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <div>
+                                                    {lastResult.pathsRewritten
+                                                        ? t('legacy_migrate_paths_rewritten')
+                                                        : t('legacy_migrate_paths_not_rewritten')}
+                                                </div>
+                                                {lastResult.supersededDb && (
+                                                    <div>
+                                                        {t('legacy_migrate_superseded').replace(
+                                                            '{path}',
+                                                            lastResult.supersededDb
+                                                        )}
+                                                    </div>
                                                 )}
-                                            </div>
-                                        )}
-                                        {lastResult.rewriteError && (
-                                            <div>
-                                                {t('legacy_migrate_rewrite_warning').replace(
-                                                    '{e}',
-                                                    lastResult.rewriteError
+                                                {lastResult.rewriteError && (
+                                                    <div>
+                                                        {t('legacy_migrate_rewrite_warning').replace(
+                                                            '{e}',
+                                                            lastResult.rewriteError
+                                                        )}
+                                                    </div>
                                                 )}
-                                            </div>
-                                        )}
-                                        {lastResult.restartRequired && (
-                                            <div style={{ marginTop: '4px', fontWeight: 600 }}>
-                                                {t('legacy_migrate_restart')}
-                                            </div>
+                                                {lastResult.restartRequired && (
+                                                    <div className="migration-result-restart">
+                                                        {t('legacy_migrate_restart')}
+                                                    </div>
+                                                )}
+                                            </>
                                         )}
                                     </>
                                 )}
@@ -977,20 +1059,23 @@ const DataSettingsGroup = ({ t, collapsed, onToggle, dataPath }: DataSettingsGro
                                         <div style={{ marginTop: '4px' }}>{lastResult.error}</div>
                                         {/* Windows 上文件被应用占用时改名/覆盖会失败；失败是安全的
                                             （源与目标都保留），但用户需要知道下一步该做什么。 */}
-                                        <div style={{ marginTop: '4px', opacity: 0.85 }}>
+                                        <div className="migration-result-hint">
                                             {t('legacy_migrate_failed_hint')}
                                         </div>
                                     </>
                                 )}
-                                {lastResult.restartRequired && lastResult.status === "migrated" && (
-                                    <button
-                                        className="btn-icon"
-                                        onClick={() => invoke("relaunch").catch(console.error)}
-                                        style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '24px', marginTop: '8px' }}
-                                    >
-                                        {t('legacy_migrate_restart_now')}
-                                    </button>
-                                )}
+                                {/* 待接管与"迁移成功但需重启"共用同一个既有命令，
+                                    不新增后端命令：`relaunch` 已经在多处使用。 */}
+                                {isMigrationSuccess(lastResult) &&
+                                    (isDeferred(lastResult) || lastResult.restartRequired) && (
+                                        <button
+                                            className="btn-icon"
+                                            onClick={() => invoke("relaunch").catch(console.error)}
+                                            style={{ width: 'auto', padding: '4px 12px', fontSize: '10px', height: '24px', marginTop: '8px' }}
+                                        >
+                                            {t('legacy_migrate_restart_now')}
+                                        </button>
+                                    )}
                             </div>
                         )}
 
