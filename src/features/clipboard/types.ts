@@ -64,12 +64,25 @@ export interface ClipboardItemProps {
   isEditingBody?: boolean;
   /** R10: draft the editor starts from; only read when the dialog mounts. */
   bodyInitialDraft?: string;
+  /**
+   * R13: 富文本条目的 HTML 初值。只有 `rich_text` 会给，其它类型为空。
+   *
+   * 之前弹窗的初值只有 `item.content`（**纯文本列**），所以用户一打开富文本条目的
+   * 编辑器，格式就已经没了 —— 这是"编辑富文本坍缩成纯文本"的前端侧那一半根因，
+   * 与后端的降级彼此独立，只修一处都不够。
+   */
+  bodyInitialHtml?: string;
+  /** R13: 这条正文是否以富文本（可编辑 HTML）方式编辑。 */
+  bodyEditIsRich?: boolean;
   /** R10: a save is in flight (dialog disables its buttons). */
   bodyEditSaving?: boolean;
   /** R10: error text from the last failed save, shown inside the dialog. */
   bodyEditError?: string | null;
-  /** R10: commit the edited body. The renderer hook owns the backend call. */
-  onBodyEditSave?: (newContent: string) => void;
+  /**
+   * R10/R13: commit the edited body. The renderer hook owns the backend call.
+   * 第二个参数是编辑后的 HTML，**只有** `rich_text` 条目会带上。
+   */
+  onBodyEditSave?: (newContent: string, htmlContent?: string) => void;
   /** R10: close the body editor without saving. */
   onBodyEditCancel?: () => void;
   /**
@@ -173,11 +186,22 @@ export const isNoteEditable = (_contentType: string): boolean => true;
 
 
 /**
- * R10: `rich_text` is editable, but saving downgrades it to plain text and drops
- * `html_content` (backend behaviour in `update_entry_content_with_conn`). The editor
- * warns about that before the user commits.
+ * R13: 这条正文是否应以**富文本**（可编辑 HTML）方式打开编辑器。
+ *
+ * 只有 `rich_text` 为真。
+ *
+ * # 为什么其它文本类型不改成富文本编辑器
+ *
+ * `text` / `code` / `url` 的 `html_content` 要么为空、要么没有语义（代码的缩进与
+ * 换行在 HTML 里要靠 `<pre>` 才能保住，往返一趟反而会改变用户看到的东西）。
+ * 给它们一个 contentEditable 只会让"所见即所得"承诺落空 —— 用户改了间距、加了
+ * 换行，存回去的 HTML 与 `content` 对不上。所以富文本编辑器**只**服务真正带格式的
+ * 类型，其余仍是 `<textarea>`。
+ *
+ * 旧名字是 `bodyEditDowngradesFormat`（"这条保存后会降级"）—— 降级已经被修掉，
+ * 那个函数随之删除；语言测试与界面里针对它的警告文案也一并移除。
  */
-export const bodyEditDowngradesFormat = (contentType: string): boolean =>
+export const isRichBodyEditable = (contentType: string): boolean =>
   contentType === "rich_text";
 
 export type ClipboardRenderItem = (

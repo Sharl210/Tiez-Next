@@ -191,8 +191,12 @@ pub fn delete_auto_backup(
 /// 从一份自动备份恢复全部数据。
 ///
 /// 复用既有的导入链（`restore_backup`）：它自己会在导入前给当前数据建一份旁路备份，
-/// 失败时一个字节都不动现有数据。返回的 `restoreReport.restartRequired` 为真，界面必须
-/// 提示用户重启应用。
+/// 失败时一个字节都不动现有数据。
+///
+/// 【返回的语义：这是一次**提交**，不是一次交换】运行期只做"校验包 + 组装暂存 + 写
+/// 待接管标记"，真正的文件交换由下次启动在打开数据库**之前**完成——因为应用自己正
+/// 打开着 `clipboard.db`，Windows 不允许改名已打开的文件。因此 `restoreReport.restartRequired`
+/// 不是建议：**重启是这次恢复生效的唯一途径**，界面必须把它当必做动作呈现。
 #[tauri::command]
 pub fn restore_auto_backup(
     app: AppHandle,
@@ -212,6 +216,11 @@ pub fn restore_auto_backup(
         &crate::services::backup::RestoreRequest {
             data_dir,
             archive_path,
+            // 【为什么这里也必须给】两条恢复入口（自动备份列表 / 数据管理里的导入）
+            // 走的是**同一条**导入链，因此都必须能写下"待接管"标记——否则其中一条会在
+            // 提交阶段失败，用户看到"恢复没成功"而另一条却能成功，行为不一致。
+            // 原生数据目录是标记唯一合法的落脚点，理由见 `migration_pending` 模块头部。
+            pending_marker_dir: app.path().app_data_dir().ok(),
         },
     )
     .map_err(|e| to_app_error(AutoBackupError::Export(e.to_string())))?;

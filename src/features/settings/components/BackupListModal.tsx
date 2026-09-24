@@ -88,7 +88,16 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; entry: AutoBackupEntry } | null>(null);
   const [pending, setPending] = useState<PendingAction | null>(null);
-  /** 恢复成功后若后端要求重启，这里置位并显示重启提示（含"立即重启"）。 */
+  /**
+   * 恢复提交成功后置位，显示"待重启生效"提示（含"立即重启"）。
+   *
+   * # 为什么它承载的是"必须做"而不是"建议做"
+   *
+   * 恢复的文件交换发生在下次启动、打开数据库**之前**——应用此刻正打开着
+   * `clipboard.db`，Windows 不允许改名已打开的文件。所以后端返回的
+   * `restartReport.restartRequired` 不是可选提示：**不重启，这次恢复就完全没生效**。
+   * 提示里必须带上这一点，否则用户会像看普通通知一样把它关掉，然后以为恢复失败了。
+   */
   const [restartRequired, setRestartRequired] = useState(false);
 
   const explain = useCallback((e: unknown) => autoBackupErrorText(t, e), [t]);
@@ -244,14 +253,15 @@ export const BackupListModal = ({ open, t, theme, onClose, onLoaded }: BackupLis
     setBusy(true);
     setError(null);
     try {
-      // 后端复用既有导入链，返回 `{ archiveName, restoreReport }`，其中
-      // `restoreReport.restartRequired` 表示"必须重启应用才能看到恢复后的数据"。
-      // 这不是可选提示：不重启用户会以为恢复没生效。因此这里必须读出来并提示，
-      // 复用既有导入链已经在用的重启文案（`backup_import_restart*`），不新造词条。
-      const result = await invoke<{ restoreReport?: { restartRequired?: boolean } }>(
-        "restore_auto_backup",
-        { archiveName: entry.archiveName }
-      );
+      // 后端复用既有导入链，返回 `{ archiveName, restoreReport }`。其中
+      // `restoreReport.restartRequired` 表示"数据已组装就绪，重启后由启动期换上"——
+      // **不是可选提示**：不重启，这次恢复一点都没生效（交换被刻意推迟到下次启动，
+      // 因为应用此刻正打开着数据库文件，Windows 不允许改名已打开的文件）。
+      // 因此这里必须读出来并弹提示，复用既有导入链已经在用的文案
+      // （`backup_import_restart*`），不新造词条。
+      const result = await invoke<{
+        restoreReport?: { restartRequired?: boolean; pendingStagingDir?: string | null };
+      }>("restore_auto_backup", { archiveName: entry.archiveName });
       if (result?.restoreReport?.restartRequired) setRestartRequired(true);
       await refresh();
     } catch (e: unknown) {

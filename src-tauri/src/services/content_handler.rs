@@ -484,16 +484,31 @@ fn update_database_with_changes(
 ) {
     use crate::app_state::SessionHistory;
 
+    // R13：外部文件被编辑后，正文是**纯文本**。
+    //
+    // 修复前这里把 `content_type` 改成 `text` 并清空 `html_content`（会话态两处都做了）。
+    // 现在类型不再被偷走，但 `html_content` 必须同步成与新正文一致的 HTML —— 否则界面
+    // 按 HTML 渲染、复制走 `content`，两者会显示不同内容。因此与 AI 改写路径一致：
+    // 纯文本转义后按行包成 `<p>`。
+    let synced_html: Option<String> = if new_content.starts_with("data:image") {
+        None // 图片载荷没有 HTML 语义
+    } else {
+        Some(crate::services::clipboard_mutation::plain_text_to_html(new_content))
+    };
+
     if id < 0 {
         if let Some(session) = app_handle.try_state::<SessionHistory>() {
             let mut history = session.0.lock().unwrap();
             if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.content = new_content.to_string();
-                item.preview = preview.to_string();
-                item.html_content = None;
-                if item.content_type == "rich_text" {
-                    item.content_type = "text".to_string();
-                }
+                // 原先这里无条件清空 HTML 并把类型降级成 `text`。`history_cmd` 会把
+                // 会话态条目合并进首页列表，于是在这里降级会让用户先看到"没降级"，
+                // 切窗口后才看到降级。
+                crate::services::clipboard_mutation::mirror_body_edit_in_session(
+                    item,
+                    new_content,
+                    preview,
+                    synced_html.as_deref(),
+                );
                 let _ = app_handle.emit("clipboard-updated", item.clone());
                 println!(
                     "Session item updated and clipboard-updated event emitted for id: {}",
@@ -508,20 +523,32 @@ fn update_database_with_changes(
 
     let state = app_handle.state::<DbState>();
 
+    // 只有富文本条目才带 HTML：给 `text` / `code` / `url` 行写 HTML 会造出
+    // "类型与载荷不一致"的错位行。仓储层对此也做了一层保护，这里先从库里读类型，
+    // 让"文件回写"这条路径连一次无意义的 HTML 都不产生。
+    let is_rich_row = state
+        .repo
+        .get_entry_by_id(id)
+        .ok()
+        .flatten()
+        .map(|e| e.content_type == "rich_text")
+        .unwrap_or(false);
+    let html_for_write = if is_rich_row { synced_html.as_deref() } else { None };
+
     if state
         .repo
-        .update_entry_content(id, new_content, preview)
+        .update_entry_content(id, new_content, preview, html_for_write)
         .is_ok()
     {
         if let Some(session) = app_handle.try_state::<SessionHistory>() {
             let mut history = session.0.lock().unwrap();
             if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.content = new_content.to_string();
-                item.preview = preview.to_string();
-                item.html_content = None;
-                if item.content_type == "rich_text" {
-                    item.content_type = "text".to_string();
-                }
+                crate::services::clipboard_mutation::mirror_body_edit_in_session(
+                    item,
+                    new_content,
+                    preview,
+                    if is_rich_row { synced_html.as_deref() } else { None },
+                );
             }
         }
 

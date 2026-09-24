@@ -7,8 +7,29 @@
 //! 2. **先校验后落地**：整包先只读扫描并逐条目校验 sha256、核对数量、校验必备条目，
 //!    全部通过才开始写。
 //! 3. **失败不得破坏现有数据**：所有解压与组装都发生在数据目录的**同级暂存目录**里；
-//!    正式数据只在最后一步被逐个受管条目替换，任一步失败即把已挪走的条目原样放回。
+//!    正式数据的交换推迟到下次启动、在 `init_db` 之前进行，任一步失败即把已挪走的
+//!    条目原样放回。
 //! 4. **导入是破坏性操作**，前端必须二次确认并明确告知"当前数据将被替换"。
+//!
+//! # 为什么"交换"必须跨一次重启（这是本模块最重要的一条结构决定）
+//!
+//! 备份恢复的入口是**应用内的界面**：用户点它时应用**必定正在运行**，而应用启动时
+//! 就已经打开了数据目录里的 `clipboard.db`（`app/setup.rs` 的 `database::init_db`），
+//! 这个连接常驻在 `DbState` 里、被 3 个 repo 与 `McpStore` 多处持有，**不可能在运行期
+//! 释放**。Windows **不允许给已打开的文件改名**（`ERROR_SHARING_VIOLATION`，os error 32），
+//! 于是"把当前库挪走、把新库放上来"这一步在运行期**必然失败**——旧实现正是这么做的，
+//! 用户看到的就是"点了恢复，报错说文件被占用"。
+//!
+//! 因此这条链和迁移一样走**两阶段**：
+//!
+//! ```text
+//! 用户点恢复 → 运行期只做「校验包 + 组装暂存 + 写待接管标记」→ 提示重启
+//! 下次启动   → 在 init_db 之前做改名交换（此时无人持句柄）→ 必然成功
+//! ```
+//!
+//! 运行期能安全完成的部分一步都没少（含导入前的旁路备份、逐条 sha256 校验、路径改写、
+//! 云同步游标重置、数量对账），被推迟的**只有文件改名**这一个动作。标记的读写、失败
+//! 语义与启动期时机与迁移**完全共用** `migration_pending`，见那里的说明。
 //!
 //! # "完全恢复"到底恢复什么（这决定了哪些东西**故意**不动）
 //!
@@ -93,6 +114,16 @@ pub struct RestoreRequest {
     pub data_dir: PathBuf,
     /// 要导入的备份包路径。
     pub archive_path: PathBuf,
+    /// 「待接管标记」的存放目录（**原生**应用数据目录，即 `app.path().app_data_dir()`）。
+    ///
+    /// 【为什么必须是原生目录而不是当前数据目录】标记要指出"下次启动该做什么"，而
+    /// 它自己**不能住在会被这次恢复替换掉的目录里**——那正是它的作用对象。原生目录由
+    /// identifier 推导、位置稳定，且永远不是被替换的那一个。这条判断与迁移完全一致
+    /// （`migration_pending` 模块头部有完整说明）。
+    ///
+    /// `None` 表示调用方拿不到这个目录。此时**拒绝执行**而不是猜一个路径：猜错会让
+    /// 下次启动找不到标记，用户会以为"恢复成功了"，而数据其实从未被交换过。
+    pub pending_marker_dir: Option<PathBuf>,
 }
 
 /// 导入结果（回传前端，供用户核对到底发生了什么）。
@@ -117,8 +148,24 @@ pub struct RestoreReport {
     pub resets_applied: Vec<String>,
     /// 需要用户知道的非致命情况。
     pub warnings: Vec<String>,
-    /// 是否建议重启应用才能看到新数据。
+    /// 是否需要重启应用才能看到新数据。
+    ///
+    /// 【语义已收紧：从"建议"变成"必须"】旧实现在这里返回 `true` 的同时**已经做完**
+    /// 了替换（真机上则是失败报错）；现在它表示"数据已组装就绪、等着下次启动上位"，
+    /// 是**完成这次恢复的唯一途径**。因此界面必须把重启当成必做动作来呈现，而不是一句
+    /// 可忽略的提示。
     pub restart_required: bool,
+    /// 本次恢复是否已提交为"待下次启动生效"（成功路径上恒为 `true`）。
+    ///
+    /// 【为什么单列一个字段而不复用 `restartRequired`】两者在这种情形下会分叉：恢复已经
+    /// **提交**（暂存与标记都就绪），但调用方拿不到原生数据目录、标记没能落盘。那时
+    /// `restartRequired` 仍是 `false`（重启也不会有任何变化），而 `deferredUntilRestart`
+    /// 让我们能如实区分"提交了"和"生效了"。前端的判据是 `restartRequired`。
+    pub deferred_until_restart: bool,
+    /// 暂存目录路径（**必须告知用户**：重启后由它上位；若一直不重启，它就一直占着磁盘）。
+    pub pending_staging_dir: Option<String>,
+    /// 待接管标记路径（`None` 表示这次恢复**没有**被提交，重启不会有任何变化）。
+    pub pending_marker_path: Option<String>,
 }
 
 /// 包内容清点结果（**只读阶段**产出）。
@@ -208,13 +255,73 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
         }
     };
 
-    // ===== 第 6 步：把暂存里的受管条目换上去 =====
-    let mut orphaned: Vec<String> = Vec::new();
-    if let Err(e) = swap_managed_entries(data_dir, &staging, &mut orphaned) {
+    // ===== 第 6 步：提交为"待下次启动生效" =====
+    //
+    // 【为什么这里不做交换，而是写一个标记】见本模块头部：换掉 `clipboard.db` 需要给它
+    // 改名，而应用自己正把这个文件打开着，Windows 不许改名已打开的文件。真正的交换由
+    // 下次启动在 `init_db` 之前完成（`app/setup.rs` 的 `run_pending_takeover`）。
+    //
+    // 走到这里，运行期**能安全完成的全部工作**都已经做完：包已逐条校验、暂存已组装、
+    // 路径已改写、云同步游标已重置、数量已对账。剩下的只有一个改名动作。
+    let Some(marker_dir) = req.pending_marker_dir.as_deref() else {
+        // 拿不到原生数据目录 ⇒ 没法让下次启动知道有活要干。**如实失败并回滚暂存**，
+        // 绝不能让用户看到"恢复成功"而其实什么都没发生。
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+        return Err(BackupError::Land(format!(
+            "无法确定「待接管标记」的存放位置，本次恢复未能提交（你的现有数据未被改动；\
+             已组装好的暂存目录已清理）。请重试；若反复出现，请把应用日志提供给支持人员。\
+             （数据目录 {}）",
+            data_dir.display()
+        )));
+    };
+
+    // 暂存目录名带 pid 与序号（见 `staging_dir`），因此**下一次提交必然用的是另一个名字**。
+    // 在写标记之前，把上一次未重启就已失效的暂存清掉：不清的话它会一直占着磁盘，
+    // 而没有任何东西会再来处理它（标记只指向最新那一个）。
+    let reclaimed = remove_superseded_restore_staging(data_dir, &staging);
+
+    // 标记里记的"源目录"是 `data_dir` 自身——恢复没有"另一个源目录"，用户的依据是那个
+    // 备份包（导出链只读它，本模块从不写它）。填 `data_dir` 而不是留空，是为了让现有
+    // 接管路径（它无条件用这个字段做路径改写）不需要理解两种语义：对恢复来说
+    // "旧前缀 = 当前数据目录"恰好是正确的。
+    let pending = crate::migration_pending::PendingMigration::for_kind(
+        crate::migration_pending::PendingKind::LocalRestore,
+        data_dir.clone(),
+        staging.clone(),
+        data_dir.clone(),
+        // 【顺序不可颠倒】暂存组装成功之后才写"已就绪"的标记。若组装中途进程被杀，
+        // 数据目录同级会留下半个暂存目录而**没有**标记——那就只是一个无主残渣；
+        // 反过来（先写标记再组装）会让下次启动把一个不完整的片段当成正式数据提升。
+        true,
+        env!("CARGO_PKG_VERSION"),
+    );
+
+    let marker_path = match crate::migration_pending::write(marker_dir, &pending) {
+        Ok(p) => p,
+        Err(e) => {
+            // 标记是"下次启动该做什么"的唯一凭据。写不进去就不能对用户说"重启即可"。
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(BackupError::Land(format!(
+                "数据已在暂存目录组装就绪（{}），但「待接管标记」写入失败（{}）；\
+                 本次恢复未能提交，你的现有数据未被改动。请检查数据目录的写入权限后重试。",
+                staging.display(),
+                e
+            )));
+        }
+    };
+
+    if reclaimed > 0 {
+        warnings.push(format!(
+            "已清理上次未重启就已失效的恢复暂存目录（{} 个）。那一次恢复的内容未写入正式数据；\
+             正式数据现在仍是你操作前的样子。",
+            reclaimed
+        ));
     }
-    let _ = std::fs::remove_dir_all(&staging);
+    warnings.push(format!(
+        "本次恢复已进入待生效状态：数据已按包内容组装完毕并存放在 {}。\
+         重启应用后，它会在打开数据库**之前**自动完成替换并开始生效。",
+        staging.display()
+    ));
 
     Ok(RestoreReport {
         archive_path: req.archive_path.to_string_lossy().to_string(),
@@ -227,19 +334,56 @@ pub fn restore_backup(req: &RestoreRequest) -> Result<RestoreReport, BackupError
         verified_entries: plan.verified_entries,
         counts: manifest.counts.clone(),
         resets_applied: staged.resets_applied,
-        warnings: {
-            if !orphaned.is_empty() {
-                warnings.push(format!(
-                    "检测到上次导入遗留的数据快照，已为其改名封存（未删除）：{}。确认当前数据无误后可自行清理。",
-                    orphaned.join("、")
-                ));
-            }
-            warnings
-        },
-        // 应用启动时就把数据库连接建好了；导入是运行中发生的，进程内的连接仍指向
-        // 替换前那份数据。必须重启才能加载新数据——与迁移中心保持一致的语义。
+        warnings,
+        // 【这不是"建议"】旧实现在这里返回 true 的同时已经做完了替换（真机上则是失败），
+        // 现在它表示"数据等着下次启动上位"——重启是这次恢复生效的唯一途径。
         restart_required: true,
+        deferred_until_restart: true,
+        pending_staging_dir: Some(staging.to_string_lossy().to_string()),
+        pending_marker_path: Some(marker_path.to_string_lossy().to_string()),
     })
+}
+
+/// 清掉上次提交、但从未重启生效的**恢复暂存目录**。
+///
+/// # 为什么必须清（以及为什么只清这一种）
+///
+/// 恢复的暂存目录名带 pid 与进程内序号（`staging_dir`）。下次提交恢复时名字**必然不同**，
+/// 于是上一次那个目录再也不会被任何人处理：
+///
+/// - 它不是"待提升的活"：标记只指向最新那一个，旧的那个没有被提升的机会；
+/// - 它不能被当成"碎片"盲删：万一标记恰好还指着它（理论上不会，因为标记此刻指向
+///   最新一个），删了就丢掉了用户唯一的一份待生效数据。
+///
+/// 所以判据是"名字符合恢复暂存的形状 **且** 不等于本次要提交的那一个"。只删目录、
+/// 不删任何别的东西；删不掉也只记一笔（磁盘占着比误删用户数据轻得多）。
+///
+/// 返回清掉的个数。
+fn remove_superseded_restore_staging(data_dir: &Path, keep: &Path) -> usize {
+    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+    let target_name = data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "appdata".to_string());
+    let prefix = format!(".{}.restoring.", target_name);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 读取并校验 manifest（含"是不是本应用的包"与版本判定）。
@@ -1109,38 +1253,97 @@ fn verify_counts(
     Ok(())
 }
 
-/// 把暂存目录里的**受管条目**逐个换到正式数据目录上。
+/// 启动期提升的**调用点锚文本**。
+///
+/// # 为什么要有这么一个常量
+///
+/// "备份恢复的提升必须发生在打开数据库之前"这条约束**在本机不可观测**：Linux 允许改名
+/// 已打开的文件，所以顺序错了、行为测试照样全绿（真机上则表现为"重启后数据没进来"）。
+/// 唯一的办法是对源码的**文本顺序**下断言——就像迁移那条已有的守门测试一样。
+///
+/// 而普通的文本断言很容易被"锚在一段其实不在 `init` 体内的代码上"骗过去。因此这里把
+/// 分派点**写成一句可被唯一识别的调用**（见 `app/setup.rs`），常量即那段文本：
+/// 断言的是"这句话确实出现在 `init` 体内、且在 `init_db` 之前"。
+pub const LOCAL_RESTORE_PROMOTION_ANCHOR: &str =
+    "crate::services::backup::import::promote_staged_restore(&pending.staging_dir, &pending.target_dir)";
+
+/// **启动期提升**：把一份已组装就绪的恢复暂存目录变成正式数据。
+///
+/// # 契约（与 `migration_identifier::promote_staged_takeover` 逐条一致）
+///
+/// - **调用时机**：数据目录已解析、logger 已就绪、**尚无任何 `Connection`** 那一刻
+///   （`app/setup.rs` 的 `run_pending_takeover`）。这是本函数能成功的前提：此时
+///   `clipboard.db` 没有被任何人打开，Windows 才允许给它改名。
+/// - **成功** ⇒ 暂存目录已消失（内容已就位），调用方清除标记。
+/// - **失败** ⇒ 目标恢复到调用前的状态，**暂存目录保留**；调用方据此保留标记、
+///   下次启动自动重试。绝不返回"改了一半"。
 ///
 /// # 为什么不是"整个目录 rename"
 ///
-/// 应用此刻正持有 `clipboard.db` 的连接。在 Windows 上，重命名一个内含已打开文件的
-/// 目录会失败；逐个条目的 `rename` 也会失败，但**失败点是可控的**：第一个 rename 就
-/// 会暴露问题，此时什么都还没换，直接返回并提示用户"完全退出应用后重试"。
+/// 暂存目录里装的只是**受管条目的片段**（`clipboard.db`、`attachments/`…），不是一整份
+/// 数据目录——它是从包内容组装出来的，不含 `datapath.txt`、日志这些"这台机器的运行
+/// 环境"。整目录合并会把暂存里的形态强加给正式目录，而逐条目的交换恰好只动该动的东西。
 ///
-/// 已经挪走的条目会在失败时**原样放回**，因此无论在哪一步失败，正式数据目录都回到
-/// 调用前的状态（另有一份完整旁路备份作为最终兜底）。
-fn swap_managed_entries(
-    data_dir: &Path,
+/// 反过来，逐条目交换也**天然可回滚**：第一个 `rename` 就暴露问题，此时什么都还没换。
+/// 已经挪走的条目在失败时**原样放回**，因此无论在哪一步失败，正式数据目录都回到调用前
+/// 的状态（另有一份完整旁路备份作为最终兜底）。
+pub fn promote_staged_restore(staging: &Path, data_dir: &Path) -> Result<(), String> {
+    promote_staged_restore_with(staging, data_dir, &mut |from, to| std::fs::rename(from, to))
+}
+
+/// [`promote_staged_restore`] 的实现主体：把"改名"这一步作为**可注入的接缝**接收。
+///
+/// 【为什么要有这个接缝】本模块的失败路径必须能在**任意平台**上被确定性地复现，而真机上
+/// 的失败来自 Windows 的 `os error 32`（文件被本应用自己打开的句柄占住）。Linux 允许改名
+/// 已打开的文件，"持有连接"在这里造不出同样的失败。因此把改名动作参数化：测试可以注入
+/// "第 N 次必然失败"的改名器来精确验证回滚，生产路径传的仍是 [`std::fs::rename`]。
+///
+/// 这与 `migration_identifier::promote_staged_takeover(staging, target, rename)` 是同一个
+/// 做法——两条链面对的是同一个平台约束，因此用同一种接缝，而不是各造一套。
+fn promote_staged_restore_with(
     staging: &Path,
-    orphaned: &mut Vec<String>,
-) -> Result<(), BackupError> {
-    let aside = data_dir.join(format!(".pre-import-swap-{}", std::process::id()));
-    // 【绝不能直接删掉已存在的 aside】它只可能是上一次导入在替换中途失败/被强杀时留下的，
-    // 里面装的是**用户当时的原始数据**（受管条目被挪进 aside 后没来得及放回或清场）。
-    // 无条件 `remove_dir_all` 会在第二次导入时把用户仅存的那份数据销毁。
-    // 正确做法：把它**改名封存**（带时间戳，便于用户与支持人员辨认），并在结果里告知。
-    if aside.exists() {
-        let orphan = orphan_aside_path(data_dir);
-        std::fs::rename(&aside, &orphan).map_err(|e| {
-            BackupError::Land(format!(
-                "检测到上次导入遗留的数据快照 {}，但无法为它让位（{}）。\n为避免覆盖其中可能包含的你的数据，本次导入已取消；请先手工把该目录改名或移走后重试。",
-                aside.display(),
-                e
-            ))
-        })?;
-        orphaned.push(orphan.to_string_lossy().to_string());
+    data_dir: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if staging == data_dir {
+        return Err("恢复暂存目录与数据目录重合，已放弃本次提升（未做任何改动）".to_string());
     }
-    std::fs::create_dir_all(&aside)?;
+    if !staging.is_dir() {
+        return Err(format!(
+            "恢复暂存目录不存在（{}），本次提升没有任何输入",
+            staging.display()
+        ));
+    }
+    // 启动期是清掉"被取代的恢复暂存"的安全时机：此刻没有任何界面命令在跑（应用还没起来），
+    // 因此不可能有人正在往里写。只清 `.restoring.*` 形状的目录，且**跳过本次要提升的那一个**。
+    let _ = remove_superseded_restore_staging(data_dir, staging);
+
+    // 【必备条目必须齐】缺数据库就意味着这份暂存不完整。此时**绝不能**拿它去替换正式
+    // 数据：那会让用户得到"附件在、记录没了"这种自相矛盾的状态。宁可这一次不生效，
+    // 让用户重新恢复一次。
+    if !staging.join(ENTRY_DATABASE).is_file() {
+        return Err(format!(
+            "恢复暂存目录里没有 {}，这份暂存不完整，本次提升已放弃（你的现有数据未被改动）",
+            ENTRY_DATABASE
+        ));
+    }
+
+    let aside = data_dir.join(format!(".pre-restore-promote-{}", std::process::id()));
+    // 【绝不能直接删掉已存在的 aside】它只可能是上一次启动期提升中途失败/断电时留下的，
+    // 里面装的是**用户当时的原始数据**（受管条目被挪进 aside 后没来得及放回或清场）。
+    // 无条件删掉它等于把用户仅存的那份数据销毁。这里选择**停手并如实报告**：提升本身
+    // 可以晚一次启动再做，用户的数据只有一份。
+    if aside.exists() {
+        return Err(format!(
+            "检测到上次提升中途失败留下的数据快照 {}（里面是替换前的原始数据）。\
+             为避免覆盖它，本次提升已放弃、你的现有数据未被改动；\
+             请先确认该目录内容，把它移走后重启应用即可重试。",
+            aside.display()
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(&aside) {
+        return Err(format!("无法创建替换用的过渡目录 {}：{}", aside.display(), e));
+    }
 
     let mut moved_aside: Vec<String> = Vec::new();
     let mut placed: Vec<String> = Vec::new();
@@ -1151,15 +1354,15 @@ fn swap_managed_entries(
         if !from.exists() {
             continue;
         }
-        if let Err(e) = std::fs::rename(&from, aside.join(name)) {
+        if let Err(e) = rename(&from, &aside.join(name)) {
             // 回滚：把已挪走的放回原位。
             let restored = restore_from_aside(&aside, data_dir, &moved_aside, false);
-            return Err(BackupError::Land(format!(
-                "无法替换 {}：{}。这通常是因为应用仍占用该文件。{}",
+            return Err(format!(
+                "无法让位 {}：{}。{}",
                 name,
                 e,
                 rollback_note(restored, &aside)
-            )));
+            ));
         }
         moved_aside.push((*name).to_string());
     }
@@ -1170,23 +1373,26 @@ fn swap_managed_entries(
         if !from.exists() {
             continue;
         }
-        if let Err(e) = std::fs::rename(&from, data_dir.join(name)) {
+        if let Err(e) = rename(&from, &data_dir.join(name)) {
             // 回滚：先撤掉本次已放上去的，再把 aside 里的原样放回。
             for p in placed.iter().rev() {
                 let _ = remove_any(&data_dir.join(p));
             }
             let restored = restore_from_aside(&aside, data_dir, &moved_aside, true);
-            return Err(BackupError::Land(format!(
+            return Err(format!(
                 "放置 {} 失败：{}。{}",
                 name,
                 e,
                 rollback_note(restored, &aside)
-            )));
+            ));
         }
         placed.push((*name).to_string());
     }
 
     // ---- 步骤 3：清场 ----
+    // 暂存已被逐条搬空，把这个空壳收掉（清不掉也不影响正确性：标记马上会被清除，
+    // 而下次提交恢复时会按名字前缀把它当无主残渣清掉）。
+    let _ = std::fs::remove_dir_all(staging);
     let _ = std::fs::remove_dir_all(&aside);
     Ok(())
 }
@@ -1295,23 +1501,6 @@ fn build_pre_restore_backup(
     }
 }
 
-/// 为上次遗留的 `aside` 生成一个带时间戳的封存路径（**不删除**，只改名）。
-fn orphan_aside_path(data_dir: &Path) -> PathBuf {
-    let name = data_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "appdata".to_string());
-    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let mut p = parent.join(format!(".{}.orphan-import-data-{}", name, stamp));
-    let mut n = 1;
-    while p.exists() {
-        p = parent.join(format!(".{}.orphan-import-data-{}-{}", name, stamp, n));
-        n += 1;
-    }
-    p
-}
-
 fn staging_dir(data_dir: &Path) -> PathBuf {
     let name = data_dir
         .file_name()
@@ -1412,6 +1601,101 @@ pub fn digest_of(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // 自证测试：本任务的验收要求就是"这 6 件事必须被实测证明"，而不是读代码推断。
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 测试专用：把"运行期提交 + 启动期提升"这两步接起来
+// ---------------------------------------------------------------------------
+
+/// 测试里"模拟重启"的那一步：在**没有任何数据库连接**的状态下执行启动期提升。
+///
+/// # 为什么测试必须走真实入口，而不是直接调 `promote_staged_restore`
+///
+/// 因为真正要证明的是**这两个阶段接得上**：运行期写的标记内容、标记的位置、提升函数
+/// 收到的参数、失败时标记是否被保留。直接调提升函数会把这一整段接线绕过去，于是
+/// "标记写错了字段"这类缺陷在测试里永远抓不到（真机上表现为"重启后什么都没发生"）。
+/// 因此这里调的是与 `app/setup.rs` 同一个入口 `migration_pending::run_startup_takeover`。
+#[cfg(test)]
+fn simulate_restart(marker_dir: &Path) -> crate::migration_pending::TakeoverOutcome {
+    crate::migration_pending::run_startup_takeover(marker_dir, &mut |pending| {
+        assert_eq!(
+            pending.kind,
+            crate::migration_pending::PendingKind::LocalRestore,
+            "恢复写下的标记必须是 LocalRestore 种类（否则启动期会用错提升函数）"
+        );
+        promote_staged_restore(&pending.staging_dir, &pending.target_dir)
+    })
+}
+
+/// 断言一次恢复**确实被提交**了，并模拟重启把它落地。
+///
+/// 返回提升结果，供调用方按需继续断言（例如"提升失败时标记仍在"）。
+#[cfg(test)]
+fn commit_and_restart(rep: &RestoreReport, data_dir: &Path) -> crate::migration_pending::TakeoverOutcome {
+    assert!(
+        rep.restart_required,
+        "恢复必须告诉用户需要重启（这是它生效的唯一途径）"
+    );
+    assert!(
+        rep.deferred_until_restart,
+        "恢复成功路径必须已提交为待生效状态"
+    );
+    let marker = rep
+        .pending_marker_path
+        .as_deref()
+        .expect("提交成功必须给出标记路径，否则用户无从判断重启后会发生什么");
+    assert!(
+        Path::new(marker).is_file(),
+        "标记必须真的落盘（它是下次启动唯一能知道有活要干的凭据）：{}",
+        marker
+    );
+    simulate_restart(marker_dir_for(data_dir).as_path())
+}
+
+/// 递归收集一份目录树里每个文件的 sha256（键为相对 `root` 的路径）。
+///
+/// 提到这里是因为三个测试模块都要用它；`mod tests` 里那份是同名副本（它早于本函数存在，
+/// 且被大量用例直接调用，保留它可避免无谓的改动面）。
+#[cfg(test)]
+fn collect_digests(path: &Path, root: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+    if path.is_dir() {
+        let mut children: Vec<PathBuf> = std::fs::read_dir(path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        children.sort();
+        for c in children {
+            collect_digests(&c, root, out);
+        }
+    } else if path.is_file() {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.insert(
+            rel,
+            crate::services::backup::format::sha256_file(path).unwrap_or_default(),
+        );
+    }
+}
+
+/// 测试用的原生标记目录：放在数据目录同级的 `native-<数据目录名>` 下。
+///
+/// 真实环境里它是 `app.path().app_data_dir()`（由 identifier 推导、位置稳定、**永远不是**
+/// 被替换的那个目录）。测试里也必须保持"它不是数据目录、也不是它的子目录"这一条，
+/// 否则"标记住在待替换目录里"这种错误设计会被测试放过。
+#[cfg(test)]
+fn marker_dir_for(data_dir: &Path) -> PathBuf {
+    let name = data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "appdata".to_string());
+    data_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("native-{}", name))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1526,6 +1810,8 @@ mod tests {
         out
     }
 
+    /// 递归收集每个文件的 sha256（按相对路径）。在 `mod tests` 内可见；
+    /// 其他测试模块用下面 `#[cfg(test)] fn collect_digests` 的那个同名入口。
     fn collect_digests(
         path: &Path,
         root: &Path,
@@ -1704,8 +1990,14 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive.clone(),
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        let outcome = commit_and_restart(&report, &data);
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+            "模拟重启必须成功完成提升，实际 {outcome:?}"
+        );
 
         assert!(
             report.pre_restore_backup.is_some(),
@@ -1954,8 +2246,10 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        commit_and_restart(&report, &data.clone());
         assert_eq!(report.format_version, 1);
         assert_eq!(report.exported_app_version, "");
         assert_eq!(count_of(&data.join("clipboard.db"), "clipboard_history"), 1);
@@ -2009,11 +2303,25 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .expect("含未知字段的包必须能导入（旧版读新版的场景）");
         assert_eq!(report.format_version, 1);
         assert_eq!(report.counts.entries, 0);
-        assert!(data.join("clipboard.db").is_file());
+        // 提交之后、重启之前，新数据库还在暂存里等下次启动上位——这是设计，不是"数据
+        // 没恢复"。因此这里断言的是**暂存目录里那份**（它是否被正确组装），随后模拟重启
+        // 断言它真的到位。这条测试的数据目录在构造时是空的，因此不能假设正式位置有库。
+        let staging = PathBuf::from(report.pending_staging_dir.clone().unwrap());
+        assert!(
+            staging.join("clipboard.db").is_file(),
+            "组装好的新库必须在暂存目录里等着上位：{}",
+            staging.display()
+        );
+        simulate_restart(&marker_dir_for(&data));
+        assert!(
+            data.join("clipboard.db").is_file(),
+            "重启后正式位置的库必须已被替换"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2079,6 +2387,7 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .expect("未知条目必须被跳过而不是让整包失败");
         assert!(
@@ -2086,6 +2395,7 @@ mod tests {
             "必须如实告知用户跳过了什么，实际 warnings={:?}",
             report.warnings
         );
+        commit_and_restart(&report, &data.clone());
         // 数据库照常恢复
         let conn = Connection::open(data.join("clipboard.db")).unwrap();
         let kept: i64 = conn
@@ -2208,6 +2518,7 @@ mod tests {
             let err = restore_backup(&RestoreRequest {
                 data_dir: data.clone(),
                 archive_path: archive,
+                pending_marker_dir: Some(marker_dir_for(&data.clone())),
             })
             .unwrap_err();
             assert_eq!(err.code(), "foreign_app", "必须明确拒绝（app={}）", app);
@@ -2242,6 +2553,7 @@ mod tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap_err();
         assert_eq!(err.code(), "foreign_app");
@@ -2266,6 +2578,7 @@ mod tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: bad,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap_err();
         assert_eq!(err.code(), "invalid_zip");
@@ -2306,6 +2619,7 @@ mod tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: tampered,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap_err();
         assert_eq!(err.code(), "checksum_mismatch", "篡改必须被校验和抓出");
@@ -2323,6 +2637,7 @@ mod tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: truncated,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap_err();
         assert!(
@@ -2336,7 +2651,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 断言没有残留的暂存/临时目录（失败即清场的证据）。
+    /// 断言没有残留的**替换现场**类临时目录（失败即清场的证据）。
+    ///
+    /// 【只查替换现场，不查 `.restoring.`】后者是**待提升的暂存目录**，在"已提交、还没
+    /// 重启"这段窗口里它**必须存在**——那正是本次恢复的载体。把它算作残留会让这条断言
+    /// 与设计直接冲突（也让"用户不重启就一直占着磁盘"这个真实行为无法被断言）。
+    /// 走完 `commit_and_restart` 的测试里它是空的；专门验证"提交后未重启"的测试则反过来
+    /// 断言它**在**。暂存残留另有一条更精确的判据，见 `only_the_latest_restore_staging_survives`。
     fn assert_no_staging_left(data_dir: &Path) {
         let parent = data_dir.parent().unwrap();
         let leftovers: Vec<String> = std::fs::read_dir(parent)
@@ -2344,9 +2665,9 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| {
-                n.contains(".restoring.")
-                    || n.contains(".tmp-")
+                n.contains(".tmp-")
                     || n.contains(".pre-import-swap-")
+                    || n.contains(".pre-restore-promote-")
                     || n.contains(".writing-")
             })
             .collect();
@@ -2396,8 +2717,10 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        commit_and_restart(&report, &data.clone());
 
         // 游标被重置（包里的 1234567 不得留下来）
         let conn = Connection::open(data.join("clipboard.db")).unwrap();
@@ -2472,8 +2795,10 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        commit_and_restart(&report, &data.clone());
 
         let backup = PathBuf::from(report.pre_restore_backup.expect("必须有导入前备份"));
         assert!(backup.is_dir());
@@ -2528,8 +2853,10 @@ mod tests {
         restore_backup(&RestoreRequest {
             data_dir: other_data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&other_data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&other_data.clone()));
 
         let conn = Connection::open(other_data.join("clipboard.db")).unwrap();
         let content: String = conn
@@ -2606,8 +2933,10 @@ mod tests {
         restore_backup(&RestoreRequest {
             data_dir: other_data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&other_data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&other_data.clone()));
 
         let conn = Connection::open(other_data.join("clipboard.db")).unwrap();
         let value: String = conn
@@ -2835,8 +3164,10 @@ mod tests {
         restore_backup(&RestoreRequest {
             data_dir: other_data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&other_data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&other_data.clone()));
 
         // 磁盘那一份
         assert!(
@@ -2884,8 +3215,10 @@ mod tests {
         restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&data.clone()));
 
         assert_eq!(
             std::fs::read(data.join("datapath.txt")).unwrap(),
@@ -2924,6 +3257,7 @@ mod tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap_err();
         assert_eq!(err.code(), "format_too_new");
@@ -2998,6 +3332,7 @@ mod tests {
         let report = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .expect("恶意包应被安全处理（净化后继续），而不是 panic");
 
@@ -3021,12 +3356,18 @@ mod tests {
         assert!(suspicious.is_empty(), "父目录出现逃逸产物：{:?}", suspicious);
 
         // ---- 净化后的背景图应落在 background/ 内，且用的是被剥离后的文件名 ----
+        //
+        // 注意断言的是**暂存目录**里那一份：受管条目的交换推迟到下次启动（这样才不用在
+        // 运行期去改名一个被打开的库）。断言的位置从"正式目录"移到"暂存目录"，检查的
+        // 事实没有变少——净化是否把文件限制在 background/ 内，看的就是这份组装结果。
+        let staging = PathBuf::from(report.pending_staging_dir.clone().unwrap());
         assert!(
-            data.join("background").join("pwned.exe").is_file(),
-            "净化后应把文件限制在 data_dir/background/ 内"
+            staging.join("background").join("pwned.exe").is_file(),
+            "净化后应把文件限制在 <暂存>/background/ 内：{}",
+            staging.display()
         );
         assert_eq!(
-            std::fs::read(data.join("background").join("pwned.exe")).unwrap(),
+            std::fs::read(staging.join("background").join("pwned.exe")).unwrap(),
             payload
         );
 
@@ -3036,7 +3377,10 @@ mod tests {
             "必须告知用户跳过了不安全的映射键，实际 warnings={:?}",
             report.warnings
         );
-        let conn = Connection::open(data.join("clipboard.db")).unwrap();
+        // 受管条目的交换在下次启动发生，所以这里读**暂存目录**里那份组装结果：
+        // "改写后的背景路径不得含 `..`" 检查的是改写逻辑，与它此刻停在哪里无关。
+        let staging = PathBuf::from(report.pending_staging_dir.clone().unwrap());
+        let conn = Connection::open(staging.join("clipboard.db")).unwrap();
         let v: String = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = 'app.custom_background'",
@@ -3068,11 +3412,14 @@ mod tests {
 
         let mut digests = Vec::new();
         for _ in 0..3 {
-            restore_backup(&RestoreRequest {
+            let report = restore_backup(&RestoreRequest {
                 data_dir: data.clone(),
                 archive_path: archive.clone(),
+                pending_marker_dir: Some(marker_dir_for(&data.clone())),
             })
             .unwrap();
+            // 每一轮都"重启一次"，这才是用户实际经历的时序（点恢复 → 重启 → 再点恢复）。
+            commit_and_restart(&report, &data);
             digests.push(digest_managed(&data));
         }
         assert_eq!(digests[0], digests[1], "第二次导入必须与第一次结果一致");
@@ -3146,8 +3493,10 @@ mod tests {
         restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&data.clone()));
 
         assert!(
             !data.join("attachments").join("extra.png").exists(),
@@ -3272,6 +3621,7 @@ mod rollback_tests {
         let err = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: bad,
+            pending_marker_dir: Some(root.join("native")),
         })
         .unwrap_err();
         assert_eq!(err.code(), "invalid_zip");
@@ -3280,9 +3630,14 @@ mod rollback_tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains(".restoring.") || n.contains(".tmp-") || n.contains(".pre-import-swap-"))
+            .filter(|n| n.contains(".restoring.") || n.contains(".tmp-") || n.contains(".pre-import-swap-") || n.contains(".pre-restore-promote-"))
             .collect();
         assert!(leftovers.is_empty(), "失败后不得残留暂存目录：{:?}", leftovers);
+        // 而且**什么都没被提交**：重启不会有任何举动（失败必须是干净的失败）。
+        assert!(
+            crate::migration_pending::read(&root.join("native")).is_none(),
+            "失败路径绝不允许留下待接管标记"
+        );
         // 且数据未被改动
         assert_eq!(std::fs::read(data.join("clipboard.db")).unwrap(), b"x");
 
@@ -3360,8 +3715,10 @@ mod reviewer_fix_tests {
         let rep = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: a1,
+            pending_marker_dir: Some(marker_dir_for(&data.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&data));
         let bg_dir_file = {
             let c = Connection::open(data.join("clipboard.db")).unwrap();
             let v: String = c
@@ -3417,8 +3774,10 @@ mod reviewer_fix_tests {
         restore_backup(&RestoreRequest {
             data_dir: dest.clone(),
             archive_path: a2,
+            pending_marker_dir: Some(marker_dir_for(&dest.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&dest.clone()));
         let c = Connection::open(dest.join("clipboard.db")).unwrap();
         let v: String = c
             .query_row(
@@ -3508,10 +3867,20 @@ mod reviewer_fix_tests {
     }
 
     // =================================================================
-    // A3：孤儿 aside 必须被**改名封存**而非删除
+    // A3：启动期提升遇到"上次失败留下的替换现场"必须停手，而不是覆盖它
     // =================================================================
+    /// 提升中途失败/断电留下的 `.pre-restore-promote-<pid>` 里装的是**替换前的原始数据**。
+    ///
+    /// 【为什么这条是本模块最不能出错的一条】那个目录里的东西是"用户数据最后一次出现在
+    /// 正式位置时的样子"。若下一次提升无条件删除它再重来，用户仅存的那份原始数据就没了；
+    /// 若下一次提升无视它继续搬，替换过程会与残留混在一起，得到无法解释的状态。
+    /// 因此正确行为是**停手**：这一次不提升，如实告诉用户现场在哪，让他先确认。
+    ///
+    /// 与旧实现的关系：旧实现在运行期交换，遇到孤儿 aside 时是"改名封存 + 继续本次导入"。
+    /// 现在交换发生在启动期、且**已经失败过一次**（否则不会有 aside），继续往前推的价值
+    /// 远小于"先把现场交给用户看"——提升可以晚一次启动再做，用户的数据只有一份。
     #[test]
-    fn orphan_aside_is_preserved_not_deleted() {
+    fn a_leftover_swap_site_stops_the_promotion_instead_of_being_overwritten() {
         let root = tmp("orphan");
         let data = root.join("com.tieznext");
         seed(&data);
@@ -3523,35 +3892,60 @@ mod reviewer_fix_tests {
         })
         .unwrap();
 
-        // 伪造"上次导入崩溃留下的 aside"（当前 pid 的那个名字）
-        let aside = data.join(format!(".pre-import-swap-{}", std::process::id()));
-        std::fs::create_dir_all(&aside).unwrap();
-        std::fs::write(aside.join("clipboard.db"), b"ORPHAN-USER-DATA").unwrap();
-
         let rep = restore_backup(&RestoreRequest {
             data_dir: data.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
         })
         .unwrap();
+        assert!(rep.restart_required);
 
-        // 原 aside 名已不存（被改名），但其**内容**必须还在磁盘上
-        assert!(!aside.exists(), "原 aside 名应已被改名");
-        let preserved: Vec<PathBuf> = std::fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.to_string_lossy().contains(".orphan-import-data-"))
-            .collect();
-        assert_eq!(preserved.len(), 1, "必须留下恰好一份封存快照");
+        // 伪造"上次提升中途失败留下的替换现场"，里面是用户当时的原始数据。
+        let aside = data.join(format!(".pre-restore-promote-{}", std::process::id()));
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("clipboard.db"), b"ORIGINAL-USER-DATA").unwrap();
+        let before_db = std::fs::read(data.join("clipboard.db")).unwrap();
+
+        // 模拟重启：提升必须**停手**，不能覆盖那个现场
+        let outcome = simulate_restart(&marker_dir_for(&data));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Failed { .. }),
+            "存在上次失败留下的替换现场时必须停手，实际 {outcome:?}"
+        );
         assert_eq!(
-            std::fs::read(preserved[0].join("clipboard.db")).unwrap(),
-            b"ORPHAN-USER-DATA",
-            "封存快照里的用户数据必须完整保留（修复前会被删除）"
+            std::fs::read(aside.join("clipboard.db")).unwrap(),
+            b"ORIGINAL-USER-DATA",
+            "替换现场里的原始数据必须一字未改（那是用户仅存的那一份）"
+        );
+        assert_eq!(
+            std::fs::read(data.join("clipboard.db")).unwrap(),
+            before_db,
+            "正式数据也不得被改动"
         );
         assert!(
-            rep.warnings.iter().any(|w| w.contains("遗留的数据快照")),
-            "必须告知用户存在遗留快照，实际={:?}",
-            rep.warnings
+            crate::migration_pending::marker_path(&marker_dir_for(&data)).is_file(),
+            "提升失败必须保留标记与暂存：下次启动才有第二次机会"
+        );
+        match outcome {
+            crate::migration_pending::TakeoverOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains(&aside.to_string_lossy().to_string()),
+                    "必须把现场位置告知用户，实际={reason}"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // 用户确认并移走现场之后，下一次启动必须照常完成提升（不能因为失败过一次就永久卡住）
+        std::fs::remove_dir_all(&aside).unwrap();
+        let outcome = simulate_restart(&marker_dir_for(&data));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+            "现场移走后下一次启动必须能完成提升，实际 {outcome:?}"
+        );
+        assert!(
+            !crate::migration_pending::marker_path(&marker_dir_for(&data)).exists(),
+            "提升成功后标记必须清除"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3587,10 +3981,13 @@ mod reviewer_fix_tests {
         let a1 = archive.clone();
         let d2 = data.clone();
         let a2 = archive.clone();
+        let m1 = marker_dir_for(&data);
+        let m2 = marker_dir_for(&data);
         let h1 = std::thread::spawn(move || {
             restore_backup(&RestoreRequest {
                 data_dir: d1,
                 archive_path: a1,
+                pending_marker_dir: Some(m1),
             })
             .map(|_| ())
         });
@@ -3598,6 +3995,7 @@ mod reviewer_fix_tests {
             restore_backup(&RestoreRequest {
                 data_dir: d2,
                 archive_path: a2,
+                pending_marker_dir: Some(m2),
             })
             .map(|_| ())
         });
@@ -3612,13 +4010,34 @@ mod reviewer_fix_tests {
             "并发导入后数据库必须仍在（修复前会被销毁）"
         );
         assert_eq!(count(&data.join("clipboard.db"), "clipboard_history"), 1);
-        let leftovers: Vec<String> = std::fs::read_dir(&root)
+        // 两次提交各自留下待提升的暂存（**这是设计**：它们等着下次启动生效，而不是
+        // 在运行期被交换）。但它们必须能在启动期被安全提升掉，见下面的重启。
+        let pending_count = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains(".restoring.") || n.contains(".pre-import-swap-"))
-            .collect();
-        assert!(leftovers.is_empty(), "不得残留暂存目录：{:?}", leftovers);
+            .filter(|e| e.file_name().to_string_lossy().contains(".restoring."))
+            .count();
+        assert_eq!(
+            pending_count, 1,
+            "无论提交过几次，只允许存在**一个**待提升的暂存目录（后一次取代前一次），\
+             否则用户无法判断重启后到底会上位哪一份"
+        );
+
+        // 模拟重启：并发期间的两次提交必须能被干净地提升落地
+        for d in [&data] {
+            let outcome = simulate_restart(&marker_dir_for(d));
+            assert!(
+                matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+                "启动期提升必须成功，实际 {outcome:?}"
+            );
+        }
+        assert!(
+            !std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".restoring.")),
+            "提升成功后暂存目录与替换现场都必须消失"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3679,8 +4098,10 @@ mod reviewer_fix_tests {
         restore_backup(&RestoreRequest {
             data_dir: dest.clone(),
             archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&dest.clone())),
         })
         .unwrap();
+        simulate_restart(&marker_dir_for(&dest.clone()));
 
         let c = Connection::open(dest.join("clipboard.db")).unwrap();
         let got: String = c
@@ -3745,6 +4166,782 @@ mod reviewer_fix_tests {
             .filter(|n| n.contains(".writing-"))
             .collect();
         assert!(leftovers.is_empty(), "不得残留临时输出：{:?}", leftovers);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// 两阶段备份恢复（提交 → 重启提升）的专项测试。
+///
+/// # 这一组测试在守什么
+///
+/// 恢复的**交换**必须推迟到下次启动、在打开数据库之前完成——因为应用自己正打开着
+/// `clipboard.db`，而 Windows 不允许改名已打开的文件。旧实现在运行期直接改名，真机上
+/// 必然报"文件被占用"。
+///
+/// 因此这里逐条守住：提交是否真的可被重启落地、被占用时是否不再报错、二次提交的语义、
+/// 残留暂存是否安全、提升失败是否可原地回滚。
+///
+/// # 本机测得到什么、测不到什么（**不要把这些测试当成真机证据**）
+///
+/// - **本机（Linux/WSL2）测得到**：提交/提升两阶段是否接得上、标记内容与位置是否正确、
+///   失败时标记与数据是否保持、二次提交的取代规则、提升失败是否原地回滚。这些是**逻辑
+///   正确性**，与平台无关。
+/// - **本机测不到**：「Windows 真的不允许改名一个已打开的文件」。Linux 允许改名已打开的
+///   文件（`rename(2)` 只动目录项），所以"持有连接 ⇒ rename 失败"这个前提在这里**原理上
+///   造不出来**。本组的失败路径一律通过**注入改名器**（`promote_staged_restore_with`）
+///   来确定性地复现，而不是假装自己复现了平台行为。真机验证清单见任务交付说明。
+#[cfg(test)]
+mod two_phase_restore_tests {
+    use super::*;
+    use crate::services::backup::export::{create_backup, BackupRequest};
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tiez-2phase-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 造一个"用过的"数据目录：真实 schema + 可辨认的记录。
+    fn seed_data_dir(root: &Path, rows: usize) -> PathBuf {
+        let data = root.join("com.tieznext");
+        std::fs::create_dir_all(data.join("attachments")).unwrap();
+        let conn = Connection::open(data.join("clipboard.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;",
+        )
+        .unwrap();
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
+        crate::database::seed_defaults(&conn).unwrap();
+        for i in 0..rows {
+            conn.execute(
+                "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+                 VALUES ('text', ?1, 'x', ?2, 'p')",
+                rusqlite::params![format!("ROW-{}", i), 1000 + i as i64],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO saved_tags (name, color) VALUES ('work', '#ff0000')",
+            [],
+        )
+        .unwrap();
+        std::fs::write(data.join("attachments").join("a.png"), b"PNGDATA").unwrap();
+        std::fs::write(data.join("datapath.txt"), data.to_string_lossy().as_bytes()).unwrap();
+        std::fs::write(data.join("tiez.log"), b"log line\n").unwrap();
+        drop(conn);
+        data
+    }
+
+    fn count_rows(db: &Path) -> i64 {
+        Connection::open(db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0)))
+            .unwrap_or(-1)
+    }
+
+    fn row_contents(db: &Path) -> Vec<String> {
+        let conn = Connection::open(db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT content FROM clipboard_history ORDER BY id")
+            .unwrap();
+        let v: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        v
+    }
+
+    /// 列出现场残留（替换现场 + 恢复暂存），用于断言"清理干净"或"正确保留"。
+    fn leftovers(data_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(data_dir.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".restoring.") || n.contains(".pre-restore-promote-"))
+            .collect()
+    }
+
+    // =================================================================
+    // ① 端到端：导出 → 改坏原数据 → 恢复 → **模拟重启** → 数据回到导出时
+    // =================================================================
+    /// 这是"重启后数据真的到位了"的正面证据，而不是"写了个标记"。
+    ///
+    /// 时序完全按用户真机上的样子走：先导出、再把原数据改坏（换机/误删的场景）、
+    /// 然后点恢复、再重启。断言的是重启**之后**正式位置的内容。
+    #[test]
+    fn end_to_end_restore_is_actually_effective_after_a_simulated_restart() {
+        let root = tmp("e2e");
+        let data = seed_data_dir(&root, 5);
+        let archive = root.join("snapshot.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+        let before_rows = row_contents(&data.join("clipboard.db"));
+        assert_eq!(before_rows.len(), 5);
+
+        // 把原数据改坏：清空记录、删掉附件、塞一条垃圾进来。
+        {
+            let conn = Connection::open(data.join("clipboard.db")).unwrap();
+            conn.execute("DELETE FROM clipboard_history", []).unwrap();
+            conn.execute(
+                "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+                 VALUES ('text', 'STALE-AFTER-WIPE', 'x', 1, 'stale')",
+                [],
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(data.join("attachments").join("a.png")).unwrap();
+        assert_eq!(count_rows(&data.join("clipboard.db")), 1, "前置条件：原数据已被改坏");
+
+        // ---- 点恢复（运行期：只组装 + 提交）----
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .unwrap();
+        assert!(report.restart_required, "必须告诉用户要重启");
+        assert!(report.deferred_until_restart, "必须如实标记为已提交待生效");
+        assert!(
+            report.pending_staging_dir.is_some(),
+            "必须告知暂存位置（用户不重启时它就一直在那儿占磁盘）"
+        );
+
+        // 此刻**还没有生效**：正式位置仍是改坏后的那份。这条断言是"两阶段真的分开了"的证据。
+        assert_eq!(
+            count_rows(&data.join("clipboard.db")),
+            1,
+            "重启前正式数据不得被改动（交换发生在下次启动）"
+        );
+        assert!(
+            !data.join("attachments").join("a.png").exists(),
+            "重启前附件也不该凭空出现"
+        );
+
+        // ---- 模拟重启 ----
+        let outcome = simulate_restart(&marker_dir_for(&data));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+            "启动期提升必须成功，实际 {outcome:?}"
+        );
+
+        // ---- 数据真的回到了导出时的状态 ----
+        assert_eq!(
+            row_contents(&data.join("clipboard.db")),
+            before_rows,
+            "重启后记录必须与导出时逐条一致"
+        );
+        assert_eq!(
+            std::fs::read(data.join("attachments").join("a.png")).unwrap(),
+            b"PNGDATA",
+            "附件内容必须逐字节一致"
+        );
+        // 非受管但属于运行环境的文件必须**没被动过**（逐条目交换只动该动的）
+        assert!(
+            data.join("datapath.txt").is_file() && data.join("tiez.log").is_file(),
+            "datapath.txt 与日志不是受管条目，提升不该碰它们"
+        );
+        // 标记与暂存被消费干净
+        assert!(
+            !crate::migration_pending::marker_path(&marker_dir_for(&data)).exists(),
+            "提升成功后标记必须清除"
+        );
+        assert!(
+            leftovers(&data).is_empty(),
+            "提升成功后不得留下暂存或替换现场：{:?}",
+            leftovers(&data)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // ② 真机等价的失败场景：持有数据库连接时发起恢复
+    // =================================================================
+    /// **在持有连接的状态下提交恢复，不得报"文件被占用"，而应如实返回"待重启"。**
+    ///
+    /// # 本机的能力边界（必须说清楚，不能假装覆盖了）
+    ///
+    /// 真机（Windows）上"持有连接 ⇒ 改名失败"是平台行为；本机是 Linux，改名已打开的文件
+    /// 是允许的，因此这条测试**无法**在本机复现那个平台行为本身。它守的是**我们这侧的责任**：
+    /// 提交阶段**根本不去尝试改名**（一次 `rename` 都不发生）——只要这一点成立，真机上就
+    /// 不可能从这条路径冒出 `os error 32`。
+    ///
+    /// 判据是"提交阶段对正式数据零写操作"：提交前后正式数据目录的**全部条目哈希**必须完全
+    /// 不变。这比"没报错"强得多——不报错但偷偷换了一半，用户会更惨。
+    #[test]
+    fn committing_a_restore_while_holding_a_connection_reports_pending_not_occupied() {
+        let root = tmp("holding-conn");
+        let data = seed_data_dir(&root, 3);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+
+        // 【模拟真机状态】像应用启动时那样，一直持有着数据库连接不放。
+        let held = Connection::open(data.join("clipboard.db")).unwrap();
+        held.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        held.execute(
+            "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+             VALUES ('text', 'WHILE-CONNECTED', 'x', 9, 'p')",
+            [],
+        )
+        .unwrap();
+        let held_rows = count_rows(&data.join("clipboard.db"));
+
+        // 提交之前的完整快照（正式数据目录里每个文件的内容哈希）
+        let snapshot_before = {
+            let mut m: std::collections::BTreeMap<String, String> = Default::default();
+            collect_digests(&data, &data, &mut m);
+            m
+        };
+
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .expect(
+            "持有连接时提交恢复必须成功返回「待重启」，而不是报错说文件被占用——\
+             这正是旧实现在真机上的失败点",
+        );
+
+        // ① 没有报"被占用"，而是如实说"待重启"
+        assert!(report.restart_required);
+        assert!(report.deferred_until_restart);
+
+        // ② 提交阶段对正式数据零写操作
+        let snapshot_after = {
+            let mut m: std::collections::BTreeMap<String, String> = Default::default();
+            collect_digests(&data, &data, &mut m);
+            m
+        };
+        assert_eq!(
+            snapshot_after, snapshot_before,
+            "提交阶段绝不能改动正式数据目录里的任何文件（交换只允许发生在下次启动）"
+        );
+        // 连接仍然可用、数据仍在（证明我们没在它背后动过文件）
+        assert_eq!(
+            count_rows(&data.join("clipboard.db")),
+            held_rows,
+            "持有连接期间，那条记录必须还在（提交不该动它）"
+        );
+        drop(held);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // ③ 二次恢复（未重启就再恢复一次）
+    // =================================================================
+    /// **未重启就再次恢复：后一次取代前一次，只留一份待提升，且行为明确不损坏数据。**
+    ///
+    /// 明确回答"到底会发生什么"（三条缺一不可）：
+    /// 1. 第二次**不报错**（用户换一个包重来是正常操作）；
+    /// 2. 第二次**取代**第一次——重启后生效的是**第二个包**，不是两个包的混合；
+    /// 3. 第一次的暂存被清掉，磁盘上**只留一份**，用户不必猜重启后会上位哪一份。
+    #[test]
+    fn a_second_restore_before_restart_supersedes_the_first_cleanly() {
+        let root = tmp("twice");
+        // 两份内容不同的包：包 A 有 AAAA，包 B 有 BBBB
+        let src_a = root.join("src-a");
+        std::fs::create_dir_all(&src_a).unwrap();
+        let data_a = seed_data_dir(&src_a, 2);
+        {
+            let c = Connection::open(data_a.join("clipboard.db")).unwrap();
+            c.execute(
+                "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, preview)
+                 VALUES ('text','FROM-PACKAGE-A','x',10,'p')",
+                [],
+            )
+            .unwrap();
+        }
+        let archive_a = root.join("a.zip");
+        create_backup(&BackupRequest {
+            data_dir: data_a,
+            output_path: archive_a.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+
+        let src_b = root.join("src-b");
+        std::fs::create_dir_all(&src_b).unwrap();
+        let data_b = seed_data_dir(&src_b, 7);
+        let archive_b = root.join("b.zip");
+        create_backup(&BackupRequest {
+            data_dir: data_b,
+            output_path: archive_b.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+
+        // 目标数据目录（要被替换的那个）
+        let dest_root = root.join("dest");
+        std::fs::create_dir_all(&dest_root).unwrap();
+        let dest = seed_data_dir(&dest_root, 1);
+
+        // 第一次：投 A
+        let r1 = restore_backup(&RestoreRequest {
+            data_dir: dest.clone(),
+            archive_path: archive_a,
+            pending_marker_dir: Some(marker_dir_for(&dest)),
+        })
+        .unwrap();
+        let staging_a = PathBuf::from(r1.pending_staging_dir.clone().unwrap());
+        assert!(staging_a.is_dir(), "第一次的暂存必须就绪");
+
+        // 第二次（**没有重启**）：投 B
+        let r2 = restore_backup(&RestoreRequest {
+            data_dir: dest.clone(),
+            archive_path: archive_b,
+            pending_marker_dir: Some(marker_dir_for(&dest)),
+        })
+        .expect("未重启就再次恢复必须成功（用户换个包重来是正常操作）");
+
+        // ② 第二次取代第一次：磁盘上只剩一份暂存
+        assert!(
+            !staging_a.exists(),
+            "第一次的暂存必须被取代并清掉（否则用户无法判断重启后会上位哪一份）"
+        );
+        let staged: Vec<String> = leftovers(&dest)
+            .into_iter()
+            .filter(|n| n.contains(".restoring."))
+            .collect();
+        assert_eq!(staged.len(), 1, "只允许留一份待提升的暂存：{:?}", staged);
+
+        // 标记指向的就是第二次那一份
+        let marker = crate::migration_pending::read(&marker_dir_for(&dest)).expect("标记必须在");
+        assert_eq!(
+            marker.staging_dir,
+            PathBuf::from(r2.pending_staging_dir.clone().unwrap()),
+            "标记必须指向最新的那一份"
+        );
+        assert_eq!(marker.kind, crate::migration_pending::PendingKind::LocalRestore);
+
+        // 用户应被告知"上一次被取代"（否则他无从解释上一个包为什么没生效）
+        assert!(
+            r2.warnings.iter().any(|w| w.contains("上次未重启")),
+            "必须如实告知有一次未生效的恢复被取代，实际={:?}",
+            r2.warnings
+        );
+
+        // 重启：上位的是 B 的内容，不是 A+B 的混合
+        let outcome = simulate_restart(&marker_dir_for(&dest));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+            "提升必须成功，实际 {outcome:?}"
+        );
+        assert_eq!(
+            count_rows(&dest.join("clipboard.db")),
+            7,
+            "上位必须是第二个包（7 条），绝不能是两个包混在一起"
+        );
+        assert_eq!(leftovers(&dest), Vec::<String>::new(), "提升后不得留下任何残留");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // ④ 暂存残留：上次崩溃留下半个暂存目录
+    // =================================================================
+    /// **上次崩溃留下的暂存目录必须能被安全清理，然后照常完成一次新恢复。**
+    ///
+    /// 两种残留各测一遍：
+    /// - **无主残渣**：上次组装到一半就被杀，目录在、标记不在。它从未被提交，清掉不丢数据。
+    /// - **已提交但被取代**：目录在、标记指向**另一个**（后来的那次提交）。同样该清掉。
+    #[test]
+    fn crash_leftover_staging_is_cleaned_and_the_next_restore_still_works() {
+        let root = tmp("leftover");
+        let data = seed_data_dir(&root, 4);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+
+        // 造一个"上次崩溃留下的"暂存目录（名字符合形状，但不被任何标记指向）
+        let crash_leftover = root.join(format!(".{}.restoring.99999-0", "com.tieznext"));
+        std::fs::create_dir_all(&crash_leftover).unwrap();
+        std::fs::write(crash_leftover.join("clipboard.db"), b"HALF-BUILT").unwrap();
+        assert!(crash_leftover.is_dir(), "前置条件：残留目录确实存在");
+
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .expect("上次的残留不得影响这一次恢复");
+        assert!(report.restart_required, "本次恢复同样应提交为待重启生效");
+
+        assert!(
+            !crash_leftover.exists(),
+            "无主残渣必须被清掉（它从未被提交，留着只会一直占磁盘）"
+        );
+        let staged: Vec<String> = leftovers(&data)
+            .into_iter()
+            .filter(|n| n.contains(".restoring."))
+            .collect();
+        assert_eq!(staged.len(), 1, "只剩本次这一份待提升：{:?}", staged);
+
+        let outcome = simulate_restart(&marker_dir_for(&data));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Promoted { .. }),
+            "残留清理之后，本次恢复必须照常落地，实际 {outcome:?}"
+        );
+        assert_eq!(count_rows(&data.join("clipboard.db")), 4);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 标记在、暂存被用户手工删掉：**绝不能去动目标**（否则用户会"数据没了"）。
+    #[test]
+    fn a_marker_pointing_at_a_vanished_staging_never_touches_the_live_data() {
+        let root = tmp("vanished");
+        let data = seed_data_dir(&root, 4);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .unwrap();
+        let staging = PathBuf::from(report.pending_staging_dir.unwrap());
+        std::fs::remove_dir_all(&staging).unwrap(); // 用户/清理工具手工删了
+        let before = std::fs::read(data.join("clipboard.db")).unwrap();
+
+        let outcome = simulate_restart(&marker_dir_for(&data));
+        assert!(
+            matches!(outcome, crate::migration_pending::TakeoverOutcome::Failed { .. }),
+            "暂存不在时必须判失败并停手，实际 {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(data.join("clipboard.db")).unwrap(),
+            before,
+            "正式数据必须一字未改（此时若照常'让位再提升'，用户会看到数据没了）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // =================================================================
+    // ⑤ 提升失败的回滚：原地数据仍在，不能"两边都不在"
+    // =================================================================
+    /// **提升中途失败必须原地回滚：正式数据恢复成调用前的样子。**
+    ///
+    /// 用注入的改名器在**第二个条目**上失败（第一个已成功搬进 aside），这是回滚逻辑唯一
+    /// 真正被考验的情形——只失败在第一个上时什么都还没动，回滚是平凡的。
+    #[test]
+    fn a_failed_promotion_rolls_back_in_place_so_the_data_is_never_lost_from_both_sides() {
+        let root = tmp("rollback");
+        let data = seed_data_dir(&root, 6);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .unwrap();
+        let staging = PathBuf::from(report.pending_staging_dir.clone().unwrap());
+
+        // 提升前的现场：正式目录里每个受管条目的哈希
+        let before = {
+            let mut m: std::collections::BTreeMap<String, String> = Default::default();
+            for name in MANAGED_ENTRIES {
+                let p = data.join(name);
+                if p.exists() {
+                    collect_digests(&p, &data, &mut m);
+                }
+            }
+            m
+        };
+        let rows_before = count_rows(&data.join("clipboard.db"));
+
+        // 注入失败：第 2 次改名开始一律失败（第 1 次已把 clipboard.db 搬进 aside）
+        let mut calls = 0usize;
+        let mut rename = |from: &Path, to: &Path| {
+            calls += 1;
+            if calls >= 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "模拟真机：文件被占用（os error 32）",
+                ));
+            }
+            std::fs::rename(from, to)
+        };
+        let err = promote_staged_restore_with(&staging, &data, &mut rename)
+            .expect_err("注入的失败必须让提升失败，而不是静默成功");
+        assert!(
+            err.contains("无法让位"),
+            "失败原因必须说清是哪一步：{err}"
+        );
+
+        // ---- 核心断言：正式数据原地未损，暂存也还在（下次启动还能重试）----
+        let after = {
+            let mut m: std::collections::BTreeMap<String, String> = Default::default();
+            for name in MANAGED_ENTRIES {
+                let p = data.join(name);
+                if p.exists() {
+                    collect_digests(&p, &data, &mut m);
+                }
+            }
+            m
+        };
+        assert_eq!(
+            after, before,
+            "提升失败必须原地回滚：正式数据一个字节都不许少（绝不能变成'两边都不在'）"
+        );
+        assert_eq!(
+            count_rows(&data.join("clipboard.db")),
+            rows_before,
+            "正式库必须仍可读、记录数不变"
+        );
+        assert!(
+            staging.is_dir() && staging.join("clipboard.db").is_file(),
+            "失败后暂存必须保留（它是下次启动重试的唯一输入）"
+        );
+        assert!(
+            !data
+                .join(format!(".pre-restore-promote-{}", std::process::id()))
+                .exists(),
+            "回滚完整时替换现场应被清掉（数据已归位，不该留下空壳）"
+        );
+
+        // 标记仍在 → 用户重启一次仍有第二次机会
+        assert!(
+            crate::migration_pending::read(&marker_dir_for(&data)).is_some(),
+            "提升失败后标记必须保留（否则用户永远等不到重试）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 提升失败在**第一个**条目上（真机最常见：主库被占用）：什么都不该被改动。
+    #[test]
+    fn a_promotion_failing_on_the_very_first_entry_changes_nothing() {
+        let root = tmp("rollback-first");
+        let data = seed_data_dir(&root, 3);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+        let report = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: Some(marker_dir_for(&data)),
+        })
+        .unwrap();
+        let staging = PathBuf::from(report.pending_staging_dir.unwrap());
+        let before = std::fs::read(data.join("clipboard.db")).unwrap();
+
+        let mut rename = |_from: &Path, _to: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "模拟真机：主库被打开的连接占住",
+            ))
+        };
+        let err = promote_staged_restore_with(&staging, &data, &mut rename).unwrap_err();
+        assert!(err.contains("已回滚到导入前的状态"), "应如实报告已回滚：{err}");
+        assert_eq!(
+            std::fs::read(data.join("clipboard.db")).unwrap(),
+            before,
+            "第一个条目就失败时，正式数据必须一字未改"
+        );
+        assert!(
+            !leftovers(&data)
+                .iter()
+                .any(|n| n.contains(".pre-restore-promote-")),
+            "不该留下替换现场空壳，实际={:?}",
+            leftovers(&data)
+        );
+        // 但待提升的暂存**必须留下**：它是下次启动重试的唯一输入。
+        assert!(
+            staging.is_dir(),
+            "提升失败后暂存必须保留（下次启动才有第二次机会）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 残缺的暂存（没有数据库）绝不允许被提升——那会让用户得到"附件在、记录没了"。
+    #[test]
+    fn an_incomplete_staging_is_refused_by_the_promotion() {
+        let root = tmp("incomplete");
+        let data = seed_data_dir(&root, 2);
+        let staging = root.join(".com.tieznext.restoring.fake");
+        std::fs::create_dir_all(staging.join("attachments")).unwrap();
+        std::fs::write(staging.join("attachments").join("x.png"), b"X").unwrap();
+        let before = std::fs::read(data.join("clipboard.db")).unwrap();
+
+        let err = promote_staged_restore(&staging, &data)
+            .expect_err("缺数据库的暂存必须被拒绝，不能拿它替换正式数据");
+        assert!(err.contains("不完整"), "原因必须说清：{err}");
+        assert_eq!(
+            std::fs::read(data.join("clipboard.db")).unwrap(),
+            before,
+            "被拒绝时正式数据不得被改动"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 提交成功但**拿不到标记目录** ⇒ 必须如实失败并清理暂存，而不是让用户以为成功了。
+    #[test]
+    fn without_a_marker_dir_the_commit_fails_loudly_instead_of_pretending() {
+        let root = tmp("no-marker-dir");
+        let data = seed_data_dir(&root, 2);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+        let before = std::fs::read(data.join("clipboard.db")).unwrap();
+
+        let err = restore_backup(&RestoreRequest {
+            data_dir: data.clone(),
+            archive_path: archive,
+            pending_marker_dir: None,
+        })
+        .expect_err("拿不到标记目录时必须失败");
+        assert!(
+            err.to_string().contains("待接管标记"),
+            "必须说清失败原因与标记有关：{err}"
+        );
+        assert_eq!(
+            std::fs::read(data.join("clipboard.db")).unwrap(),
+            before,
+            "失败路径不得改动正式数据"
+        );
+        assert!(
+            leftovers(&data).is_empty(),
+            "失败路径不得留下暂存：{:?}",
+            leftovers(&data)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 报告里的字段名是**与前端/两处命令的契约**，必须逐字一致。
+    ///
+    /// 【为什么值得一条独立测试】`#[serde(rename_all = "camelCase")]` 漏了**不会编译
+    /// 报错**：只会让前端读到的 `restartRequired` 变成 `undefined`，于是恢复提交成功、
+    /// 提示却不弹——用户重启前看到的是"什么都没发生"，重启后看到数据变了，中间没有任何
+    /// 解释。这种缺陷在编译期与类型检查里都抓不到，只能对序列化结果下断言。
+    ///
+    /// 本仓库已有同型先例：`system_cmd::migration_pristine_tests` 里那条
+    /// `progress_payload_uses_the_contract_field_names`。
+    #[test]
+    fn restore_report_field_names_are_the_frontend_contract() {
+        let report = RestoreReport {
+            archive_path: "a.zip".into(),
+            format_version: 1,
+            exported_at: "t".into(),
+            exported_app_version: "0.5.6".into(),
+            pre_restore_backup: Some("bak".into()),
+            restored_files: 3,
+            restored_bytes: 42,
+            verified_entries: 4,
+            counts: ManifestCounts::default(),
+            resets_applied: vec![],
+            warnings: vec![],
+            restart_required: true,
+            deferred_until_restart: true,
+            pending_staging_dir: Some("staging".into()),
+            pending_marker_path: Some("marker.json".into()),
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        let obj = v.as_object().expect("报告必须是 JSON 对象");
+        // 前端与两个命令层读取的那几个键，一个都不能少、名字不能变。
+        for key in [
+            "restartRequired",
+            "deferredUntilRestart",
+            "pendingStagingDir",
+            "pendingMarkerPath",
+            "preRestoreBackup",
+            "restoredFiles",
+            "verifiedEntries",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "报告缺少契约字段 `{key}`（前端读不到它 → 重启提示不弹，用户以为恢复没生效）\
+                 ；实际字段={:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(obj["restartRequired"], serde_json::json!(true));
+    }
+
+    /// 只有**最新一次**提交的暂存会被提升；更早的残留不会复活。
+    #[test]
+    fn only_the_latest_restore_staging_survives() {
+        let root = tmp("latest");
+        let data = seed_data_dir(&root, 3);
+        let archive = root.join("p.zip");
+        create_backup(&BackupRequest {
+            data_dir: data.clone(),
+            output_path: archive.clone(),
+            app_version: "0.5.6".to_string(),
+        })
+        .unwrap();
+
+        // 三次提交，中间不重启
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(
+                restore_backup(&RestoreRequest {
+                    data_dir: data.clone(),
+                    archive_path: archive.clone(),
+                    pending_marker_dir: Some(marker_dir_for(&data)),
+                })
+                .unwrap(),
+            );
+        }
+        let last = last.unwrap();
+        let staged: Vec<String> = leftovers(&data)
+            .into_iter()
+            .filter(|n| n.contains(".restoring."))
+            .collect();
+        assert_eq!(staged.len(), 1, "三次提交只允许留一份待提升：{:?}", staged);
+        assert_eq!(
+            crate::migration_pending::read(&marker_dir_for(&data))
+                .unwrap()
+                .staging_dir,
+            PathBuf::from(last.pending_staging_dir.unwrap())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

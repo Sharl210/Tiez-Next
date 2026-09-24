@@ -35,8 +35,30 @@ describe("标签候补：输入为空时不展示", () => {
 });
 
 describe("标签候补：有输入才补全", () => {
-    it("输入 i → 只返回包含 i 的", () => {
+    it("输入 i → 前缀命中的排前面", () => {
         expect(selectTagSuggestions({ ...base, query: "i" })).toEqual(["ims", "img", "invoice"]);
+    });
+
+    it("前缀命中排在包含命中之前（这才是补全的语义）", () => {
+        // 用户明确说"我要的是那种**前缀相同**的"。若只按 allTags 顺序混排，
+        // 中间含 i 的会插到前缀命中之前，看起来就不像补全。
+        const r = selectTagSuggestions({
+            ...base,
+            query: "i",
+            allTags: ["work-ims", "img", "待办-i", "invoice"],
+        });
+        // img / invoice 以 i 开头 → 在前；work-ims / 待办-i 只是包含 → 在后
+        expect(r).toEqual(["img", "invoice", "work-ims", "待办-i"]);
+    });
+
+    it("中文按关键词也能搜到（包含兜底，不只是前缀）", () => {
+        const r = selectTagSuggestions({
+            ...base,
+            query: "配置",
+            allTags: ["底层ims配置下发", "配置", "别的东西"],
+        });
+        // "配置" 前缀命中在前，"底层ims配置下发" 包含命中在后
+        expect(r).toEqual(["配置", "底层ims配置下发"]);
     });
 
     it("大小写无关", () => {

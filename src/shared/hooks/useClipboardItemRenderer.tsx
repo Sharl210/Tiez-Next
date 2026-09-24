@@ -6,7 +6,7 @@ import type { Dispatch, SetStateAction, MouseEvent, ReactNode } from "react";
 import type { DragControls } from "framer-motion";
 import ClipboardItem from "../../features/clipboard/components/ClipboardItem";
 import type { QuickPasteHint } from "../../features/clipboard/types";
-import { getEntryNote, isBodyEditable, isNoteEditable } from "../../features/clipboard/types";
+import { getEntryNote, isBodyEditable, isNoteEditable, isRichBodyEditable } from "../../features/clipboard/types";
 import type { ClipboardEntry } from "../types";
 import type { Locale } from "../types";
 
@@ -130,19 +130,34 @@ export const useClipboardItemRenderer = ({
     setNoteEditError(null);
   }, []);
 
-  const saveBodyEdit = useCallback(async (id: number, newContent: string) => {
-    setBodyEditSaving(true);
-    setBodyEditError(null);
-    try {
-      await invoke("update_item_content", { id, newContent });
-      setEditingBodyId(null);
-    } catch (err) {
-      // TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳
-      setBodyEditError(`保存失败：${err?.toString() || err}`);
-    } finally {
-      setBodyEditSaving(false);
-    }
-  }, []);
+  /**
+   * R13：保存正文，富文本条目**同时**带上编辑后的 HTML。
+   *
+   * # 为什么要带第二个参数
+   *
+   * 修复之前，这个调用只送 `newContent`，后端据此把 `rich_text` 降级成 `text` 并清空
+   * `html_content` —— 也就是用户报的"编辑富文本坍缩成纯文本"。现在正文与 HTML 作为
+   * **一次写入**提交，中间不存在"正文已改、HTML 还是旧的"这个可被并发读到的状态。
+   *
+   * 非富文本条目传 `undefined`：此时后端既不写也不清 `html_content`（富文本以外的类型
+   * 本来就没有那一列的值），语义与旧行为一致。
+   */
+  const saveBodyEdit = useCallback(
+    async (id: number, newContent: string, htmlContent?: string) => {
+      setBodyEditSaving(true);
+      setBodyEditError(null);
+      try {
+        await invoke("update_item_content", { id, newContent, htmlContent });
+        setEditingBodyId(null);
+      } catch (err) {
+        // TODO(i18n): 文案暂硬编码，待 locales.ts 统一收纳
+        setBodyEditError(`保存失败：${err?.toString() || err}`);
+      } finally {
+        setBodyEditSaving(false);
+      }
+    },
+    []
+  );
 
   /**
    * R11: `update_entry_note` writes the note column only, so it is valid for every
@@ -198,10 +213,18 @@ export const useClipboardItemRenderer = ({
           } : undefined}
           isEditingBody={editingBodyId === item.id}
           bodyInitialDraft={editingBodyId === item.id ? item.content : undefined}
+          // R13: 富文本条目的初值是 **HTML**（`sanitizeHTML` 洗过），不是纯文本列。
+          // 否则用户一打开弹窗格式就已经没了 —— 那是"编辑坍缩"的前端侧根因。
+          bodyInitialHtml={
+            editingBodyId === item.id && isRichBodyEditable(item.content_type)
+              ? (item.html_content ?? "")
+              : undefined
+          }
+          bodyEditIsRich={isRichBodyEditable(item.content_type)}
           bodyEditSaving={bodyEditSaving}
           bodyEditError={editingBodyId === item.id ? bodyEditError : null}
           onBodyEditSave={isBodyEditable(item.content_type)
-            ? (newContent) => { void saveBodyEdit(item.id, newContent); }
+            ? (newContent, htmlContent) => { void saveBodyEdit(item.id, newContent, htmlContent); }
             : undefined}
           onBodyEditCancel={closeBodyEditor}
           // R11: `image` / `file` / `video` store a path or a data URL, so the body

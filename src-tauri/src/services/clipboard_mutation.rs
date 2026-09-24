@@ -284,15 +284,81 @@ pub fn apply_tag_color(
 /// 仓储层会拒绝二进制类型（`image`/`file`/`video` 的 `content` 是路径或 data URL），
 /// 这是有意为之：改写这类行的正文会让 `content_hash` 与实际载荷不一致。调用方
 /// 必须把这个错误如实返回给用户 / AI，而不是绕过。
+///
+/// R13：`html_content` 让富文本条目在改正文的同时改格式。传 `None` 表示本次不含
+/// HTML —— 富文本条目会**保留**原 HTML（这正是修复"编辑富文本坍缩成纯文本"的关键），
+/// 而不是像旧行为那样把它清空并降级成 `text`。
 pub fn apply_entry_content(
     repo: &impl ClipboardRepository,
     id: i64,
     content: &str,
+    html_content: Option<&str>,
 ) -> Result<(), String> {
     let preview = body_preview(content);
-    repo.update_entry_content(id, content, preview.as_str())
+    repo.update_entry_content(id, content, preview.as_str(), html_content)
 }
 
+/// 把一段**纯文本**转成可渲染的 HTML 片段。
+///
+/// # 为什么需要它（R13）
+///
+/// 有两个路径会把富文本条目的正文换成纯文本：AI 改写（`ai_cmd`）与外部文件被编辑后
+/// 的回写（`content_handler`）。修复降级之前，这两条路都是把 `content_type` 改成
+/// `text` 并把 `html_content` 清空。
+///
+/// 现在类型不再被偷走，于是**必须**给出一份与新正文一致的 HTML：否则渲染侧按
+/// `html_content` 画、复制走 `content`，同一条目会显示两种内容。转义 HTML 元字符是
+/// 必需的 —— 文本里出现 `<` 或 `&` 时不能被当成标签解析。
+pub fn plain_text_to_html(text: &str) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let mut out = String::with_capacity(escaped.len() + 8);
+    for line in escaped.split('\n') {
+        out.push_str("<p>");
+        out.push_str(line);
+        out.push_str("</p>");
+    }
+    out
+}
+
+/// R13：把一次正文编辑**镜像进会话态**条目。
+///
+/// # 为什么抽成函数
+///
+/// 会话态（`SessionHistory`）是内存里的条目列表，`history_cmd` 会把它**合并进首页
+/// 列表**。所以会话态与库内一旦不一致，用户看到的就是错的那一份 —— 而症状很隐蔽：
+/// 改完当轮显示正常，切窗口（重新拉库）后才"突然"变样。
+///
+/// 修复前这里有**两处**无条件降级（把 `content_type` 改成 `text`、把 `html_content`
+/// 置 `None`），于是富文本条目在界面上先显示为"没降级"、随后跳成纯文本。
+///
+/// 抽出来是为了让它可被单测直接钉住：内联在 Tauri 命令里时，这条不变量只能靠
+/// "读源码看有没有写错"，改错了没有任何测试会红。
+///
+/// # 语义
+///
+/// * `content_type` **永不改写** —— 编辑正文不是改变条目类型。
+/// * `html` 为 `None` 时不动 `html_content`（本次编辑没带 HTML，保留原有格式）。
+/// * `html` 为 `Some("")` 时清空（用户显式删光格式）。
+/// * 非富文本条目的 `html_content` 保持原样 —— 往 `text` 行写 HTML 会造出
+///   "类型与载荷不一致"的错位行。
+pub fn mirror_body_edit_in_session(
+    item: &mut crate::domain::models::ClipboardEntry,
+    content: &str,
+    preview: &str,
+    html: Option<&str>,
+) {
+    item.content = content.to_string();
+    item.preview = preview.to_string();
+    if item.content_type != "rich_text" {
+        return;
+    }
+    if let Some(h) = html {
+        item.html_content = if h.is_empty() { None } else { Some(h.to_string()) };
+    }
+}
 
 /// 设置条目备注。对所有内容类型都可用（备注不参与内容哈希）。
 pub fn apply_entry_note(
@@ -462,5 +528,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next, owned(&["B"]));
+    }
+}
+
+#[cfg(test)]
+mod r13_session_mirror_tests {
+    use super::mirror_body_edit_in_session;
+    use crate::domain::models::ClipboardEntry;
+
+    fn rich_item() -> ClipboardEntry {
+        ClipboardEntry {
+            id: 1,
+            content_type: "rich_text".to_string(),
+            content: "旧的".to_string(),
+            html_content: Some("<p>旧的</p>".to_string()),
+            source_app: "t".to_string(),
+            source_app_path: None,
+            timestamp: 0,
+            preview: "旧的".to_string(),
+            is_pinned: false,
+            tags: vec![],
+            use_count: 0,
+            is_external: false,
+            pinned_order: 0,
+            note: String::new(),
+            file_preview_exists: true,
+        }
+    }
+
+    /// 反向对照的守卫：把这里改回"降级成 text 并清空 html"（旧行为），本测试立刻变红。
+    #[test]
+    fn mirror_never_downgrades_rich_text_type() {
+        let mut item = rich_item();
+        mirror_body_edit_in_session(&mut item, "新的", "新的", Some("<p>新的</p>"));
+        assert_eq!(
+            item.content_type, "rich_text",
+            "会话态镜像绝不能把富文本条目降级成纯文本"
+        );
+        assert_eq!(item.html_content.as_deref(), Some("<p>新的</p>"));
+        assert_eq!(item.content, "新的");
+    }
+
+    #[test]
+    fn mirror_without_html_keeps_existing_format() {
+        let mut item = rich_item();
+        mirror_body_edit_in_session(&mut item, "只改正文", "只改正文", None);
+        assert_eq!(
+            item.html_content.as_deref(),
+            Some("<p>旧的</p>"),
+            "本次不带 HTML 时必须保留原格式，而不是清空"
+        );
+    }
+
+    #[test]
+    fn mirror_with_empty_html_clears_format() {
+        let mut item = rich_item();
+        mirror_body_edit_in_session(&mut item, "纯了", "纯了", Some(""));
+        assert_eq!(item.html_content, None, "显式清空应当生效");
+        assert_eq!(item.content_type, "rich_text", "清空格式不等于改类型");
+    }
+
+    #[test]
+    fn mirror_never_gives_a_text_row_an_html_payload() {
+        let mut item = rich_item();
+        item.content_type = "text".to_string();
+        item.html_content = None;
+        mirror_body_edit_in_session(&mut item, "改过", "改过", Some("<p>改过</p>"));
+        assert_eq!(
+            item.html_content, None,
+            "纯文本行不能被写入 HTML（类型与载荷必须一致）"
+        );
     }
 }

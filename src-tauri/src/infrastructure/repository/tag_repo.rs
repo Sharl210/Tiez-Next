@@ -786,7 +786,7 @@ fn r4_body_edit_is_refused_for_binary_content_types() {
         let id = seed_row(&conn_arc, original, content_type, &[]);
 
         let err = repo
-            .update_entry_content(id, "replacement text", "replacement")
+            .update_entry_content(id, "replacement text", "replacement", None)
             .expect_err("binary body edit must be refused");
         assert!(
             err.contains(content_type),
@@ -817,7 +817,7 @@ fn r4_body_edit_still_works_for_text_types() {
 
     for content_type in ["text", "code", "url"] {
         let id = seed_row(&conn_arc, "before", content_type, &[]);
-        repo.update_entry_content(id, "after", "after")
+        repo.update_entry_content(id, "after", "after", None)
             .expect("text body edit must succeed");
 
         assert_eq!(
@@ -837,7 +837,7 @@ fn r4_body_edit_still_works_for_text_types() {
 }
 
 #[test]
-fn r4_rich_text_edit_downgrades_to_text_and_clears_html() {
+fn r13_rich_text_edit_keeps_type_and_html() {
     use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 
     let conn = setup_test_db();
@@ -845,7 +845,6 @@ fn r4_rich_text_edit_downgrades_to_text_and_clears_html() {
     let repo = SqliteClipboardRepository::new(conn_arc.clone());
     let id = seed_row(&conn_arc, "rich body", "rich_text", &[]);
     {
-        // Give the row HTML so the downgrade path has something to clear.
         let conn = conn_arc.lock().unwrap();
         conn.execute(
             "UPDATE clipboard_history SET html_content = '<b>rich body</b>' WHERE id = ?1",
@@ -854,19 +853,263 @@ fn r4_rich_text_edit_downgrades_to_text_and_clears_html() {
         .unwrap();
     }
 
-    repo.update_entry_content(id, "plain now", "plain now")
+    // 只改正文、不带 HTML：这是"用户在编辑器里改了文字但没动格式"的场景。
+    repo.update_entry_content(id, "plain now", "plain now", None)
         .expect("rich_text edit must succeed");
 
-    // This is the documented, pre-existing backend behaviour the UI warns about:
-    // editing a rich-text body turns it into plain text and drops the HTML.
+    // R13：**不再降级**。曾几何时这里断言 `content_type == "text"` 且 HTML 被清空
+    // （函数名 `r4_rich_text_edit_downgrades_to_text_and_clears_html`），
+    // 那正是用户报的"编辑富文本会坍缩成纯文本"。现在反向断言：
+    // 类型保持 `rich_text`，且原有 HTML 原样留着。
     assert_eq!(
         scalar_text(
             &conn_arc,
             "SELECT content_type FROM clipboard_history WHERE id = ?1",
             id
         ),
-        "text"
+        "rich_text",
+        "editing a rich-text body must NOT downgrade the content type"
     );
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT COALESCE(html_content, '<null>') FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "<b>rich body</b>",
+        "editing a rich-text body must NOT clear html_content"
+    );
+    // 正文本身照旧被写入
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT content FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "plain now"
+    );
+}
+
+#[test]
+fn r13_rich_text_edit_recomputes_content_hash() {
+    use crate::database::calc_text_hash;
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "before", "rich_text", &[]);
+
+    repo.update_entry_content(id, "after", "after", Some("<p>after</p>"))
+        .expect("rich_text edit must succeed");
+
+    // 内容哈希必须跟着正文重算：否则去重与云同步 sync_key 会拿一个已不描述本行的
+    // 哈希去比对，导致该合并的条目并存、该同步的改动被判为相同。
+    assert_eq!(
+        scalar_int(
+            &conn_arc,
+            "SELECT content_hash FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        calc_text_hash("after") as i64,
+        "content_hash must be recomputed from the new content"
+    );
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT COALESCE(html_content, '<null>') FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "<p>after</p>",
+        "the supplied html must be persisted"
+    );
+}
+
+#[test]
+fn r13_format_only_edit_is_not_treated_as_a_no_op() {
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "same words", "rich_text", &[]);
+    {
+        let conn = conn_arc.lock().unwrap();
+        conn.execute(
+            "UPDATE clipboard_history SET html_content = '<p>same words</p>' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    // 正文一字未改，只把"同一段文字"加粗。
+    repo.update_entry_content(id, "same words", "same words", Some("<p><b>same words</b></p>"))
+        .expect("format-only edit must succeed");
+
+    // 旧短路条件（`old_content == content && content_type != "rich_text" && !has_html`）
+    // 会把"只改格式"当成无变化而丢弃；新增的 html 比较让它落盘。
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT COALESCE(html_content, '<null>') FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "<p><b>same words</b></p>",
+        "a format-only change must be persisted, not dropped as a no-op"
+    );
+}
+
+#[test]
+fn r13_unchanged_edit_is_a_true_no_op() {
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "同文", "rich_text", &[]);
+    {
+        let conn = conn_arc.lock().unwrap();
+        conn.execute(
+            "UPDATE clipboard_history SET html_content = '<p>同文</p>' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    // 正文与 HTML 都没变 -> 必须真的短路（否则每次保存都会多一次无意义的写与刷新）。
+    repo.update_entry_content(id, "同文", "同文", Some("<p>同文</p>"))
+        .expect("no-op edit must succeed");
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT COALESCE(html_content, '<null>') FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "<p>同文</p>"
+    );
+}
+
+#[test]
+fn r13_sensitive_rich_text_encrypts_html_together_with_content() {
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "秘密正文", "rich_text", &["sensitive"]);
+
+    repo.update_entry_content(id, "新的秘密", "新的秘密", Some("<p>新的秘密</p>"))
+        .expect("sensitive rich_text edit must succeed");
+
+    // 敏感条目的 HTML 必须与正文一起加密：只加密正文而 HTML 明文落库，等于
+    // 用户以为打了敏感标签，内容却仍是明文。
+    let html = scalar_text(
+        &conn_arc,
+        "SELECT COALESCE(html_content, '<null>') FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+    assert!(
+        !html.contains("新的秘密"),
+        "html_content must not be stored in plaintext for a sensitive entry, got: {}",
+        html
+    );
+}
+
+#[test]
+fn r13_rich_edit_derives_plain_content_from_html() {
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "旧的正文", "rich_text", &[]);
+
+    // 界面为了不丢格式，送的是编辑器里的 `innerHTML`。正文列必须是**派生的纯文本**，
+    // 否则粘贴与列表预览会拿到 HTML 源码，与界面显示的正文不符。
+    repo.update_entry_content(
+        id,
+        "<p>新的<b>正文</b></p>",
+        "<p>新的<b>正文</b></p>",
+        Some("<p>新的<b>正文</b></p>"),
+    )
+    .expect("rich edit must succeed");
+
+    let content = scalar_text(
+        &conn_arc,
+        "SELECT content FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+    assert!(
+        !content.contains('<'),
+        "content 必须是派生的纯文本，不能是 HTML 源码，got: {}",
+        content
+    );
+    assert!(content.contains("新的"), "got: {}", content);
+    assert!(content.contains("正文"), "got: {}", content);
+
+    // 预览同样从派生正文重算，否则列表里显示的还是旧文字。
+    let preview = scalar_text(
+        &conn_arc,
+        "SELECT preview FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+    assert!(!preview.contains("旧的"), "preview 未重算：{}", preview);
+}
+
+#[test]
+fn r13_rich_write_is_idempotent_for_repeated_saves() {
+    use crate::database::calc_text_hash;
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "同文", "rich_text", &[]);
+
+    let html = "<p>同文</p>";
+    repo.update_entry_content(id, html, html, Some(html)).unwrap();
+    let h1 = scalar_int(
+        &conn_arc,
+        "SELECT content_hash FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+    let c1 = scalar_text(
+        &conn_arc,
+        "SELECT content FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+
+    // 再存一次完全相同的 HTML：派生结果必须稳定，哈希不变。
+    repo.update_entry_content(id, html, html, Some(html)).unwrap();
+    let h2 = scalar_int(
+        &conn_arc,
+        "SELECT content_hash FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+    let c2 = scalar_text(
+        &conn_arc,
+        "SELECT content FROM clipboard_history WHERE id = ?1",
+        id,
+    );
+
+    assert_eq!(h1, h2, "派生必须是确定性的，否则去重与云同步会误判");
+    assert_eq!(c1, c2);
+    assert_eq!(h1, calc_text_hash(&c1) as i64, "哈希必须描述派生后的正文");
+}
+
+#[test]
+fn r13_text_entry_edit_never_gains_html() {
+    use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+
+    let conn = setup_test_db();
+    let conn_arc = Arc::new(Mutex::new(conn));
+    let repo = SqliteClipboardRepository::new(conn_arc.clone());
+    let id = seed_row(&conn_arc, "plain", "text", &[]);
+
+    // 对一个纯文本条目附带 HTML：不应造出"类型是 text、却带着 HTML"的错位行。
+    repo.update_entry_content(id, "changed", "changed", Some("<p>changed</p>"))
+        .expect("text edit must succeed");
+
     assert_eq!(
         scalar_int(
             &conn_arc,
@@ -874,7 +1117,15 @@ fn r4_rich_text_edit_downgrades_to_text_and_clears_html() {
             id
         ),
         1,
-        "html_content must be cleared"
+        "a text row must not gain html_content"
+    );
+    assert_eq!(
+        scalar_text(
+            &conn_arc,
+            "SELECT content_type FROM clipboard_history WHERE id = ?1",
+            id
+        ),
+        "text"
     );
 }
 

@@ -59,10 +59,33 @@ export function selectTagSuggestions({
     if (!q) return [];
 
     const existing = new Set(existingTags);
-    return allTags
-        .filter((tag) => !existing.has(tag))
-        .filter((tag) => tag.toLowerCase().includes(q))
-        .slice(0, TAG_SUGGEST_LIST_MAX);
+    const pool = allTags.filter((tag) => !existing.has(tag));
+
+    /*
+     * 【前缀匹配优先，包含匹配兜底 —— 这才是"补全"该有的行为】
+     *
+     * 用户的原话是"**类似于 tab 那种**我输了内容才进行补全列表的展示，
+     * 类似于我入了 i 那就有一个列表展示已有标签"。
+     *
+     * "tab 补全"的语义是**前缀**：输入 `i` 时先给 `ims` / `img` / `invoice` 这类
+     * **以 i 开头**的。而单纯的 `includes` 会把"中间含 i"的也混进来，且与前缀命中
+     * 混在同一个序列里，看起来就不像补全 —— 用户反馈"没有我要的那种前缀相同的"
+     * 说的正是这一点。
+     *
+     * 但只用前缀会漏掉"按关键词找标签"的用法（例如输入 `配置` 想找
+     * `底层ims配置下发`）。所以分两组：**前缀命中的排前面，包含命中的排后面**。
+     * 两组内部都保持 `allTags` 的原有顺序（它按名称排过序），结果稳定 ——
+     * 不会因为多打一个字就整体跳动。
+     */
+    const startsWithHits: string[] = [];
+    const containsHits: string[] = [];
+    for (const tag of pool) {
+        const lower = tag.toLowerCase();
+        if (lower.startsWith(q)) startsWithHits.push(tag);
+        else if (lower.includes(q)) containsHits.push(tag);
+    }
+
+    return [...startsWithHits, ...containsHits].slice(0, TAG_SUGGEST_LIST_MAX);
 }
 
 /**

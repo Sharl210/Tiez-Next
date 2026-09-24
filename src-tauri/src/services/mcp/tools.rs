@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 
 use super::store::McpStore;
 use crate::domain::models::ClipboardEntry;
+use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::services::clipboard_mutation as mutation;
 use crate::services::encryption_queue::{EncryptionAction, EncryptionJob};
 
@@ -328,7 +329,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "import_backup",
             title: "导入备份包",
-            description: "导入备份包并完全恢复数据（覆盖当前数据）。执行前后会先建立旁路备份；导入后必须重启应用才生效。破坏性操作，需 confirm: true。",
+            description: "导入备份包并完全恢复数据（覆盖当前数据）。执行前会先建立旁路备份；返回 restartRequired=true 表示数据已组装就绪、但**必须重启应用**才会真正换上新数据（交换发生在下次启动、打开数据库之前，因为应用此刻正占用着数据库文件）。请务必把这一点转达用户，不要只说「导入成功」。破坏性操作，需 confirm: true。",
             access: Access::Write,
             destructive: true,
             input_schema: obj(
@@ -597,6 +598,20 @@ pub trait HostEffects: Send + Sync {
     fn enqueue_encryption(&self, id: i64, encrypt: bool);
     /// 当前数据目录（导出与附件清理需要）。
     fn data_dir(&self) -> Option<std::path::PathBuf>;
+
+    /// 「待接管标记」的存放目录（**原生**应用数据目录）。
+    ///
+    /// # 为什么 AI 入口也需要它
+    ///
+    /// 导入备份在运行期只做"组装暂存 + 写标记"，真正的文件交换要等下次启动在
+    /// `init_db` 之前完成。因此这条链**必然**需要一个原生目录来放标记；拿不到它就不能
+    /// 提交这次导入（必须如实失败，而不是让 AI 回一句"导入成功"、用户重启后什么都没发生）。
+    ///
+    /// 默认实现返回 `None`：没有宿主的场景（单元测试、无界面）本来就没有原生数据目录，
+    /// 此时导入会明确失败并说明原因，而不是猜一个路径。
+    fn pending_marker_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     /// 当前应用版本（写进备份包 manifest）。
     fn app_version(&self) -> String;
 
@@ -1058,14 +1073,19 @@ fn adopt_session_entry(ctx: &Ctx<'_>, id: i64, action: &str) -> Result<i64, Stri
 }
 
 /// 把新正文同步回会话态（`update_entry_content` 用）。
-fn mirror_content_in_session(ctx: &Ctx<'_>, id: i64, content: &str) {
+fn mirror_content_in_session(ctx: &Ctx<'_>, id: i64, content: &str, html: Option<&str>) {
     let preview = mutation::body_preview(content);
+    let html_owned = html.map(|h| h.to_string());
     let _ = ctx.effects.session_apply(&|snapshot: &mut Vec<ClipboardEntry>| {
         let Some(item) = snapshot.iter_mut().find(|e| e.id == id) else {
             return 0;
         };
         item.content = content.to_string();
         item.preview = preview.clone();
+        // R13：会话态与库内一致 —— 只有富文本条目的 HTML 会被更新，类型不被偷走。
+        if item.content_type == "rich_text" {
+            item.html_content = html_owned.clone();
+        }
         1
     });
 }
@@ -1718,9 +1738,24 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
                 Ok(v) => v,
                 Err(e) => return ToolOutcome::failed(e),
             };
-            match mutation::apply_entry_content(&store.repo, target_id, &content) {
+            // R13：AI 通过 MCP 改正文时同样**不降级**。富文本条目要得到一份与
+            // 新正文一致的 HTML（否则界面按 HTML 画、复制走 content，两者不一致），
+            // 非富文本条目则完全不传 HTML。
+            let html_for_write: Option<String> =
+                match ClipboardRepository::get_entry_by_id(&store.repo, target_id) {
+                    Ok(Some(e)) if e.content_type == "rich_text" => {
+                        Some(mutation::plain_text_to_html(&content))
+                    }
+                    _ => None,
+                };
+            match mutation::apply_entry_content(
+                &store.repo,
+                target_id,
+                &content,
+                html_for_write.as_deref(),
+            ) {
                 Ok(()) => {
-                    mirror_content_in_session(ctx, target_id, &content);
+                    mirror_content_in_session(ctx, target_id, &content, html_for_write.as_deref());
                     ctx.effects.emit_changed();
                     ctx.effects.request_cloud_sync();
                     ToolOutcome::ok(json!({ "id": target_id, "updated": true }))
@@ -2139,6 +2174,7 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
                 &crate::services::backup::import::RestoreRequest {
                     data_dir,
                     archive_path: std::path::PathBuf::from(path.trim()),
+                    pending_marker_dir: ctx.effects.pending_marker_dir(),
                 },
             ) {
                 Ok(report) => {

@@ -87,7 +87,18 @@ pub trait ClipboardRepository {
         content: &str,
         content_type: Option<&str>,
     ) -> Result<Option<i64>, String>;
-    fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String>;
+    /// R13：写入正文，`html_content` 可同时带上富文本 HTML。
+    ///
+    /// `html_content` 的语义见 [`SqliteClipboardRepository::update_entry_content_with_conn`]：
+    /// `None` = 本次不含 HTML（富文本条目保留原 HTML，**不再降级**），
+    /// `Some("")` = 显式清空，`Some(html)` = 写入该 HTML。
+    fn update_entry_content(
+        &self,
+        id: i64,
+        content: &str,
+        preview: &str,
+        html_content: Option<&str>,
+    ) -> Result<(), String>;
     /// R6: per-entry user note. `clipboard_history.note` is the single source of truth;
     /// the note never participates in content hashing, so it can be updated for any
     /// content_type (including image/file/video whose `content` is a path).
@@ -752,29 +763,44 @@ impl SqliteClipboardRepository {
         }
     }
 
+    /// R13：写入条目正文，**可选地**同时写入富文本 HTML。
+    ///
+    /// # `html_content` 的三种含义
+    ///
+    /// * `None` —— 本次不含 HTML。富文本条目**保留**原 HTML，不改写成纯文本。
+    /// * `Some("")` —— 显式清空 HTML（纯文本条目仍是 `NULL`）。
+    /// * `Some(html)` —— 写入这份 HTML，`content_type` 保持 `rich_text`。
+    ///
+    /// # 为什么必须重算 `content_hash`
+    ///
+    /// `content_hash` 是按 `content` 算的（[`calc_text_hash`]）。改写正文却不重算，
+    /// 会让去重（`pipeline`）与云同步 `sync_key` 拿一个"已不描述本行"的哈希去比对，
+    /// 结果是两条本该合并的条目并存、或本该同步的改动被判为相同。
     pub fn update_entry_content_with_conn(
         &self,
         conn: &Connection,
         id: i64,
         content: &str,
         preview: &str,
+        html_content: Option<&str>,
     ) -> Result<(), String> {
-        let (old_content_raw, content_type, tags_json, has_html) = conn
+        let (old_content_raw, content_type, old_html_raw, tags_json) = conn
             .query_row(
-                "SELECT content, content_type, tags, (html_content IS NOT NULL) FROM clipboard_history WHERE id = ?",
+                "SELECT content, content_type, html_content, tags FROM clipboard_history WHERE id = ?",
                 params![id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, bool>(3)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .map_err(|e| e.to_string())?;
 
         let old_content = self.maybe_decrypt_text(&old_content_raw);
+        let old_html = old_html_raw.map(|h| self.maybe_decrypt_text(&h));
 
         // R4: refuse body edits when `content` is a filesystem path. Rewriting such a
         // row as text would leave the stale `content_hash` in place, so dedup /
@@ -794,32 +820,92 @@ impl SqliteClipboardRepository {
             ));
         }
 
-        // Procceed if content changed, OR if content is same but we need to transition away from rich text/clear HTML
-        if old_content == content && content_type != "rich_text" && !has_html {
+        // R13：富文本条目的 `content` 必须是**派生的纯文本**，不能是编辑器送来的
+        // `innerHTML`（形如 `<p>加粗的<b>字</b></p>`）。
+        //
+        // 界面为了不丢格式，保存时读的就是 contentEditable 的 `innerHTML`。若把它当作
+        // `content` 直接落库，粘贴与列表预览拿到的会是 HTML 源码，与界面显示的正文不符。
+        // 所以只要带了 HTML 且类型是富文本，就按捕获路径**同一口径**重新派生一次纯文本
+        // （`derive_rich_text_content`），让"复制 → 编辑 → 再复制"幂等。
+        //
+        // 派生放在短路判断**之前**：否则"正文列是 HTML、库里是纯文本"会让每次"打开就
+        // 保存"都判定为有变化，白白写一次库并触发刷新。
+        let is_rich_write = content_type == "rich_text" && html_content.is_some();
+        let derived_content: Option<String> = if is_rich_write {
+            Some(crate::services::clipboard::derive_rich_text_content(content, html_content))
+        } else {
+            None
+        };
+        let effective_content = derived_content.as_deref().unwrap_or(content);
+
+        // R13：短路条件必须把 HTML 的参与算进去。
+        //
+        // 旧条件是 `old_content == content && content_type != "rich_text" && !has_html`，
+        // 它对富文本条目**永远为假** —— 于是"打开弹窗、什么都不改、点保存"也会走完整
+        // 更新路径。反过来，只改格式（加粗、换色）而正文不变时，正文比较相等，
+        // 若不把 HTML 的差异算进去就会把用户的格式改动当"无变化"丢弃。
+        let html_changed = match html_content {
+            Some(new_html) => old_html.as_deref() != Some(new_html),
+            None => false,
+        };
+
+        if old_content == effective_content && !html_changed {
             return Ok(());
         }
+
+        // 预览也从派生后的正文重算，否则列表里显示的还是旧文字。
+        let effective_preview: String = if is_rich_write {
+            crate::services::clipboard::build_entry_preview(
+                "rich_text",
+                effective_content,
+                html_content,
+            )
+        } else {
+            preview.to_string()
+        };
+        let preview = effective_preview.as_str();
+        let content = effective_content;
 
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
         let should_encrypt = has_sensitive_tag(&tags);
 
         if is_text_type(&content_type) {
             let hash = calc_text_hash(content) as i64;
-            let new_type = if content_type == "rich_text" {
-                "text"
+
+            // 敏感条目：`html_content` 必须与 `content` 一起加密，否则正文是密文、
+            // HTML 却是明文，落库即泄露。空串仍按空串处理（不加密成密文），
+            // 这样"清空 HTML"这个语义在解密后依旧成立。
+            //
+            // `html_content` 只对富文本条目有意义：`text` / `code` / `url` 行的这一列
+            // 保持原值不变（它们本来就没写过 HTML）。若不加这一层，往一个 `text`
+            // 条目写 HTML 会造出"类型是纯文本、却带着 HTML"的行，渲染侧对待它的方式
+            // 与数据库声明的类型不一致 —— 这是比降级更难排查的一类错位。
+            let new_html_stored: Option<String> = if content_type != "rich_text" {
+                old_html.clone()
             } else {
-                &content_type
+                match html_content {
+                    // 本次不带 HTML：保留原值（含加密态），**不降级、不清空**。
+                    None => old_html.clone(),
+                    Some("") => Some(String::new()),
+                    Some(h) => Some(if should_encrypt {
+                        self.maybe_encrypt_text(h)
+                    } else {
+                        h.to_string()
+                    }),
+                }
             };
+
             if should_encrypt {
                 let encrypted_content = self.maybe_encrypt_text(content);
                 let encrypted_preview = self.maybe_encrypt_text(preview);
                 conn.execute(
-                    "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = NULL, content_type = ? WHERE id = ?",
-                    params![encrypted_content, encrypted_preview, hash, new_type, id],
+                    "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = ?, content_type = ? WHERE id = ?",
+                    params![encrypted_content, encrypted_preview, hash, new_html_stored, content_type, id],
                 ).map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = NULL, content_type = ? WHERE id = ?",
-                    params![content, preview, hash, new_type, id],
+                    "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = ?, content_type = ? WHERE id = ?",
+                    params![content, preview, hash, new_html_stored, content_type, id],
                 ).map_err(|e| e.to_string())?;
             }
             return Ok(());
@@ -1379,9 +1465,15 @@ impl ClipboardRepository for SqliteClipboardRepository {
         self.find_by_content_with_conn(&conn, content, content_type)
     }
 
-    fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String> {
+    fn update_entry_content(
+        &self,
+        id: i64,
+        content: &str,
+        preview: &str,
+        html_content: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        self.update_entry_content_with_conn(&conn, id, content, preview)
+        self.update_entry_content_with_conn(&conn, id, content, preview, html_content)
     }
 
     fn update_entry_note(&self, id: i64, note: &str) -> Result<(), String> {

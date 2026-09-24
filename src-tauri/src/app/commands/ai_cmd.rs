@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, Manager};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
+struct ChatMessage {    role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -451,9 +450,16 @@ pub async fn call_ai(
 
         // Update database only if persistence is enabled
         if persistent {
+            // R13：AI 改写返回的是**纯文本**，因此这里显式覆盖 HTML 为这一份纯文本，
+            // 而不是沿用旧行为（把 `content_type` 改成 `text` 并清空 HTML）。
+            //
+            // 区别在"用户能不能撤销"：旧行为把富文本条目**永久**降级成纯文本条目，
+            // 再编辑也回不到富文本；现在类型保持 `rich_text`，HTML 就是新文本本身，
+            // 语义等价（一份没有额外格式的富文本），而条目的类型不被偷走。
+            let plain_html = crate::services::clipboard_mutation::plain_text_to_html(&ai_response);
             state
                 .repo
-                .update_entry_content(id, &ai_response, &preview)
+                .update_entry_content(id, &ai_response, &preview, Some(plain_html.as_str()))
                 .map_err(|e| format!("Database update failed: {}", e))?;
         }
 
@@ -462,13 +468,19 @@ pub async fn call_ai(
         if let Some(session) = app_handle.try_state::<SessionHistory>() {
             let mut history = session.0.lock().unwrap();
             if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.content = ai_response.clone();
-                item.preview = preview.clone();
-                // Clear rich text so AI result is shown
-                if item.content_type == "rich_text" {
-                    item.content_type = "text".to_string();
-                    item.html_content = None;
-                }
+                // R13：不再把富文本条目降级成 `text`；类型由共享镜像函数保证不被改写。
+                let ai_html = crate::services::clipboard_mutation::plain_text_to_html(&ai_response);
+                let html_for_session = if item.content_type == "rich_text" {
+                    Some(ai_html.as_str())
+                } else {
+                    None
+                };
+                crate::services::clipboard_mutation::mirror_body_edit_in_session(
+                    item,
+                    &ai_response,
+                    &preview,
+                    html_for_session,
+                );
                 // Emit update event from session item
                 let _ = app_handle.emit("clipboard-updated", item.clone());
             } else if persistent {

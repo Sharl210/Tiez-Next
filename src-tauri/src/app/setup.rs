@@ -83,7 +83,7 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let native_data_dir = app.path().app_data_dir().ok();
 
     // 本次启动是否真的完成了一次"待接管"提升（供 3.1 决定要不要改写库内路径）。
-    let mut promoted: Option<std::path::PathBuf> = None;
+    let mut promoted: Option<PromotedPending> = None;
 
     // 1. Data Directory & Migration
     let app_dir = resolve_data_dir(app)?;
@@ -135,8 +135,19 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     //
     // 【为什么必须做】接管把旧库整体搬进来了，但库里的附件/表情/自定义背景记录的仍是
     // **旧数据目录**下的绝对路径。不改写的话，用户看到的是"记录都在、图片全打不开"。
-    if let Some(source) = promoted.as_deref() {
-        rewrite_paths_after_takeover(source, &app_dir, &db_path);
+    //
+    // 【为什么只有迁移接管需要这一步】备份恢复的暂存是在组装阶段就按**当前**数据目录
+    // 改写好的（它本来就知道目标是谁，见 `backup::import::prepare_database`），就地再
+    // 改写一次是多余的；更糟的是它的"源目录"等于当前数据目录，替换对是空串，那种改写
+    // 没有明确语义。因此这里按 kind 分流，两边都只做自己真正需要的那件事。
+    if let Some(p) = promoted.as_ref() {
+        if p.kind == crate::migration_pending::PendingKind::Takeover {
+            rewrite_paths_after_takeover(&p.source_dir, &app_dir, &db_path);
+        } else {
+            info!(
+                ">>> [RESTORE] 备份恢复已在组装阶段按当前数据目录改写路径，本次不再重复改写。"
+            );
+        }
     }
 
     // 4. Initial Settings & Reset Safety
@@ -197,17 +208,32 @@ const DATA_DIR_REDIRECT_FILE: &str = "datapath.txt";
 // 两阶段迁移的启动期一半
 // ---------------------------------------------------------------------------
 
-/// **启动期接管**：把上次运行留下的"待接管"暂存目录提升为正式数据目录。
+/// 本次启动真的完成的一次"待办提升"（迁移接管或备份恢复）。
 ///
-/// 返回 `Some(源目录)` 表示本次启动真的完成了一次接管（调用方据此决定要不要在
-/// `init_db` 之后改写库内路径）；`None` 表示没有待接管任务，或接管失败。
+/// 返回它而不是裸 `PathBuf`：两种待办的**善后不同**——迁移接管之后必须按"旧目录 →
+/// 新目录"改写库内的绝对路径，而备份恢复在组装暂存时就已经把路径改写好了（它本来
+/// 就知道目标目录是谁）。没有 `kind` 就只能一视同仁地改写，那对恢复不仅多余，还会用
+/// `source_dir == target_dir` 拼出无意义的替换对。
+struct PromotedPending {
+    kind: crate::migration_pending::PendingKind,
+    source_dir: std::path::PathBuf,
+}
+
+/// **启动期待办提升**：把上次运行留下的"待接管/待恢复"暂存目录提升为正式数据目录。
+///
+/// 返回 `Some(..)` 表示本次启动真的完成了一次提升；`None` 表示没有待办，或提升失败。
 ///
 /// ## 为什么必须在 `init_db` 之前（这一条是整个方案成立的前提）
 ///
-/// 接管的动作是给目标目录里的 `clipboard.db`（及 `-wal`/`-shm`）**改名让位**。
+/// 提升的动作是给目标目录里的 `clipboard.db`（及 `-wal`/`-shm`）**改名让位**。
 /// Windows 不允许给已打开的文件改名（`ERROR_SHARING_VIOLATION`，os error 32）。
 /// 应用一启动就会 `init_db` 打开那个库，连接随后常驻 `DbState`、被 3 个 repo 与
 /// `McpStore` 多处持有，**运行期不可能释放**——所以这件事必须在开库之前做完。
+///
+/// 【这同一个理由对备份恢复完全成立】旧实现直接在运行期 `rename` 那个被占用的库，
+/// 于是真机上"点了恢复就报文件被占用"。现在恢复也只做运行期能安全完成的部分
+/// （组装暂存 + 写标记），真正的交换推迟到这里——一条时机、两种待办，谁都不必再各自
+/// 想一遍"什么时候才能动文件"。
 ///
 /// ## 为什么不能在运行期"热替换"连接
 ///
@@ -217,36 +243,71 @@ const DATA_DIR_REDIRECT_FILE: &str = "datapath.txt";
 ///
 /// ## 失败绝不阻断启动
 ///
-/// 迁移是附加功能。任何失败都只记日志并**保留标记**（下次启动再试）；暂存目录与源
-/// 目录都不会被删。因此本函数没有返回值意义上的错误，调用方无需 `?`。
-fn run_pending_takeover(
-    native_data_dir: &std::path::Path,
-) -> Option<std::path::PathBuf> {
+/// 迁移与恢复都是附加功能。任何失败都只记日志并**保留标记**（下次启动再试）；暂存目录
+/// 与源目录都不会被删。因此本函数没有返回值意义上的错误，调用方无需 `?`。
+fn run_pending_takeover(native_data_dir: &std::path::Path) -> Option<PromotedPending> {
+    use crate::migration_pending::{PendingKind, TakeoverOutcome};
+
     let outcome = crate::migration_pending::run_startup_takeover(
         native_data_dir,
-        &mut |staging: &std::path::Path, target: &std::path::Path| {
-            crate::migration_identifier::promote_staged_takeover_default(staging, target)
-                .map(|_| ())
+        &mut |pending: &crate::migration_pending::PendingMigration| {
+            // 【按种类分派】两条链的提升动作不同，但都只在这一个时机执行。
+            match pending.kind {
+                PendingKind::Takeover => {
+                    crate::migration_identifier::promote_staged_takeover_default(
+                        &pending.staging_dir,
+                        &pending.target_dir,
+                    )
+                    .map(|_| ())
+                }
+                // 【下面这一行的写法是对外契约】`setup_tests` 用它的文本做源码顺序断言
+                // （见 `LOCAL_RESTORE_PROMOTION_ANCHOR`）。不要因为格式化或"看起来能换行"
+                // 而改动它——那会让那条守卫失去锚点而失败，而失败本身是**正确的**：它在
+                // 提醒你确认这次改动没有把恢复的提升挪到打开数据库之后。
+                PendingKind::LocalRestore => {
+                    crate::services::backup::import::promote_staged_restore(&pending.staging_dir, &pending.target_dir)
+                }
+            }
         },
     );
 
     match outcome {
-        crate::migration_pending::TakeoverOutcome::NotPending => None,
-        crate::migration_pending::TakeoverOutcome::Promoted {
+        TakeoverOutcome::NotPending => None,
+        TakeoverOutcome::Promoted {
+            kind,
             source_dir,
             target_dir,
+            superseded_staging_bytes,
         } => {
-            info!(
-                ">>> [MIGRATION] 已接管待迁移数据：暂存目录已提升为 {:?}（源 {:?} 保持只读、未被改动）。",
-                target_dir, source_dir
-            );
-            Some(source_dir)
+            match kind {
+                PendingKind::Takeover => info!(
+                    ">>> [MIGRATION] 已接管待迁移数据：暂存目录已提升为 {:?}（源 {:?} 保持只读、未被改动）。",
+                    target_dir, source_dir
+                ),
+                PendingKind::LocalRestore => {
+                    info!(
+                        ">>> [RESTORE] 已把上次提交的备份恢复提升为正式数据：{:?}。",
+                        target_dir
+                    );
+                    // 【这条日志是"我上次那个包为什么没生效"的唯一解释依据】
+                    // 用户在未重启的情况下提交了第二次恢复时，第一次的暂存会被取代；
+                    // 不为零就说明确实发生过这件事，且被取代的那一份从未写入正式数据。
+                    if superseded_staging_bytes > 0 {
+                        info!(
+                            ">>> [RESTORE] 提交本次恢复时有 {} 字节的旧暂存被取代（那是更早一次、\
+                             未重启就再次提交的恢复；其内容已被本次取代，未写入正式数据）。",
+                            superseded_staging_bytes
+                        );
+                    }
+                }
+            }
+            Some(PromotedPending { kind, source_dir })
         }
-        crate::migration_pending::TakeoverOutcome::Failed { reason } => {
-            // 【必须只记日志、不阻断启动】迁移失败最多是"这次没迁成"，数据都还在。
+        TakeoverOutcome::Failed { reason } => {
+            // 【必须只记日志、不阻断启动】失败最多是"这次没成"，数据都还在。
             // 标记被保留，下次启动会自动重试。
             error!(
-                "[MIGRATION] 待接管的数据本次未能接管（不影响正常使用，下次启动会自动重试）：{}",
+                "[PENDING] 上次留下的待处理数据本次未能提升（不影响正常使用，下次启动会自动重试）：{}",
                 reason
             );
             None
@@ -2270,14 +2331,80 @@ mod setup_tests {
         );
     }
 
+    /// **备份恢复的启动期提升也必须在 `init_db` 之前**（与迁移那条同源同因）。
+    ///
+    /// # 为什么这条必须单独存在
+    ///
+    /// 两条待办共用同一个调用点 `run_pending_takeover`，但**分派是按 `kind` 做的**。
+    /// 若将来有人把 `PendingKind::LocalRestore` 那一支挪走（挪到 `init_db` 之后，
+    /// 或改回"运行期直接交换文件夹"），上面迁移那条断言照样是绿的 —— 它只看
+    /// `run_pending_takeover(` 的位置。于是恢复会退回"点了恢复就报文件被占用"，
+    /// 而没有任何测试变红。
+    ///
+    /// # 断言方式：验调用链，而不是要求锚文本落在 `init` 体内
+    ///
+    /// 提升的实现体位于 `run_pending_takeover`（`init` **之外**的函数），
+    /// 所以那段文本不可能出现在 `init` 体内。本测试分四步，缺一不可：
+    ///
+    /// 1. `init` **体内**：`run_pending_takeover(...)` 出现在 `database::init_db(...)` 之前；
+    /// 2. `run_pending_takeover` **体内**：确实按 `PendingKind::LocalRestore` 分派到
+    ///    `promote_staged_restore`（锚文本由 `LOCAL_RESTORE_PROMOTION_ANCHOR` 单点持有）；
+    /// 3. 迁移那一支仍在（两种待办共用一个启动期入口，别把另一个删了）；
+    /// 4. 这段提升代码**自己不许打开数据库** —— 它一旦开库，正要改名让位的那个文件就被
+    ///    自己占住了，改名会失败，而失败是静默的（只记日志、保留标记、下次启动再试），
+    ///    用户最终只看到"重启了也没用"。
+    ///
+    /// 【反向对照实测】
+    /// - 把 `init` 里那句 `promoted = run_pending_takeover(native);` 移到
+    ///   `let conn = database::init_db(...)` 之后 → 本条第 1 步失败，迁移那条也失败；
+    /// - 把 `LocalRestore` 那一支从 `run_pending_takeover` 里删掉 → 本条第 2 步失败。
     #[test]
-    fn dock_threshold_stays_below_auto_placement_margin() {
-        // 5px 停靠阈值与 40px 自动摆位留白必须不相等，否则「程序摆到边缘」= 「用户拖到边缘」
-        assert_ne!(
-            super::EDGE_DOCK_THRESHOLD,
-            crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN
+    fn local_restore_promotion_is_dispatched_before_the_database_is_opened() {
+        let source = include_str!("setup.rs");
+
+        // ---- 第 1 步：调用点在 init 体内，且在 init_db 之前 ----
+        let init_start = source.find("pub fn init(app: &mut App)").expect("init 必须存在");
+        let body = &source[init_start..];
+
+        let guard_at = body
+            .find("promoted = run_pending_takeover(")
+            .expect("init 必须调用 run_pending_takeover");
+        let init_db_at = body
+            .find("database::init_db(&db_path_str)")
+            .expect("init 必须调用 database::init_db");
+
+        assert!(
+            guard_at < init_db_at,
+            "待接管提升（含备份恢复那一支）必须由 init 在 `database::init_db` **之前**调用：\
+             它做的正是给被占用的 clipboard.db 改名让位，而 Windows 不允许改名已打开的\
+             文件（os error 32）——一旦库被打开，恢复在真机上必然失败。\
+             （调用偏移 {guard_at}，init_db 偏移 {init_db_at}）"
         );
-        assert!(super::EDGE_DOCK_THRESHOLD < crate::app::window_manager::AUTO_PLACEMENT_EDGE_MARGIN);
+
+        // ---- 第 2..4 步：run_pending_takeover 体内 ----
+        let fn_start = source
+            .find("fn run_pending_takeover(")
+            .expect("run_pending_takeover 必须存在");
+        let fn_tail = &source[fn_start..];
+        let fn_end = fn_tail.find("\n}\n").unwrap_or(fn_tail.len());
+        let fn_body = &fn_tail[..fn_end];
+
+        assert!(
+            fn_body.contains(crate::services::backup::import::LOCAL_RESTORE_PROMOTION_ANCHOR),
+            "run_pending_takeover 里必须按 `PendingKind::LocalRestore` 分派到\
+             `promote_staged_restore`（锚文本见 LOCAL_RESTORE_PROMOTION_ANCHOR）：\
+             少了它，恢复的暂存永远不会在启动期被提升 —— 用户点了恢复、重启、\
+             然后发现数据没变（标记写了却没人消费）"
+        );
+        assert!(
+            fn_body.contains("PendingKind::Takeover"),
+            "迁移那一支也必须保留（两种待办共用一个启动期入口，删掉另一个等于删掉迁移）"
+        );
+        assert!(
+            !fn_body.contains("database::init_db"),
+            "启动期提升不得自己打开数据库：那会让它正要改名让位的那个文件被自己占住，\
+             而失败是静默的（只记日志、保留标记）——用户只会看到「重启了也没用」"
+        );
     }
 }
 

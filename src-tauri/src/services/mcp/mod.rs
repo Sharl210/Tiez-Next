@@ -155,6 +155,15 @@ impl tools::HostEffects for TauriEffects {
             .filter(|p| !p.as_os_str().is_empty())
     }
 
+    /// 「待接管标记」放**原生**数据目录，不是当前数据目录。
+    ///
+    /// 【为什么不能放在当前数据目录】标记要指出"下次启动该做什么"，而它自己绝不能住在
+    /// 会被这次导入换掉的那个目录里——那正是它的作用对象。原生目录由 identifier 推导、
+    /// 位置稳定。与界面命令 `system_cmd::native_data_dir` 完全同一处。
+    fn pending_marker_dir(&self) -> Option<std::path::PathBuf> {
+        self.app.path().app_data_dir().ok()
+    }
+
     fn app_version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
     }

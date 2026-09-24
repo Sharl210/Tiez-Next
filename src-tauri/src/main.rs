@@ -58,6 +58,32 @@ fn main() {
             //
             // 它**不阻塞启动**：整件事（含"软件刚启动自动备份一次"）都在后台线程，窗口先出来。
             services::auto_backup::spawn_auto_backup_service(app.handle().clone());
+
+            // macOS 的 Dock 图标：把用户上次的选择复原到系统。
+            //
+            // 【为什么必须在这里补一句】`set_dock_visible` 只负责"改的时候立刻生效 + 记住"，
+            // 而 Dock 图标的状态不落盘在系统里——重启后应用会带着图标回来，用户会以为
+            // 设置没保存。这正是 v0.5.3 那批"界面显示已生效、实际没生效"的同型缺陷。
+            //
+            // 放在 `setup::init` 之后：那时 `DbState` 已注册，能读到设置库。
+            #[cfg(target_os = "macos")]
+            {
+                use crate::infrastructure::repository::settings_repo::SettingsRepository;
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<database::DbState>() {
+                    let hidden = db
+                        .settings_repo
+                        .get("app.hide_dock_icon")
+                        .ok()
+                        .flatten()
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    if hidden {
+                        let _ = app.handle().set_dock_visibility(false);
+                    }
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -67,6 +93,10 @@ fn main() {
             app::window_manager::focus_clipboard_window,
             app::window_manager::set_navigation_enabled,
             app::window_manager::set_navigation_mode,
+            // 「把焦点还给上一个前台窗口」：粘贴后回焦用（`src/shared/lib/focus.ts`）。
+            // 命令本身一直存在且已加 `#[tauri::command]`，但从未登记到这里，
+            // 于是搜索框每次失焦都只是往控制台丢一条 not found。
+            app::window_manager::restore_last_focus,
             app::hooks::set_recording_mode,
             services::content_handler::open_content,
             services::clipboard_ops::copy_to_clipboard,
@@ -90,6 +120,9 @@ fn main() {
             app::commands::set_sequential_hotkey,
             app::commands::set_rich_paste_hotkey,
             app::commands::set_search_hotkey,
+            // 数字快速粘贴的修饰键。设置项、内存态与 Windows 钩子都早就实现了，
+            // 唯独这条写入命令从没存在过，于是设置页选了下拉框不会有任何效果。
+            app::commands::set_quick_paste_modifier,
             app::commands::set_deduplication,
             app::commands::save_setting,
             app::commands::set_ignore_blur,
@@ -114,6 +147,10 @@ fn main() {
             app::commands::get_cloud_sync_status,
             app::commands::restart_cloud_sync_client,
             app::commands::request_cloud_sync,
+            // 关闭云同步时先让后台循环退出：只写 `cloud_sync_enabled=false` 不会通知
+            // 正在跑的循环。这个包装一直缺 `#[tauri::command]`，前端调它会直接报
+            // "command not found"（见 `src/shared/hooks/useAppActions.ts`）。
+            app::commands::stop_cloud_sync_client,
             app::commands::cloud_sync_now,
             // 存量凭据外流的升级告知：只读查询 + 用户确认后落一次性标记。
             // 拆成两条命令是刻意的——标记只在用户真的看到并确认后才写，
@@ -124,6 +161,9 @@ fn main() {
             app::commands::set_file_transfer_auto_open,
             app::commands::set_arrow_key_selection,
             app::commands::set_tray_visible,
+            // macOS 专属：隐藏 Dock 图标。非 macOS 上只落设置、不做系统动作，
+            // 界面也只在 macOS 渲染这个开关。
+            app::commands::set_dock_visible,
             app::commands::set_edge_docking,
             app::commands::set_follow_mouse,
             app::commands::get_data_path,
@@ -199,6 +239,12 @@ fn main() {
             services::file_transfer::get_file_server_status,
             services::file_transfer::toggle_file_server,
             services::file_transfer::get_active_file_transfer_path,
+            // 传输页用到的三条：把粘贴板里的图片落成临时文件、按路径换一个可下载的
+            // token URL、以及改「展示给对方的 IP」。三者都早有 `#[tauri::command]`，
+            // 只是从来没登记，属于"界面点了没反应"的一类。
+            services::file_transfer::save_temp_image,
+            services::file_transfer::get_download_url,
+            services::file_transfer::set_display_ip,
             services::paste_queue::get_paste_queue,
             services::paste_queue::set_paste_queue,
             services::paste_queue::paste_next_step,

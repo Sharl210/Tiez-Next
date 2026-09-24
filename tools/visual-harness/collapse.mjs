@@ -169,6 +169,7 @@ const SABOTAGE_CSS = `
   .content-preview-shell { height: 0 !important; min-height: 0 !important; }
   .entry-body-editor-dialog, .entry-note-editor-dialog { height: 0 !important; min-height: 0 !important; padding: 0 !important; }
   .entry-body-editor-textarea, .entry-note-editor-textarea { height: 0 !important; min-height: 0 !important; }
+  [data-testid="entry-body-editor-rich"] { height: 0 !important; min-height: 0 !important; }
 `;
 
 const installSabotage = async () => {
@@ -241,7 +242,12 @@ const measureCardEvaluate = () => {
     imgNatural: img ? { w: img.naturalWidth, h: img.naturalHeight } : null,
     buttons: {
       bodyEdit: hasIcon("pencil"),
-      noteEdit: hasIcon("sticky-note"),
+      // 备注按钮的图标是 `sparkles`（与备注行前面那个 ✨ 同一个）。
+      //
+      // ⚠️ 它**曾经**是 `sticky-note`。若这里不同步，量测会报"没有备注按钮"，
+      // 而那其实是**图标换了**而不是按钮没了 —— 一次误报会把注意力引到错误的方向。
+      // 这也说明"用图标类名当判据"有代价：图标一改，判据必须跟着改。
+      noteEdit: hasIcon("sparkles"),
       open: hasIcon("external-link"),
       pin: hasIcon("pin") || hasIcon("pin-off"),
       tag: hasIcon("tag"),
@@ -264,7 +270,16 @@ const measureDialogEvaluate = () => {
   const bodyDialog = document.querySelector(".entry-body-editor-dialog");
   const noteDialog = document.querySelector(".entry-note-editor-dialog");
   const dialog = bodyDialog ?? noteDialog;
-  const ta = dialog?.querySelector("textarea");
+  /*
+   * R13：正文编辑器对**富文本**条目是 contentEditable（`[data-testid="entry-body-editor-rich"]`），
+   * 其余文本类型仍是 `<textarea>`。两者都是"输入区"，量测要覆盖到那个真的存在的那一个 ——
+   * 只查 `textarea` 会让富文本用例永远量到 null，从而报出一条**假的**"输入框高度不足"，
+   * 把"编辑器换实现"误报成"编辑器塌了"。
+   *
+   * 先找富文本编辑器，再退到 textarea：同一时刻弹窗里只会存在其中一个。
+   */
+  const ta = dialog?.querySelector('[data-testid="entry-body-editor-rich"]')
+    ?? dialog?.querySelector("textarea");
   return {
     overlay: rect(overlay),
     dialog: rect(dialog),
@@ -272,7 +287,9 @@ const measureDialogEvaluate = () => {
     /** 弹窗里的**可见**字符数 —— 空弹窗（高度归零 / 内容丢失）会掉到 0。 */
     dialogText: (dialog?.innerText ?? "").replace(/\s+/g, " ").trim().length,
     textarea: rect(ta),
-    textareaValue: ta?.value ?? null,
+    textareaValue: ta instanceof HTMLTextAreaElement ? ta.value : (ta?.textContent ?? null),
+    /** R13: 富文本编辑器是否真的用了 contentEditable（而不是退回 textarea）。 */
+    isContentEditable: !!ta?.isContentEditable,
     saving: !!dialog?.querySelector("button[disabled]"),
   };
 };

@@ -30,20 +30,19 @@ import {
     FileQuestion,
     GripVertical,
     Pencil,
-    StickyNote,
     FolderInput
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
 import { TagAssignMenu } from "./TagAssignMenu";
-import { bodyEditDowngradesFormat, getEntryNote, isNoteEditable, MAX_ENTRY_NOTE_CHARS } from "../types";
+import { getEntryNote, isNoteEditable, MAX_ENTRY_NOTE_CHARS } from "../types";
 import {
     formatSensitivePreview,
     getConciseTime,
     getTagColor,
     getTagTextColor
 } from "../../../shared/lib/utils";
-import HtmlContent from "../../../shared/components/HtmlContent";
+import HtmlContent, { sanitizeHTML } from "../../../shared/components/HtmlContent";
 import { toTauriLocalImageSrc } from "../../../shared/lib/localImageSrc";
 import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot";
 import { getFileIcon as getSystemFileIcon, peekFileIcon } from "../../../shared/lib/fileIcon";
@@ -66,6 +65,38 @@ const truncateNoteForInline = (note: string): string => {
     if (chars.length <= NOTE_INLINE_MAX_CHARS) return trimmed;
     return chars.slice(0, NOTE_INLINE_MAX_CHARS).join("") + "…";
 };
+/**
+ * R13: 把一个 `rich_text` 条目**没有** HTML 时的兜底：把纯文本按行转义成 HTML。
+ *
+ * `rich_text` 行的 `html_content` 理论上非空，但历史数据（以及导入的旧备份）里存在
+ * 只有 `content` 的行。此时把纯文本直接塞进 contentEditable 会让文本里的 `<` 被当成
+ * 标签吃掉，所以转义后再写。刻意不在这里加 `<p>` 包裹 —— 编辑器只是展示这份内容，
+ * 真正的写入以用户编辑后的 `innerHTML` 为准。
+ */
+/**
+ * R13：从富文本 HTML 里取出**纯文本正文**。
+ *
+ * `content` 列是派生的纯文本（粘贴与列表预览用的就是它）。富文本编辑器改的是 HTML，
+ * 保存时若把 `innerHTML` 当正文送去，`content` 里就会存下 `<p>…</p>` —— 用户复制出来
+ * 会看到 HTML 源码。后端以同一口径再派生一次作为权威值，这里派生是为了让界面上显示的
+ * 正文与最终落库的内容一致。
+ */
+const htmlToPlainText = (html: string): string => {
+    if (!html) return "";
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
+    doc.querySelectorAll("p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote, pre")
+        .forEach((el) => el.append("\n"));
+    return (doc.body.textContent ?? "").replace(/\n{3,}/g, "\n\n").trim();
+};
+
+const escapeHtmlForEditor = (text: string): string =>
+    text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\n/g, "<br>");
+
 const RICH_IMAGE_FALLBACK_PREFIX = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX = "-->";
 const TABULAR_RICH_HTML_RE = /<(table|tr|td|th|thead|tbody|tfoot|colgroup|col)\b/i;
@@ -727,6 +758,8 @@ const ClipboardItem = ({
     onEdit,
     isEditingBody = false,
     bodyInitialDraft,
+    bodyInitialHtml,
+    bodyEditIsRich = false,
     bodyEditSaving = false,
     bodyEditError,
     onBodyEditSave,
@@ -780,6 +813,14 @@ const ClipboardItem = ({
     const noteText = getEntryNote(item);
     const noteIsEmpty = noteText.trim().length === 0;
     const bodyEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+    /**
+     * R13: 富文本编辑器的 DOM 节点。
+     *
+     * contentEditable **必须**是非受控的：让 React 在每次 render 时重写它的内容会把
+     * 光标推到开头、打断中文输入法。所以这里只在弹窗打开时写一次初值，之后只读取
+     * `innerHTML`。`bodyDraft` 仍跟随输入更新，以便 Ctrl+Enter 与保存按钮拿到最新值。
+     */
+    const bodyEditorRichRef = useRef<HTMLDivElement | null>(null);
     const [snapshotFailed, setSnapshotFailed] = useState(false);
     const [richImageFallbackFailed, setRichImageFallbackFailed] = useState(false);
     const [sourceAppIcon, setSourceAppIcon] = useState<string | null>(() => peekSourceAppIcon(item.source_app_path) ?? null);
@@ -823,11 +864,28 @@ const ClipboardItem = ({
         if (!isEditingTags) setTagSuggestIndex(-1);
     }, [isEditingTags]);
 
+    /*
+     * 候选变化时维护高亮下标。
+     *
+     * 【为什么候选出现时要**自动高亮第一项**】
+     *
+     * 用户要的是"类似于 tab 那种"补全。而 Tab 补全的前提是**有一个默认选中项** ——
+     * 若初始下标是 -1（无高亮），用户打完 `i` 按 Tab 什么都不会发生，得先按一次
+     * 方向键才能选中，这就不像补全了。
+     *
+     * 原实现 `if (prev < 0) return -1;` 把"从未高亮"与"候选清空后保持无高亮"
+     * 混为一谈，于是下标**永远停在 -1**，方向键成了唯一进入方式。
+     * 现在改为：列表从空变非空时**自动指向 0**。
+     *
+     * 不做"每次输入都重置为 0" —— 那会让用户按方向键选中第 3 项后，
+     * 再多打一个字就被拽回第 1 项。
+     */
     useEffect(() => {
         setTagSuggestIndex((prev) => {
-            if (pickableTagSuggestions.length === 0) return -1;
-            if (prev < 0) return -1;
-            return Math.min(prev, pickableTagSuggestions.length - 1);
+            const n = pickableTagSuggestions.length;
+            if (n === 0) return -1;
+            if (prev < 0) return 0;
+            return Math.min(prev, n - 1);
         });
     }, [pickableTagSuggestions]);
 
@@ -1288,6 +1346,28 @@ const ClipboardItem = ({
     }, [bodyEditorOpen, bodyInitialDraft]);
 
     /**
+     * R13: 富文本编辑器是**非受控**的，所以初值必须在挂载后手动写进去。
+     *
+     * 用 `sanitizeHTML`（显示侧那道弱净化）洗一遍再写：这里的目的不是安全 ——
+     * 安全由后端写入路径的白名单净化器负责 —— 而是**复用渲染同一条管线**，
+     * 让编辑器里看到的内容与条目在列表里显示的内容一致（Office 噪声清理、
+     * 内嵌图片路径转 `asset:` 等都在那一步完成）。
+     *
+     * 依赖里带上 `bodyEditorOpen`：关掉再打开同一个条目时要重新写入初值，否则用户
+     * 丢弃的草稿会在重开时复活。
+     */
+    useEffect(() => {
+        if (!bodyEditorOpen || !bodyEditIsRich) return;
+        const node = bodyEditorRichRef.current;
+        if (!node) return;
+        const raw = bodyInitialHtml ?? "";
+        const { html } = sanitizeHTML(raw);
+        node.innerHTML = html || escapeHtmlForEditor(raw);
+        setBodyDraft(node.innerHTML);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [bodyEditorOpen, bodyEditIsRich, bodyInitialHtml]);
+
+    /**
      * R11: seed the note draft when the note editor opens. `item.note` is the source of
      * truth; the hook passes the same value in `noteInitialDraft` so the draft and the
      * row cannot disagree at open time.
@@ -1478,7 +1558,35 @@ const ClipboardItem = ({
                                     setTagSuggestIndex((prev) => (prev <= 0 ? -1 : prev - 1));
                                     return;
                                 }
-                                if (e.key === 'Enter' && !isComposing.current) {
+                                /*
+                               * Tab：**选中当前高亮的候补**（用户明确提到"tab 键那种"）。
+                               *
+                               * 与 Enter 的区别是有意保留的：
+                               * - Tab 只在**有候补且已高亮**时接管，否则放行让焦点正常移动
+                               *   （否则用户没法用 Tab 离开这个输入框）
+                               * - Enter 在无候选时是"提交当前输入"（新增标签），有候选时选中候选
+                               *
+                               * 默认高亮第 0 项（见下方 `tagSuggestIndex` 的初始化逻辑）——
+                               * 否则用户打完字按 Tab 什么都不会发生，"tab 补全"就无从谈起。
+                               */
+                              if (e.key === 'Tab' && !e.shiftKey && !isComposing.current) {
+                                  if (
+                                      suggestionCount > 0 &&
+                                      onTagPick &&
+                                      tagSuggestIndex >= 0 &&
+                                      tagSuggestIndex < suggestionCount
+                                  ) {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      const picked = pickableTagSuggestions[tagSuggestIndex];
+                                      onTagPick(picked);
+                                      setLocalTagInput('');
+                                      setTagSuggestIndex(-1);
+                                  }
+                                  // 无候补时不 preventDefault：让 Tab 正常移出焦点。
+                                  return;
+                              }
+                              if (e.key === 'Enter' && !isComposing.current) {
                                     e.preventDefault();
                                     e.stopPropagation();
                                     if (
@@ -1630,6 +1738,7 @@ const ClipboardItem = ({
             >
                 <Sparkles
                     size={10}
+                    className="entry-note-sparkle"
                     style={{ flexShrink: 0, marginTop: isCompactNote ? 0 : '2px' }}
                 />
                 <span
@@ -1680,7 +1789,6 @@ const ClipboardItem = ({
      */
     const renderBodyEditor = () => {
         if (!bodyEditorOpen || !onBodyEditSave) return null;
-        const warnsDowngrade = bodyEditDowngradesFormat(item.content_type);
 
         return createPortal(
             <div
@@ -1698,60 +1806,114 @@ const ClipboardItem = ({
                     <h3 style={{ margin: '0 0 12px 0', fontSize: '15px', fontWeight: 600 }}>
                         {t('edit_item') || '编辑条目内容'}
                     </h3>
-                    {/* R10: rich_text loses its HTML on save — say so before the user commits. */}
-                    {warnsDowngrade && (
-                        <p
-                            className="entry-body-editor-warning"
-                            style={{
-                                margin: '0 0 10px 0',
-                                fontSize: '12px',
-                                lineHeight: 1.5,
-                                color: 'var(--text-secondary)'
+                    {bodyEditIsRich ? (
+                        /*
+                         * R13：富文本条目用 contentEditable 编辑，保存时读回 `innerHTML`。
+                         *
+                         * 这一块是"编辑富文本不会坍缩成纯文本"在界面上的落点：
+                         *  - 初值是 `bodyInitialHtml`（HTML，经 sanitizeHTML 洗过），
+                         *    而不是纯文本列 `item.content`；
+                         *  - 保存时送 `innerHTML`，与正文一起提交给后端，
+                         *    后端保持 `content_type = rich_text` 并写入 `html_content`。
+                         *
+                         * 为什么用 `dangerouslySetInnerHTML` 之外的原生写法：React 的
+                         * 受控组件模型和 contentEditable 天生冲突（每次按键都由 React
+                         * 重写 DOM 会把光标推到开头）。这里走"挂载时写一次初值、之后
+                         * 只读取"的非受控方式，光标与输入法正常。
+                         */
+                        <div
+                            ref={bodyEditorRichRef}
+                            className="entry-body-editor-textarea entry-body-editor-rich"
+                            contentEditable
+                            suppressContentEditableWarning
+                            autoFocus
+                            role="textbox"
+                            aria-multiline="true"
+                            data-testid="entry-body-editor-rich"
+                            onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
+                            onFocus={() => invoke('activate_window_focus').catch(console.error)}
+                            onInput={(e) => {
+                                // 草稿存**纯文本**（= 最终会写进 `content` 的东西），
+                                // HTML 在保存的那一刻从 DOM 读。这样两处不变量都成立：
+                                // 用户看到的正文 == 落库的 content；格式 == innerHTML。
+                                setBodyDraft(htmlToPlainText((e.target as HTMLElement).innerHTML));
                             }}
-                        >
-                            该条目为富文本，保存后格式会转为纯文本（原有 HTML 排版将丢失）。
-                        </p>
+                            onKeyDown={(e) => {
+                                e.stopPropagation();
+                                if (e.key === 'Escape') {
+                                    e.preventDefault();
+                                    onBodyEditCancel?.();
+                                    return;
+                                }
+                                // Ctrl/Cmd+Enter 保存；纯 Enter 在富文本里是"换行/分段"，
+                                // 与用户的直觉一致（textarea 分支同理）。
+                                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bodyEditSaving) {
+                                    e.preventDefault();
+                                    onBodyEditSave(bodyDraft, bodyEditorRichRef.current?.innerHTML ?? bodyDraft);
+                                }
+                            }}
+                            style={{
+                                width: '100%',
+                                minHeight: '132px',
+                                maxHeight: '46vh',
+                                overflowY: 'auto',
+                                marginBottom: '12px',
+                                padding: '12px',
+                                border: 'var(--input-border)',
+                                borderRadius: 'var(--input-radius)',
+                                background: 'var(--bg-input)',
+                                boxShadow: 'var(--input-shadow)',
+                                color: 'var(--text-primary)',
+                                fontFamily: 'inherit',
+                                fontSize: '13px',
+                                lineHeight: 1.55,
+                                outline: 'none',
+                                boxSizing: 'border-box',
+                                wordBreak: 'break-word'
+                            }}
+                        />
+                    ) : (
+                        <textarea
+                            ref={bodyEditorTextareaRef}
+                            className="entry-body-editor-textarea"
+                            autoFocus
+                            value={bodyDraft}
+                            onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
+                            onFocus={() => invoke('activate_window_focus').catch(console.error)}
+                            onChange={(e) => setBodyDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                                e.stopPropagation();
+                                if (e.key === 'Escape') {
+                                    e.preventDefault();
+                                    onBodyEditCancel?.();
+                                    return;
+                                }
+                                // Ctrl/Cmd+Enter saves, matching the muscle memory of the
+                                // tag manager's editor while plain Enter stays a newline.
+                                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bodyEditSaving) {
+                                    e.preventDefault();
+                                    onBodyEditSave(bodyDraft);
+                                }
+                            }}
+                            style={{
+                                width: '100%',
+                                minHeight: '132px',
+                                marginBottom: '12px',
+                                padding: '12px',
+                                border: 'var(--input-border)',
+                                borderRadius: 'var(--input-radius)',
+                                background: 'var(--bg-input)',
+                                boxShadow: 'var(--input-shadow)',
+                                color: 'var(--text-primary)',
+                                fontFamily: 'inherit',
+                                fontSize: '13px',
+                                lineHeight: 1.55,
+                                outline: 'none',
+                                resize: 'vertical',
+                                boxSizing: 'border-box'
+                            }}
+                        />
                     )}
-                    <textarea
-                        ref={bodyEditorTextareaRef}
-                        className="entry-body-editor-textarea"
-                        autoFocus
-                        value={bodyDraft}
-                        onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
-                        onFocus={() => invoke('activate_window_focus').catch(console.error)}
-                        onChange={(e) => setBodyDraft(e.target.value)}
-                        onKeyDown={(e) => {
-                            e.stopPropagation();
-                            if (e.key === 'Escape') {
-                                e.preventDefault();
-                                onBodyEditCancel?.();
-                                return;
-                            }
-                            // Ctrl/Cmd+Enter saves, matching the muscle memory of the
-                            // tag manager's editor while plain Enter stays a newline.
-                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bodyEditSaving) {
-                                e.preventDefault();
-                                onBodyEditSave(bodyDraft);
-                            }
-                        }}
-                        style={{
-                            width: '100%',
-                            minHeight: '132px',
-                            marginBottom: '12px',
-                            padding: '12px',
-                            border: 'var(--input-border)',
-                            borderRadius: 'var(--input-radius)',
-                            background: 'var(--bg-input)',
-                            boxShadow: 'var(--input-shadow)',
-                            color: 'var(--text-primary)',
-                            fontFamily: 'inherit',
-                            fontSize: '13px',
-                            lineHeight: 1.55,
-                            outline: 'none',
-                            resize: 'vertical',
-                            boxSizing: 'border-box'
-                        }}
-                    />
                     {bodyEditError && (
                         <div
                             className="entry-body-editor-error"
@@ -1771,7 +1933,18 @@ const ClipboardItem = ({
                         <button
                             className="confirm-dialog-button primary"
                             disabled={bodyEditSaving}
-                            onClick={() => onBodyEditSave(bodyDraft)}
+                            onClick={() => {
+                                // R13：富文本条目保存时读回编辑器的 `innerHTML`，
+                                // 与正文一起提交 —— 只送纯文本就等于把格式丢掉。
+                                if (bodyEditIsRich) {
+                                    onBodyEditSave(
+                                        bodyDraft,
+                                        bodyEditorRichRef.current?.innerHTML ?? bodyDraft
+                                    );
+                                    return;
+                                }
+                                onBodyEditSave(bodyDraft);
+                            }}
                         >
                             {t('save')}
                         </button>
@@ -2093,14 +2266,22 @@ const ClipboardItem = ({
                         )}
                         {isNoteEditable(item.content_type) && onEditNote && (
                             <button
-                                className={`btn-icon ${noteEditorOpen ? "active" : ""}`}
+                                className={`btn-icon note-edit-btn ${noteEditorOpen ? "active" : ""}`}
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onEditNote(e);
                                 }}
                                 title={t('edit_item_note_label')}
                             >
-                                <StickyNote size={12} />
+                                {/*
+                                  * 图标与备注行前面那个 ✨ **是同一个**（`Sparkles`）。
+                                  *
+                                  * 用户的要求是"编辑备注的图标要和备注前面那个 ✨ 图标一样"。
+                                  * 此前这里是 `StickyNote`（便利贴），与备注在界面上的标识符
+                                  * 毫无关联 —— 用户只能靠 tooltip 才知道这个按钮是干什么的。
+                                  * 两处统一之后，"✨ = 备注"成了这个界面的固定符号。
+                                  */}
+                                <Sparkles size={12} />
                             </button>
                         )}
                         <button
@@ -2487,6 +2668,11 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         // keep reporting "unchanged" while the dialog state flips on the parent.
         prevProps.isEditingBody === nextProps.isEditingBody &&
         prevProps.bodyInitialDraft === nextProps.bodyInitialDraft &&
+        // R13: without these the memo would keep reporting "unchanged" while the rich
+        // editor's seed value flips on the parent, so a reopened dialog would show the
+        // previously discarded draft.
+        prevProps.bodyInitialHtml === nextProps.bodyInitialHtml &&
+        prevProps.bodyEditIsRich === nextProps.bodyEditIsRich &&
         prevProps.bodyEditSaving === nextProps.bodyEditSaving &&
         prevProps.bodyEditError === nextProps.bodyEditError &&
         !!prevProps.onEdit === !!nextProps.onEdit &&

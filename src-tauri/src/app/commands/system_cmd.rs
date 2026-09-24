@@ -1336,14 +1336,135 @@ pub fn quit(app: AppHandle) {
     app.exit(0);
 }
 
+/// 重启应用。
+///
+/// # 原实现的问题
+///
+/// ```ignore
+/// let _ = Command::new(exe).spawn();   // 新进程先起来
+/// app.exit(0);                          // 旧进程才退出
+/// ```
+///
+/// 本项目注册了**单实例插件**（`main.rs` 的 `tauri_plugin_single_instance`），
+/// 它在 Windows 上用**命名互斥体**判定（`CreateMutexW` → `ERROR_ALREADY_EXISTS`，
+/// 见 `tauri-plugin-single-instance-2.4.5/src/platform_impl/windows.rs:68-73`）。
+///
+/// `spawn()` 是**同步**创建进程：新进程几乎立刻开始执行、去抢那个互斥体，而此刻
+/// 旧进程的 `exit(0)` 还没走完（内核回收句柄需要时间）。新进程因此被判定为"已有实例"，
+/// 单实例插件的处理是**在旧窗口里发一条消息然后自己退出**；而本项目的回调体是空的
+/// `|_app, _args, _cwd| {}`，既不会激活旧窗口、也不会给用户任何反馈。
+///
+/// ⇒ **用户看到的现象**：点了"立即重启"，窗口关了，然后什么都没有再出现。
+///
+/// 这对「导入备份 / 恢复 / 迁移」尤其致命 —— 那些功能的**唯一生效方式就是重启**
+/// （运行期不可能替换被占用的 `clipboard.db`，见 `services/backup/import.rs` 与
+/// `migration_pending.rs`）。重启不可靠，整套流程就没有出口。
+///
+/// 注：`AppHandle::restart()` **不能**解决这个问题 —— 它内部同样是
+/// `Command::new(path).spawn()` + `exit(0)`（`tauri-2.11.6/src/process.rs:74-89`），
+/// 竞态原样存在。所以这里不能靠"换成官方 API"了事。
+///
+/// # 做法：交给一个等待旧进程退出的中间脚本
+///
+/// 在临时目录写一个一次性 `.cmd`，内容是"等一会儿 → 启动新实例 → 删除自己"，
+/// 然后以**脱离**方式运行它。等一会儿是必要的：互斥体由旧进程持有，
+/// 必须等它真正退出（句柄被内核回收）之后，新实例才能抢到。
+///
+/// 为什么用脚本文件而不是 `cmd /c "..."` 内联字符串：
+/// 可执行文件路径含空格时，`start` 的引号规则会变得很绕，而写错引号的后果是
+/// **静默不启动**（正是本次要修的那类缺陷）。落成文件后，引号规则一目了然，
+/// 出问题时用户也能直接打开那个 `.cmd` 看内容。
+///
+/// 失败时**不静默**：记日志并退回"只退出"，让用户知道要手动打开。
 #[tauri::command]
 pub fn relaunch(app: AppHandle) {
-    use std::process::Command;
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe).spawn();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let script = std::env::temp_dir()
+                    .join(format!("tiez-relaunch-{}.cmd", std::process::id()));
+                let body = build_relaunch_script(&exe.to_string_lossy());
+
+                match std::fs::write(&script, body) {
+                    Ok(()) => {
+                        let mut cmd = std::process::Command::new("cmd");
+                        cmd.args(["/c", &script.to_string_lossy()]);
+                        // 不弹控制台窗口，且脱离父进程的作业对象 —— 否则父进程退出时
+                        // 可能把子进程一起带走（那是"窗口关了什么都没起来"的另一种成因）。
+                        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+                        if let Err(e) = cmd.spawn() {
+                            crate::error!(
+                                "[RELAUNCH] 启动重启脚本失败（{}），改为只退出；请手动重新打开",
+                                e
+                            );
+                        } else {
+                            crate::info!("[RELAUNCH] 已安排新实例在旧进程退出后启动");
+                        }
+                    }
+                    Err(e) => {
+                        crate::error!(
+                            "[RELAUNCH] 写入重启脚本失败（{}），改为只退出；请手动重新打开",
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                crate::error!("[RELAUNCH] 取当前可执行文件路径失败（{}），改为只退出", e);
+            }
+        }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 非 Windows 平台没有这个互斥体竞态，交给 Tauri 的处理即可。
+        app.restart();
+    }
+
     app.exit(0);
 }
+
+/// 生成"等旧进程退出 → 启动新实例 → 删除自己"的一次性批处理脚本内容。
+///
+/// 抽成独立函数是为了**能被测试直接断言** —— 这段内容的引号规则很容易写错，
+/// 而写错的后果是**静默不启动**（用户点了重启，窗口关了，什么都没起来），
+/// 恰恰是本次要修的那类缺陷。把它变成可断言的纯函数，改动时才有人拦。
+///
+/// # 引号规则（最容易错的地方）
+///
+/// `start` 的第一个引号参数是**窗口标题**，不是路径：
+///
+/// ```bat
+/// start "C:\Program Files\App\app.exe"      ← 错：被当成标题，什么都不启动
+/// start "" "C:\Program Files\App\app.exe"   ← 对：空标题 + 带引号的路径
+/// ```
+///
+/// 所以必须有一个**空的 `""`** 在路径之前。路径本身再加引号，否则含空格的路径
+/// 会被 `start` 拆成多个参数（同样静默失败）。
+///
+/// # 为什么要等
+///
+/// 单实例插件用命名互斥体判定"是否已有实例"，而互斥体由**旧进程**持有。
+/// 必须等旧进程真正退出（句柄被内核回收）之后，新实例才抢得到。
+/// `ping -n 2 127.0.0.1` 是 Windows 上无需额外组件的约 1 秒等待 ——
+/// 不用 `timeout /t`：它在没有控制台时会报"输入重定向不受支持"而**直接跳过**，
+/// 那等于没等。
+///
+/// # 换行必须是 CRLF
+///
+/// `cmd.exe` 对 LF 结尾的批处理容错很差（尤其 `del "%~f0"` 这类自删除写法）。
+pub fn build_relaunch_script(exe_path: &str) -> String {
+    format!(
+        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\nstart \"\" \"{}\"\r\ndel \"%~f0\"\r\n",
+        exe_path
+    )
+}
+
 
 #[tauri::command]
 pub fn restart_as_admin(app_handle: AppHandle) -> AppResult<()> {
@@ -2130,9 +2251,15 @@ pub fn inspect_backup_package(
 /// 4. 执行导入后重置（路径改写 / 云同步游标 / 迁移 / 默认值 / WAL 作废 / 背景还原）；
 /// 5. 逐个受管条目换上去，失败即原样放回。
 ///
-/// 返回后界面必须提示用户**重启应用**：进程内的数据库连接仍指向替换前的数据。
+/// 返回后界面必须提示用户**重启应用**：这次导入只是把数据组装就绪并写下"待接管"标记，
+/// 真正的文件交换由下次启动在打开数据库**之前**完成（`app/setup.rs::run_pending_takeover`）。
+///
+/// 【为什么不在运行期直接交换】应用自己正打开着 `clipboard.db`，Windows 不允许改名已
+/// 打开的文件（`ERROR_SHARING_VIOLATION`）。旧实现就是在运行期改名，因此真机上必然报
+/// "文件被占用"。详见 `services::backup::import` 模块头部。
 #[tauri::command]
 pub fn import_backup(
+    app: AppHandle,
     state: State<'_, AppDataDir>,
     archive_path: String,
 ) -> AppResult<crate::services::backup::import::RestoreReport> {
@@ -2141,6 +2268,9 @@ pub fn import_backup(
     crate::services::backup::restore_backup(&crate::services::backup::RestoreRequest {
         data_dir,
         archive_path: archive,
+        // 「待接管标记」必须落在**原生**数据目录：它要指出"下次启动该做什么"，而它自己
+        // 绝不能住在会被这次导入换掉的那个目录里（那正是它的作用对象）。
+        pending_marker_dir: native_data_dir(&app),
     })
     .map_err(backup_err)
 }
@@ -2374,9 +2504,19 @@ mod migration_pristine_tests {
         // ---- 第 3 步：模拟重启，在"开库之前"完成接管 ----
         let outcome = crate::migration_pending::run_startup_takeover(
             &native,
-            &mut |staging: &std::path::Path, target: &std::path::Path| {
-                crate::migration_identifier::promote_staged_takeover_default(staging, target)
-                    .map(|_| ())
+            &mut |pending: &crate::migration_pending::PendingMigration| {
+                // 与 `app/setup.rs::run_pending_takeover` 一样按 kind 分派（这里只有
+                // 迁移那一种，因为本条测的就是迁移链）。
+                assert_eq!(
+                    pending.kind,
+                    crate::migration_pending::PendingKind::Takeover,
+                    "迁移写下的标记必须是 Takeover 种类"
+                );
+                crate::migration_identifier::promote_staged_takeover_default(
+                    &pending.staging_dir,
+                    &pending.target_dir,
+                )
+                .map(|_| ())
             },
         );
         assert!(
@@ -2855,5 +2995,84 @@ mod autostart_readback_tests {
             !strict.enabled,
             "严格判据必须与老判据给出**不同**的答案，否则这条测试就没有区分力"
         );
+    }
+}
+
+#[cfg(test)]
+mod relaunch_script_tests {
+    use super::build_relaunch_script;
+
+    /// 含空格的路径是这条脚本最容易崩的输入（也是最常见的安装路径形态）。
+    const EXE: &str = r"C:\Program Files\Tiez Next\Tiez-Next.exe";
+
+    #[test]
+    fn uses_empty_title_then_quoted_path() {
+        let s = build_relaunch_script(EXE);
+        // `start "" "<exe>"` —— 空的窗口标题必须在路径之前。
+        // 若漏掉那个 `""`，`start` 会把带引号的 exe 路径当成窗口标题，
+        // 于是**什么都不启动**，而用户只看到窗口关了。
+        assert!(
+            s.contains(r#"start "" "C:\Program Files\Tiez Next\Tiez-Next.exe""#),
+            "必须写成 start \"\" \"<路径>\"（空标题 + 带引号路径）；实际内容：\n{}",
+            s
+        );
+    }
+
+    #[test]
+    fn path_is_quoted_so_spaces_do_not_split_it() {
+        let s = build_relaunch_script(EXE);
+        let line = s
+            .lines()
+            .find(|l| l.trim_start().starts_with("start"))
+            .expect("脚本里应有 start 行");
+        // 路径两侧各有一个引号；若没引号，含空格的路径会被拆成多个参数。
+        let quoted = line.matches('"').count();
+        assert!(
+            quoted >= 4,
+            "start 行应有 4 个引号（空标题 2 个 + 路径 2 个），实际 {} 个：{}",
+            quoted,
+            line
+        );
+    }
+
+    #[test]
+    fn waits_before_launching() {
+        let s = build_relaunch_script(EXE);
+        let wait_at = s.find("ping -n").expect("必须有等待，否则新实例会撞上单实例互斥体");
+        let start_at = s.find("start ").expect("必须有 start");
+        assert!(
+            wait_at < start_at,
+            "等待必须在启动之前 —— 否则竞态原样存在（新实例被旧进程的互斥体挡掉）"
+        );
+    }
+
+    #[test]
+    fn does_not_use_timeout_command() {
+        let s = build_relaunch_script(EXE);
+        // `timeout /t` 在没有控制台时直接报错跳过 ⇒ 等于没等。
+        assert!(
+            !s.contains("timeout /t") && !s.contains("timeout /T"),
+            "不要用 timeout /t：无控制台时它会跳过，等待就失效了"
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings() {
+        let s = build_relaunch_script(EXE);
+        assert!(s.contains("\r\n"), "cmd.exe 对 LF 结尾的批处理容错很差，必须用 CRLF");
+        // 不能出现"裸 LF"（即前面不是 CR 的 LF）
+        let bytes = s.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] == b'\n' {
+                assert!(i > 0 && bytes[i - 1] == b'\r', "第 {} 字节处是裸 LF，应为 CRLF", i);
+            }
+        }
+    }
+
+    #[test]
+    fn removes_itself() {
+        let s = build_relaunch_script(EXE);
+        // 一次性脚本必须自删，否则临时目录会累积。
+        assert!(s.contains("del \"%~f0\""), "脚本应删除自己，避免临时目录累积");
     }
 }

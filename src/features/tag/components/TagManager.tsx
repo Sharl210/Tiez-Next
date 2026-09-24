@@ -4,7 +4,7 @@ import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
     Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
-    Sparkles, AlertTriangle, StickyNote
+    Sparkles, StickyNote
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
@@ -80,6 +80,39 @@ export const resolveCardEditActions = (contentType: string | undefined | null) =
 };
 
 /** 卡片编辑弹窗的两种模式：只改正文，或只改备注。 */
+/**
+ * R13：把纯文本转义成可放进 contentEditable 的 HTML。
+ *
+ * 用于 `rich_text` 行**没有** `html_content` 的历史数据：直接把纯文本塞进
+ * contentEditable 会让文本里的 `<` 被当成标签吃掉，转义后再写才与用户看到的一致。
+ */
+export const escapeHtmlForEditor = (text: string): string =>
+    text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\n/g, '<br>');
+
+/**
+ * R13：从富文本 HTML 里取出**纯文本正文**。
+ *
+ * 为什么界面也要做一次：`content` 是派生的纯文本（粘贴与列表预览用的就是它）。
+ * 富文本编辑器改的是 HTML，若直接把 `innerHTML` 当正文送去，`content` 里会存下
+ * `<p>…</p>`，与界面显示的正文不符。后端以同一口径再派生一次作为权威值，
+ * 这里派生是为了让"送去的内容"与"最终落库的内容"一致，避免脏检查误判。
+ *
+ * 用 `DOMParser` 而不是正则：标签嵌套与实体转义（`&amp;`、`&nbsp;`）正则会算错。
+ */
+export const htmlToPlainText = (html: string): string => {
+    if (!html) return '';
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // 块级元素之间补换行，否则两段文字会粘成一行。
+    doc.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+    doc.querySelectorAll('p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote, pre')
+        .forEach(el => el.append('\n'));
+    return (doc.body.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim();
+};
+
 export type CardEditMode = 'body' | 'note';
 
 /**
@@ -100,8 +133,19 @@ export const resolveEditSavePlan = (edit: {
     note: string;
     originalContent: string;
     originalNote: string;
+    /**
+     * R13：富文本条目的 HTML。可选 —— 非富文本条目根本不带，此时下面的比较退化成
+     * "两边的 undefined 相等"，判据与加富文本之前逐字一致。
+     */
+    html?: string;
+    originalHtml?: string;
 }): { writeBody: boolean; writeNote: boolean } => ({
-    writeBody: edit.mode === 'body' && edit.content !== edit.originalContent,
+    // R13：只改格式（加粗、换色）时 `content` 一字未变，若只看正文就会把改动当
+    // "无变化"丢弃 —— 用户点了保存，格式却没落盘。所以正文的差异**或** HTML 的差异
+    // 任一成立都算写正文。
+    writeBody:
+        edit.mode === 'body' &&
+        (edit.content !== edit.originalContent || edit.html !== edit.originalHtml),
     writeNote: edit.mode === 'note' && edit.note !== edit.originalNote,
 });
 
@@ -507,8 +551,37 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         contentType: string;
         originalContent: string;
         originalNote: string;
+        /**
+         * R13：富文本条目的 HTML。标签管理页此前根本不读 `html_content`，
+         * 于是这里的"编辑正文"也一定会把格式丢掉（与主页面是两个独立入口，
+         * 只修一个，另一个仍会降级）。
+         */
+        html?: string;
+        originalHtml?: string;
     } | null>(null);
     const [newItemContent, setNewItemContent] = useState('');
+    /**
+     * R13：富文本编辑器的 DOM 节点（非受控 —— 见 `openItemEditor` 附近的说明）。
+     */
+    const richBodyEditorRef = useRef<HTMLDivElement | null>(null);
+
+    /**
+     * R13：把 `editingItem.html` 的初值写进 contentEditable。
+     *
+     * 只在弹窗（重新）打开时写一次：`editingItem.id` 与 `editingItem.mode` 变化即代表
+     * 换了一条记录或换了模式，此时必须重写初值；否则用户丢弃的草稿会在重开时复活。
+     * 之后不再写 —— 受控写入会把光标推到开头并打断中文输入法。
+     */
+    useEffect(() => {
+        if (!editingItem || editingItem.mode !== 'body') return;
+        if (editingItem.contentType !== 'rich_text') return;
+        const node = richBodyEditorRef.current;
+        if (!node) return;
+        if (node.innerHTML !== (editingItem.html ?? '')) {
+            node.innerHTML = editingItem.html ?? '';
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [editingItem?.id, editingItem?.mode, editingItem?.contentType]);
     /**
      * R2: the first frame carries the remembered split geometry.
      *
@@ -970,7 +1043,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
         try {
             if (plan.writeBody) {
-                await invoke('update_item_content', { id: editingItem.id, newContent: editingItem.content });
+                // R13：富文本条目把编辑后的 HTML 一起提交，后端保持 `rich_text` 类型并
+                // 写入 `html_content` —— 这正是"编辑富文本不会坍缩成纯文本"。
+                //
+                // `newContent` 仍要送：后端以它 + HTML 一起**派生**权威的纯文本正文；
+                // 只送 HTML 会让"HTML 为空但正文非空"这类边界无处表达。
+                const isRich = editingItem.contentType === 'rich_text';
+                await invoke('update_item_content', {
+                    id: editingItem.id,
+                    newContent: isRich ? htmlToPlainText(editingItem.html ?? '') : editingItem.content,
+                    htmlContent: isRich ? editingItem.html : undefined,
+                });
             }
             if (plan.writeNote) {
                 await invoke('update_entry_note', { id: editingItem.id, note: editingItem.note });
@@ -989,6 +1072,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      */
     const openItemEditor = (item: ClipboardEntry, mode: CardEditMode) => {
         const note = item.note || '';
+        // R13：富文本条目的 HTML 初值。取库里的 `html_content`；空则用纯文本转义后的
+        // 兜底，保证编辑器里不会显示空白（历史数据里存在只有 content 的 rich_text 行）。
+        const html = item.content_type === 'rich_text'
+            ? (item.html_content ?? escapeHtmlForEditor(item.content))
+            : undefined;
         setEditingItem({
             id: item.id,
             mode,
@@ -997,6 +1085,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             contentType: item.content_type,
             originalContent: item.content,
             originalNote: note,
+            html,
+            originalHtml: html,
         });
     };
 
@@ -1673,21 +1763,40 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                         {editingItem.mode === 'body' ? (
                             <div className="modal-input-field">
                                 <label className="edit-item-label">{t('edit_item_content_label')}</label>
-                                <textarea
-                                    className="tag-manager-textarea"
-                                    value={editingItem.content}
-                                    onChange={e => setEditingItem({ ...editingItem, content: e.target.value })}
-                                    autoFocus
-                                />
-                                {/* R4: the back end rewrites a rich-text row as plain text and
-                                    drops `html_content` whenever its body is edited. Stating the
-                                    consequence before saving is the honest option, since it cannot
-                                    be undone from the UI. */}
-                                {editingItem.contentType === 'rich_text' && (
-                                    <p className="edit-item-warning">
-                                        <AlertTriangle size={11} />
-                                        <span>{t('edit_item_rich_text_warning')}</span>
-                                    </p>
+                                {editingItem.contentType === 'rich_text' ? (
+                                    /*
+                                     * R13：富文本条目用 contentEditable 编辑，保存时读回 `innerHTML`。
+                                     *
+                                     * 这里是**第二个入口**（主页面弹窗是第一个）。两处都要改：
+                                     * 只改主页面的话，从标签管理页编辑同一个富文本条目仍会把格式丢掉，
+                                     * 而且用户会以为"功能没修好"。
+                                     *
+                                     * 非受控写法（只在打开时写一次初值）的理由与主页面一致：
+                                     * 受控的 contentEditable 会把光标推到开头、打断中文输入法。
+                                     */
+                                    <div
+                                        ref={richBodyEditorRef}
+                                        className="tag-manager-textarea tag-manager-rich-textarea"
+                                        contentEditable
+                                        suppressContentEditableWarning
+                                        autoFocus
+                                        role="textbox"
+                                        aria-multiline="true"
+                                        data-testid="tag-manager-rich-editor"
+                                        onInput={e => {
+                                            const html = (e.target as HTMLElement).innerHTML;
+                                            // 正文同步派生：界面上的"内容"与粘贴出去的文字
+                                            // 必须一致，否则用户改完格式会发现粘出来是另一回事。
+                                            setEditingItem({ ...editingItem, html, content: htmlToPlainText(html) });
+                                        }}
+                                    />
+                                ) : (
+                                    <textarea
+                                        className="tag-manager-textarea"
+                                        value={editingItem.content}
+                                        onChange={e => setEditingItem({ ...editingItem, content: e.target.value })}
+                                        autoFocus
+                                    />
                                 )}
                             </div>
                         ) : (

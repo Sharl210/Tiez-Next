@@ -159,6 +159,14 @@ type CaseSpec = {
 /** 覆盖后端 schema 允许的**全部** 8 种类型，外加一个未知类型（矩阵默认值）。 */
 const CASES: CaseSpec[] = [
   { id: "text", note: "纯文本", entry: baseEntry({ id: 101, content_type: "text", content: "一条普通的文本内容，长度足够撑出一行。", preview: "一条普通的文本内容，长度足够撑出一行。" }) },
+  /*
+   * 带**真实备注**的用例。
+   *
+   * 用户要求「编辑备注的图标要和备注前面那个 ✨ 图标一样，而且要有颜色」——
+   * 两处（备注行、编辑备注按钮）都要能同时量到，所以必须有一条 entry.note 非空的
+   * 用例；否则 `.entry-note-sparkle` 根本不在 DOM 里，"图标是否统一"就无法断言。
+   */
+  { id: "with_note", note: "带备注", entry: baseEntry({ id: 120, content_type: "text", content: "一条带备注的文本内容。", preview: "一条带备注的文本内容。", note: "这是我自己写的备注" }) },
   { id: "code", note: "代码", entry: baseEntry({ id: 102, content_type: "code", content: "fn main() {\n    println!(\"hi\");\n}", preview: "fn main() {" }) },
   { id: "url", note: "链接", entry: baseEntry({ id: 103, content_type: "url", content: "https://example.com/a/b", preview: "https://example.com/a/b" }) },
   { id: "rich_html", note: "富文本（HTML 分支）", entry: baseEntry({ id: 104, content_type: "rich_text", content: "第一段正文\n第二段正文", preview: "第一段正文", html_content: RICH_HTML }) },

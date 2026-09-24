@@ -66,6 +66,32 @@ pub fn set_rich_paste_hotkey(
     crate::app::commands::hotkey_cmd::sync_registered_hotkeys(&app_handle)
 }
 
+/// 数字快速粘贴的修饰键（`app.quick_paste_modifier`）。
+///
+/// 【为什么单独开一条命令，而不是让界面改调 `save_setting`】`save_setting` 本来就认识
+/// 这个键（本文件里已有 `"app.quick_paste_modifier"` 分支：归一化后同时写内存态与设置库），
+/// 而界面已经按 `set_quick_paste_modifier` 这个名字在调——命令名不在 `generate_handler!` 里，
+/// 于是设置页选完下拉框什么都不发生。
+///
+/// 【为什么实现体是转调 `save_setting` 而不是再写一遍】归一化规则
+/// （`normalize_quick_paste_modifier`）与"内存态 + 设置库同时写"这套动作只应有一处定义。
+/// 这里直接复用，日后改规则不会漏改一边；键、存储表、写路径都与 `save_setting` 完全相同，
+/// **没有第二套存储**。
+#[tauri::command]
+pub fn set_quick_paste_modifier(
+    app_handle: AppHandle,
+    state: State<'_, SettingsState>,
+    modifier: String,
+) -> AppResult<()> {
+    let db_state = app_handle.state::<DbState>();
+    save_setting(
+        db_state,
+        state,
+        "app.quick_paste_modifier".to_string(),
+        modifier,
+    )
+}
+
 #[tauri::command]
 pub fn set_search_hotkey(
     app_handle: AppHandle,
@@ -496,6 +522,16 @@ pub fn request_cloud_sync(app_handle: AppHandle) {
     crate::services::cloud_sync::request_cloud_sync(app_handle);
 }
 
+/// 停止云同步后台循环。
+///
+/// 【为什么必须是命令而不是只写设置】用户关掉「云同步」开关时，正在跑的那轮同步不会
+/// 因为库里 `cloud_sync_enabled=false` 而中断——它已经读了配置、正在上传。界面因此先
+/// 调本命令取消当前轮，再落设置（见 `src/shared/hooks/useAppActions.ts`）。
+#[tauri::command]
+pub fn stop_cloud_sync_client(app_handle: AppHandle) {
+    crate::services::cloud_sync::stop_cloud_sync_client(app_handle);
+}
+
 #[tauri::command]
 pub async fn cloud_sync_now(
     app_handle: AppHandle,
@@ -699,6 +735,30 @@ pub fn set_tray_visible(
     db_state
         .settings_repo
         .set("app.hide_tray_icon", &(!visible).to_string())
+        .map_err(AppError::from)
+}
+
+/// 隐藏 / 显示 macOS 的 Dock 图标，并把选择存进设置库。
+///
+/// 【为什么存的是 `app.hide_dock_icon` 而参数叫 `visible`】用户看到的是"隐藏 Dock 图标"
+/// 这个开关，`visible` 是命令参数的方向；库里沿用既有键（默认 `false`），启动时用同一个
+/// 值复原，不需要第二套存储。
+///
+/// 【非 macOS 平台】Dock 概念不存在，这里只落设置、不动系统。命令本身全平台注册，
+/// 免得前端在非 macOS 上拿到 "command not found"。
+#[tauri::command]
+pub fn set_dock_visible(app_handle: AppHandle, visible: bool) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        app_handle
+            .set_dock_visibility(visible)
+            .map_err(AppError::from)?;
+    }
+
+    let db_state = app_handle.state::<DbState>();
+    db_state
+        .settings_repo
+        .set("app.hide_dock_icon", &(!visible).to_string())
         .map_err(AppError::from)
 }
 

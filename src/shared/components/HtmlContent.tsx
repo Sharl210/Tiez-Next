@@ -45,7 +45,21 @@ const resolveImgSource = (el: Element): string | null => {
   return src;
 };
 
-const sanitizeHTML = (html: string, preview?: boolean) => {
+/**
+ * 显示侧的 HTML 净化与归一化。
+ *
+ * # 这不是安全边界
+ *
+ * 它是**黑名单式**的弱净化（删 `script`、删 `on*`、删 `javascript:` 前缀），
+ * 只用来把来源五花八门的剪贴板 HTML 修到能渲染的样子（Office 噪声清理、
+ * 表格截断、内嵌图片路径转 `asset:`）。用户可编辑 HTML 的**持久化准入**由
+ * Rust 侧 `src-tauri/src/domain/rich_html.rs` 的白名单净化器负责 —— 写入路径
+ * 必须自己做决定，不能依赖"前端已经洗过了"。
+ *
+ * 导出它是为了让正文编辑器复用**同一条渲染管线**：编辑器里看到的内容必须与条目
+ * 在列表里显示的内容一致，否则用户会以为自己打开的是另一份文档。
+ */
+export const sanitizeHTML = (html: string, preview?: boolean) => {
   const parser = new DOMParser();
 
   const stripLeadingPreviewNoise = (container: HTMLElement) => {
