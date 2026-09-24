@@ -42,7 +42,7 @@ import {
     getTagColor,
     getTagTextColor
 } from "../../../shared/lib/utils";
-import HtmlContent, { sanitizeHTML } from "../../../shared/components/HtmlContent";
+import HtmlContent from "../../../shared/components/HtmlContent";
 import { toTauriLocalImageSrc } from "../../../shared/lib/localImageSrc";
 import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot";
 import { getFileIcon as getSystemFileIcon, peekFileIcon } from "../../../shared/lib/fileIcon";
@@ -890,9 +890,26 @@ const ClipboardItem = ({
     }, [pickableTagSuggestions]);
 
     useLayoutEffect(() => {
-        if (tagSuggestIndex < 0 || !tagSuggestListRef.current) return;
-        const row = tagSuggestListRef.current.children[tagSuggestIndex] as HTMLElement | undefined;
-        row?.scrollIntoView({ block: "nearest" });
+        const list = tagSuggestListRef.current;
+        if (tagSuggestIndex < 0 || !list) return;
+        const row = list.children[tagSuggestIndex] as HTMLElement | undefined;
+        if (!row) return;
+        /*
+         * 只在浮层**自己的**滚动容器内滚动，绝不调用 `scrollIntoView`。
+         *
+         * `scrollIntoView` 会滚动**所有可滚动祖先**（含 Virtuoso scroller）——
+         * 那正是"鼠标在联想列表里、外层剪贴板列表却跟着滚"的根因。
+         * `overscroll-behavior: contain` 只管 scroll chaining，管不到程序化滚动。
+         *
+         * 手算容器内滚动：只在浮层自己的 scrollTop 上动，不碰任何祖先。
+         */
+        const rowTop = row.offsetTop;
+        const rowBottom = rowTop + row.offsetHeight;
+        if (rowTop < list.scrollTop) {
+            list.scrollTop = rowTop;
+        } else if (rowBottom > list.scrollTop + list.clientHeight) {
+            list.scrollTop = rowBottom - list.clientHeight;
+        }
     }, [tagSuggestIndex, pickableTagSuggestions]);
 
     useEffect(() => {
@@ -1361,8 +1378,19 @@ const ClipboardItem = ({
         const node = bodyEditorRichRef.current;
         if (!node) return;
         const raw = bodyInitialHtml ?? "";
-        const { html } = sanitizeHTML(raw);
-        node.innerHTML = html || escapeHtmlForEditor(raw);
+        /*
+         * 编辑器 seed **不过 `sanitizeHTML`**，直接用库内原值。
+         *
+         * `sanitizeHTML` 是给列表渲染用的显示侧清洗 —— 它会删 Office `<style>`
+         * （`HtmlContent.tsx:84` 与 `:107-110`），这对"看一眼"够用，但编辑器
+         * 拿这份被洗过的 HTML 当初值、用户保存后写回数据库时，那些 `<style>`
+         * 就永久消失了。这正是 v0.5.6 之后用户反复反馈的"富文本编辑后坍缩"。
+         *
+         * 库里的 `html_content` 在写入时已过后端 `sanitize_rich_html`（白名单
+         * 净化器，`domain/rich_html.rs`），它主动保留 `<style>`（`:116`、
+         * `:690-701`），安全边界已由它承担。所以编辑器 seed 直接用原值即可。
+         */
+        node.innerHTML = raw || escapeHtmlForEditor(raw);
         setBodyDraft(node.innerHTML);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [bodyEditorOpen, bodyEditIsRich, bodyInitialHtml]);

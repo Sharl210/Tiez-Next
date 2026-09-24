@@ -25,6 +25,20 @@
      透明度"。写法与 `--accent-color-rgb` 完全一致，不引入新的命名风格。
      各主题在自身文件里覆盖（见 themes/*.css），保证次级表面跟随主题。 */
   --bg-panel-rgb: 255, 255, 255;
+
+  /*
+   * 叠加层（浮层 / 下拉 / 弹出菜单）的底色。
+   *
+   * 与弹窗 `.modal-content`（`modal.css:52`）用**同一个底色的高不透明度**：
+   * `rgba(var(--bg-panel-rgb), 0.96)`。此前浮层直接用 `--bg-element`，而
+   * `--bg-element` 在 acrylic(0.26)/mica(0.62)/sakura(0.5) 主题下是半透明的，
+   * 导致浮层能透出后面的条目文字 —— 用户反馈"不要现在这种半透明效果"。
+   *
+   * 弹窗那条路已经因为同样问题修过一次（`modal.css:48-52` 的注释），浮层是
+   * 同一根因的第二次出现。统一用这个令牌后，所有"浮在内容之上"的叠加层
+   * 都与弹窗口径一致。
+   */
+  --overlay-surface: rgba(var(--bg-panel-rgb), 0.96);
   --accent-hover: #245dce;
   --border-dark: #24364d;
   --border-light: rgba(255, 255, 255, 0.78);

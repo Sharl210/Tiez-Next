@@ -4,7 +4,7 @@
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--bg-panel) !important;
+  background: var(--overlay-surface) !important;
   border: var(--queue-border);
   padding: 10px 18px;
   display: flex;

@@ -129,7 +129,7 @@
     overflow-x: hidden;
     padding: 3px;
     border-radius: 8px;
-    background: var(--bg-element);
+    background: var(--overlay-surface);
     border: var(--tags-border);
     box-shadow: var(--tags-shadow);
     z-index: 10060;

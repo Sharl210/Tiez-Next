@@ -1092,10 +1092,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
     const copyToClipboard = async (id: number, content: string, type: string) => {
         try {
-            // R7: a paste from the tag manager counts as a paste and must land as the
-            // newest entry on the clipboard home page, so pin the move-to-top intent
-            // explicitly instead of relying on the ambient app setting.
-            await invoke('copy_to_clipboard', { content, contentType: type, paste: true, id, deleteAfterUse: false, moveToTop: true });
+            // 不传 moveToTop → 后端回落用户设置（app.move_to_top_after_paste）。
+            // 此前这里硬编码 `moveToTop: true`，绕过了用户设置（该设置在用户的库里
+            // 是 false），导致"在标签管理页点一下条目就跳到第一条"——用户以为是
+            // 编辑导致的，实际是这里的粘贴置顶。编辑本身不改排序键（timestamp）。
+            await invoke('copy_to_clipboard', { content, contentType: type, paste: true, id, deleteAfterUse: false });
         } catch (err) { console.error(err); }
     };
 

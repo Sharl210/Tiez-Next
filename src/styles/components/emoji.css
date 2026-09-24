@@ -50,7 +50,7 @@
 .active-tab-indicator {
   position: absolute;
   inset: 0;
-  background: var(--bg-panel);
+  background: var(--overlay-surface);
   border-radius: 9px;
   z-index: 1;
   border: 1px solid var(--line-soft);

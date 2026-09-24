@@ -56,7 +56,7 @@
     position: fixed;
     width: 320px;
     max-width: 80vw;
-    background: var(--bg-element);
+    background: var(--overlay-surface);
     /* Remove retro 2px border and offset shadow */
     border: var(--card-border);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
