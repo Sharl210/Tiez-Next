@@ -824,29 +824,25 @@ pub fn listen_ip(allow_lan: bool) -> Ipv4Addr {
 /// 不硬编码：默认只绑回环，用户显式打开局域网后才绑 `0.0.0.0`。
 ///
 /// 回退只在**同一地址族**内进行：`0.0.0.0` 段被占用与"本机端口被占用"是两件
-/// 事，混着试探会让用户看到与设置里填的地址不符的结果。
+/// 绑定监听器。
+///
+/// 端口策略：**严格使用用户配置的端口**。端口被占用或无权限时直接返回错误，
+/// 绝不自动改用其它端口；这样 MCP 客户端配置的 `http://127.0.0.1:23123/mcp`
+/// 不会在后台悄悄变成另一个地址。用户可以在设置页改端口，或使用端口处理工具
+/// 查看并停止占用进程后重试。
 pub async fn bind_listener(
     preferred: u16,
     allow_lan: bool,
 ) -> std::io::Result<(tokio::net::TcpListener, u16)> {
     let ip = listen_ip(allow_lan);
-    let mut port = if preferred == 0 {
+    let port = if preferred == 0 {
         super::store::DEFAULT_PORT
     } else {
         preferred
     };
-    loop {
-        let addr = std::net::SocketAddr::from((ip, port));
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => return Ok((listener, port)),
-            Err(_) if port < 65535 => port += 1,
-            Err(_) => {
-                let listener = tokio::net::TcpListener::bind((ip, 0u16)).await?;
-                let actual = listener.local_addr()?.port();
-                return Ok((listener, actual));
-            }
-        }
-    }
+    let addr = std::net::SocketAddr::from((ip, port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok((listener, port))
 }
 
 /// 只绑本机的绑定（`allow_lan = false` 的简写）。
@@ -1276,28 +1272,9 @@ mod tests {
     // ---------------- 端口绑定与监听地址 ----------------
 
     #[tokio::test]
-    async fn binds_to_loopback_only_with_fallback() {
-        // 【这条测试原先假设默认端口是空闲的，因此在"本机恰好跑着 MCP 服务"或
-        // 端口被别的东西占着时必然失败——而那种失败与代码是否正确毫无关系。】
-        //
-        // 实测撞到过：开发机上 23123 被占，该测试断言 `port_a == DEFAULT_PORT`
-        // 直接失败，看起来像回归，实际是环境。断言要验的是**行为**（先试默认端口、
-        // 被占则回退），不是"这台机器上默认端口一定空着"，所以先把默认端口占住，
-        // 再验证回退链。
-        let holder = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let taken = holder.local_addr().unwrap().port();
-
-        // 首选端口被占用时应回退到下一个可用端口，而不是失败。
-        let (second, port_b) = bind_local_listener(taken).await.unwrap();
-        assert_ne!(port_b, taken, "被占用的端口不该被返回");
-        assert!(port_b > taken, "回退应当向后找，实际 {} -> {}", taken, port_b);
-        let addr = second.local_addr().unwrap();
-        assert!(addr.ip().is_loopback(), "只能绑回环地址，实际 {}", addr.ip());
-
-        // 默认端口空闲时必须命中它——这是"0 表示用默认端口"的语义。
-        // 端口被占的情况下这条断言不成立，所以先确认它空闲。
+    async fn binds_to_loopback_only_strict() {
+        // 端口策略已改为"严格绑定"：端口被占用时直接报错，不再回退到其它端口。
+        // 先确认默认端口空闲时能命中它。
         let default_free = tokio::net::TcpListener::bind(("127.0.0.1", crate::services::mcp::store::DEFAULT_PORT))
             .await
             .is_ok();
@@ -1316,7 +1293,18 @@ mod tests {
                 crate::services::mcp::store::DEFAULT_PORT
             );
         }
-        assert!(second.local_addr().unwrap().ip().is_loopback());
+
+        // 端口被占用时必须报错，而不是悄悄改用其它端口。
+        let holder = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let result = bind_local_listener(taken).await;
+        assert!(
+            result.is_err(),
+            "端口被占用时必须报错，不能自动改用其它端口（实际绑成功了 {:?}）",
+            result.as_ref().map(|(_, p)| p)
+        );
     }
 
     /// 真绑定一个 socket，断言不同设置下**实际**落在哪个地址上。
@@ -1340,7 +1328,7 @@ mod tests {
         assert!(loopback.local_addr().unwrap().ip().is_loopback());
 
         // 打开局域网：绑 0.0.0.0，同网段其它机器可连。
-        let (any, port_any) = bind_listener(45_233, true).await.expect("应能绑定 0.0.0.0");
+        let (any, _port_any) = bind_listener(45_233, true).await.expect("应能绑定 0.0.0.0");
         assert_eq!(
             any.local_addr().unwrap().ip(),
             std::net::Ipv4Addr::UNSPECIFIED,
@@ -1351,15 +1339,11 @@ mod tests {
             "0.0.0.0 不是回环地址"
         );
 
-        // 回退逻辑在两种地址下都要工作：占用刚拿到的端口，再要一个应换到别处，
-        // 且**回退不得改变监听地址**。
-        let (fallback, port_fallback) = bind_listener(port_any, true).await.expect("应能回退");
-        assert_ne!(port_any, port_fallback, "端口被占用时应回退到下一个");
-        assert_eq!(
-            fallback.local_addr().unwrap().ip(),
-            std::net::Ipv4Addr::UNSPECIFIED,
-            "回退不得改变监听地址"
-        );
+        // 端口被占用时必须报错（严格绑定，不再回退）。
+        let holder = tokio::net::TcpListener::bind(("0.0.0.0", 45_234)).await.unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let result = bind_listener(taken, true).await;
+        assert!(result.is_err(), "端口被占用时应报错，不应回退");
     }
 
     #[tokio::test]

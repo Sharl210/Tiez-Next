@@ -16,6 +16,7 @@
 pub mod jsonrpc;
 #[cfg(test)]
 mod selfcheck;
+pub mod port_process;
 pub mod server;
 pub mod store;
 pub mod tools;

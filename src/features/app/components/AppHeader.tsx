@@ -13,7 +13,6 @@ import {
   X
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { getTagColor, getTagTextColor } from "../../../shared/lib/utils";
 
 interface AppHeaderProps {
   t: (key: string) => string;
@@ -75,10 +74,8 @@ const AppHeader = ({
   showTagFilter,
   setShowTagFilter,
   allTags,
-  searchIsFocused,
   setSearchIsFocused,
   setEditingTagsId,
-  theme,
   colorMode,
   settingsTitle,
   typeFilter,
@@ -235,31 +232,6 @@ const AppHeader = ({
                   }}
                   style={{ color: colorMode === 'dark' ? '#ffffff' : undefined }}
                 />
-                {showTagFilter && searchIsFocused && search.trim().length === 0 && allTags.length > 0 && (
-                  <div className="tags-dropdown">
-                    <div className="tags-label">{t('tags') || "Tags"}</div>
-                    <div className="tags-list">
-                      {allTags.map(tag => {
-                        const tagBackground = getTagColor(tag, theme);
-                        return (
-                          <span
-                            className="tag-chip"
-                            key={tag}
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              setSearch("tag:" + tag);
-                              setShowTagFilter(false);
-                            }}
-                            data-tag={tag}
-                            style={{ background: tagBackground, color: getTagTextColor(tagBackground) }}
-                          >
-                            {tag}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
               </div>
               <div
                 className="hide-scrollbar"

@@ -9,6 +9,8 @@ import {
     RefreshCw,
     ServerOff,
     ShieldAlert,
+    Activity,
+    X as XIcon,
 } from "lucide-react";
 
 /** 后端 `get_mcp_status` 的返回形状（camelCase）。 */
@@ -38,6 +40,25 @@ interface McpSettingsGroupProps {
     t: (key: string) => string;
     collapsed: boolean;
     onToggle: () => void;
+}
+
+/** 后端 `inspect_mcp_port_occupancy` 返回的进程信息。 */
+interface PortProcess {
+    pid: number;
+    processName: string;
+    executablePath: string | null;
+    localAddress: string;
+    state: string;
+    canTerminate: boolean;
+    isCurrentProcess: boolean;
+}
+
+/** 后端 `stop_mcp_port_process` / `stop_mcp_port_process_as_admin` 的返回。 */
+interface StopProcessResult {
+    stopped: boolean;
+    launchedElevated: boolean;
+    requiresAdmin: boolean;
+    message: string;
 }
 
 /**
@@ -120,6 +141,71 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
     const [copied, setCopied] = useState<"endpoint" | "lanEndpoint" | "token" | null>(null);
     /** 局域网开关触发重启后返回的端口，用于给用户一个明确的"已生效"回执。 */
     const [restartedPort, setRestartedPort] = useState<number | null>(null);
+
+    // --- 端口占用处理器（仅 Windows）---
+    const [portModalOpen, setPortModalOpen] = useState(false);
+    const [portProcesses, setPortProcesses] = useState<PortProcess[]>([]);
+    const [portModalPort, setPortModalPort] = useState("");
+    const [portModalBusy, setPortModalBusy] = useState(false);
+    const [portModalError, setPortModalError] = useState("");
+    const [portModalInfo, setPortModalInfo] = useState("");
+
+    const isWindows = /Windows/i.test(navigator.userAgent);
+
+    const inspectPort = useCallback(async (port: number) => {
+        setPortModalBusy(true);
+        setPortModalError("");
+        setPortModalInfo("");
+        try {
+            const result = await invoke<PortProcess[]>("inspect_mcp_port_occupancy", { port });
+            setPortProcesses(result);
+            if (result.length === 0) {
+                setPortModalInfo(`端口 ${port} 当前没有被占用`);
+            }
+        } catch (e) {
+            setPortModalError(String(e));
+        } finally {
+            setPortModalBusy(false);
+        }
+    }, []);
+
+    const stopProcess = useCallback(async (pid: number) => {
+        setPortModalBusy(true);
+        setPortModalError("");
+        setPortModalInfo("");
+        try {
+            const result = await invoke<StopProcessResult>("stop_mcp_port_process", { pid });
+            if (result.stopped) {
+                setPortModalInfo(`已停止进程 ${pid}`);
+            } else if (result.requiresAdmin) {
+                // 权限不足：发起管理员提权请求
+                try {
+                    const elevated = await invoke<StopProcessResult>("stop_mcp_port_process_as_admin", { pid });
+                    if (elevated.launchedElevated) {
+                        setPortModalInfo(`已发起管理员停止进程 ${pid} 的请求，请稍候刷新`);
+                    } else {
+                        setPortModalError(elevated.message);
+                    }
+                } catch (e2) {
+                    setPortModalError(String(e2));
+                }
+            } else {
+                setPortModalError(result.message);
+            }
+            // 刷新列表
+            const p = Number.parseInt(portModalPort, 10);
+            if (!Number.isNaN(p)) await inspectPort(p);
+        } catch (e) {
+            setPortModalError(String(e));
+        } finally {
+            setPortModalBusy(false);
+        }
+    }, [portModalPort, inspectPort]);
+
+    const refreshPortModal = useCallback(() => {
+        const p = Number.parseInt(portModalPort, 10);
+        if (!Number.isNaN(p) && p > 0) void inspectPort(p);
+    }, [portModalPort, inspectPort]);
 
     const refresh = useCallback(async () => {
         try {
@@ -232,6 +318,16 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
     const currentPort = configuredPort ?? status?.port ?? 0;
     const defaultPort = status?.defaultPort ?? 23123;
     const portIsDefault = currentPort === defaultPort;
+
+    const openPortModal = useCallback(() => {
+        const p = configuredPort ?? defaultPort;
+        setPortModalPort(String(p));
+        setPortModalOpen(true);
+        setPortProcesses([]);
+        setPortModalError("");
+        setPortModalInfo("");
+        void inspectPort(p);
+    }, [configuredPort, defaultPort, inspectPort]);
     /** 高风险组合：已开放局域网、却不要令牌。两者正交，因此只提示、不联动。 */
     const riskyCombo = allowLan && !requireToken;
 
@@ -530,6 +626,20 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                                 .replace("{current}", String(currentPort))}
                         </div>
                         <div style={STYLES.subNote}>{t("mcp_port_hint")}</div>
+                        {isWindows && (
+                            <div style={{ marginTop: "6px" }}>
+                                <button
+                                    type="button"
+                                    className="btn-icon"
+                                    onClick={() => openPortModal()}
+                                    style={STYLES.actionButton}
+                                    title={t("mcp_port_resolve_hint") || "检测并停止端口占用进程"}
+                                >
+                                    <Activity size={12} />
+                                    {t("mcp_port_resolve") || "端口占用处理"}
+                                </button>
+                            </div>
+                        )}
                     </div>
 
                     <div className="setting-item column no-border">
@@ -598,6 +708,101 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                         <p className="settings-subpage-note">{t("mcp_readonly_notice")}</p>
                     )}
                     {error && <p className="settings-subpage-note" style={{ color: DANGER_COLOR }}>{error}</p>}
+                </div>
+            )}
+
+            {/* 端口占用处理悬浮子页面（仅 Windows）*/}
+            {portModalOpen && (
+                <div className="modal-overlay" onClick={() => setPortModalOpen(false)} style={{ zIndex: 3400 }}>
+                    <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "460px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                            <h3 className="modal-title">{t("mcp_port_resolve") || "端口占用处理"}</h3>
+                            <button
+                                type="button"
+                                className="btn-icon"
+                                onClick={() => setPortModalOpen(false)}
+                                title={t("cancel") || "关闭"}
+                                style={STYLES.iconButton}
+                            >
+                                <XIcon size={14} />
+                            </button>
+                        </div>
+
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "10px" }}>
+                            <input
+                                className="search-input"
+                                inputMode="numeric"
+                                value={portModalPort}
+                                disabled={portModalBusy}
+                                onChange={(e) => setPortModalPort(e.target.value.replace(/[^0-9]/g, ""))}
+                                style={{ borderRadius: "4px", padding: "4px 8px", width: "84px", textAlign: "right" }}
+                            />
+                            <button
+                                type="button"
+                                className="btn-icon"
+                                disabled={portModalBusy}
+                                onClick={() => refreshPortModal()}
+                                style={STYLES.actionButton}
+                            >
+                                <RefreshCw size={12} />
+                                {t("mcp_port_check") || "检测"}
+                            </button>
+                        </div>
+
+                        {portModalBusy && <div style={STYLES.subNote}>正在检测…</div>}
+                        {portModalInfo && <div style={{ ...STYLES.subNote, marginBottom: "8px" }}>{portModalInfo}</div>}
+                        {portModalError && <div style={{ ...STYLES.subNote, color: DANGER_COLOR, marginBottom: "8px" }}>{portModalError}</div>}
+
+                        {portProcesses.length > 0 && (
+                            <div style={{ maxHeight: "240px", overflowY: "auto", borderTop: "1px solid var(--border-color, rgba(128,128,128,0.2))", marginTop: "8px" }}>
+                                {portProcesses.map((proc) => (
+                                    <div
+                                        key={`${proc.pid}-${proc.localAddress}`}
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "space-between",
+                                            padding: "8px 0",
+                                            borderBottom: "1px solid var(--border-color, rgba(128,128,128,0.12))",
+                                            gap: "8px",
+                                        }}
+                                    >
+                                        <div style={{ minWidth: 0, flex: 1 }}>
+                                            <div style={{ fontSize: "12px", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                {proc.processName} <span style={{ opacity: 0.6 }}>(PID {proc.pid})</span>
+                                            </div>
+                                            {proc.executablePath && (
+                                                <div style={STYLES.subNote}>
+                                                    {proc.executablePath}
+                                                </div>
+                                            )}
+                                            <div style={STYLES.subNote}>
+                                                {proc.localAddress} · {proc.state}
+                                            </div>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="btn-icon"
+                                            disabled={portModalBusy || proc.isCurrentProcess}
+                                            onClick={() => void stopProcess(proc.pid)}
+                                            style={{
+                                                ...STYLES.actionButton,
+                                                color: proc.isCurrentProcess ? "var(--text-secondary)" : DANGER_COLOR,
+                                                flexShrink: 0,
+                                            }}
+                                            title={proc.isCurrentProcess ? (t("mcp_port_self_skip") || "不能停止当前应用") : (t("mcp_port_stop") || "停止进程")}
+                                        >
+                                            {t("mcp_port_stop") || "停止"}
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        <div style={{ ...STYLES.subNote, marginTop: "10px" }}>
+                            {t("mcp_port_resolve_desc") || "输入端口号检测占用进程，点击停止可结束对应进程。权限不足时会请求管理员权限。"}
+                        </div>
+                    </div>
                 </div>
             )}
         </div>

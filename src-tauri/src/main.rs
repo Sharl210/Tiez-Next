@@ -264,7 +264,10 @@ fn main() {
             services::mcp::set_mcp_allow_lan,
             services::mcp::set_mcp_port,
             services::mcp::set_mcp_autostart,
-            services::mcp::regenerate_mcp_token
+            services::mcp::regenerate_mcp_token,
+            services::mcp::port_process::inspect_mcp_port_occupancy,
+            services::mcp::port_process::stop_mcp_port_process,
+            services::mcp::port_process::stop_mcp_port_process_as_admin
         ])
         .on_window_event(|window, event| {
             setup::handle_window_event(window, event);
