@@ -10,66 +10,36 @@ type UseSearchScrollOptions = {
   appSettings: Record<string, string>;
 };
 
+/**
+ * 搜索框的滚动触发逻辑 —— **已停用**。
+ *
+ * 此前搜索框靠"滚到列表最顶部再往下拉"触发打开，往下滚触发关闭。这有两个问题：
+ *
+ * ① 用户必须先滚到最顶部才能打开搜索 —— 在长列表里非常反直觉；
+ * ② 下拉判定与标签候选列表的滚动判定**互相干扰** —— 候补列表里滚动会误触发
+ *   搜索框的打开/关闭，正是用户反馈的"候选列表滚动还会触发外面搜索框"。
+ *
+ * 现在搜索框改为右上角放大镜按钮触发（`AppHeader.tsx`），在任何位置都能开关，
+ * 不依赖滚动位置。本 hook 保留签名以避免调用方大面积改动，但 `handleMainWheel`
+ * 不再做任何搜索相关的操作。
+ *
+ * `handleListScroll` 仍保留 `listScrollTopRef` 的记录 —— 如果将来有别的逻辑
+ * 需要知道"是否在顶部"，可以复用。但不再触发搜索框。
+ */
 export const useSearchScroll = ({
-  showSearchBox,
-  setShowSearchBox,
-  search,
-  showSettings,
-  showTagManager,
-  appSettings
-}: UseSearchScrollOptions) => {
-  const scrollTriggerRef = useRef(0);
+}: UseSearchScrollOptions = {}) => {
   const listScrollTopRef = useRef(0);
-  const topReachedTimeRef = useRef(0);
 
   const handleListScroll = useCallback((offset: number) => {
-    if (offset === 0 && listScrollTopRef.current > 0) {
-      topReachedTimeRef.current = Date.now();
-    }
     listScrollTopRef.current = offset;
   }, []);
 
+  // 不再通过滚轮触发搜索框的打开/关闭 —— 改为按钮触发。
   const handleMainWheel = useCallback(
-    (e: ReactWheelEvent<HTMLElement>) => {
-      if (showSettings || showTagManager) return;
-
-      if (
-        e.deltaY < -5 &&
-        (listScrollTopRef.current === 0 || isNaN(listScrollTopRef.current))
-      ) {
-        if (Date.now() - topReachedTimeRef.current > 250) {
-          if (!showSearchBox) {
-            scrollTriggerRef.current += Math.abs(e.deltaY);
-            if (scrollTriggerRef.current > 45) {
-              setShowSearchBox(true);
-              scrollTriggerRef.current = 0;
-            }
-          }
-        } else {
-          scrollTriggerRef.current = 0;
-        }
-      } else {
-        scrollTriggerRef.current = 0;
-      }
-
-      if (
-        e.deltaY > 10 &&
-        showSearchBox &&
-        search.trim() === "" &&
-        appSettings["app.show_search_box"] !== "true"
-      ) {
-        // See App.tsx note: do not persist setting when hiding temporary search.
-        setShowSearchBox(false);
-      }
+    (_e: ReactWheelEvent<HTMLElement>) => {
+      // intentionally empty: search is now button-triggered, not scroll-triggered.
     },
-    [
-      showSettings,
-      showTagManager,
-      showSearchBox,
-      search,
-      appSettings,
-      setShowSearchBox
-    ]
+    []
   );
 
   return {

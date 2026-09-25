@@ -31,6 +31,7 @@ interface AppHeaderProps {
   setIsWindowPinned: (val: boolean) => void;
   clearHistory: () => void;
   showSearchBox: boolean;
+  setShowSearchBox: (val: boolean) => void;
   search: string;
   setSearch: (val: string) => void;
   setIsComposing: (val: boolean) => void;
@@ -66,6 +67,7 @@ const AppHeader = ({
   setIsWindowPinned,
   clearHistory,
   showSearchBox,
+  setShowSearchBox,
   search,
   setSearch,
   setIsComposing,
@@ -134,6 +136,21 @@ const AppHeader = ({
 
         {!showSettings && !showTagManager && !showEmojiPanel && (
           <>
+            {/* 搜索按钮：点击展开/收起搜索框。
+             *
+             * 此前搜索框靠"滚到顶再往下拉"触发（useSearchScroll），这有两个问题：
+             * ①用户必须先滚到最顶部才能打开搜索，在长列表里很反直觉；
+             * ②下拉判定与标签候选列表的滚动判定互相干扰 —— 候补列表里滚动会
+             *   误触发搜索框的打开/关闭。
+             * 改为按钮触发后，搜索在任何位置都能打开，且不干扰候选列表滚动。
+             */}
+            <button
+              className={`btn-icon ${showSearchBox ? 'active' : ''}`}
+              title={t('search') || '搜索'}
+              onClick={() => setShowSearchBox(!showSearchBox)}
+            >
+              <Search size={16} />
+            </button>
             <button className="btn-icon" title={t('clear_history')} onClick={clearHistory}>
               <Trash2 size={16} />
             </button>

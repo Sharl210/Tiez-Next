@@ -1134,6 +1134,7 @@ const App = () => {
         setIsWindowPinned={setIsWindowPinned}
         clearHistory={clearHistory}
         showSearchBox={showSearchBox}
+        setShowSearchBox={setShowSearchBox}
         search={search}
         setSearch={setSearch}
         setIsComposing={setIsComposing}
