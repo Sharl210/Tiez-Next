@@ -680,10 +680,12 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                             </div>
                             <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
                                 <input
-                                    className="search-input"
+                                    className="search-input window-no-drag"
                                     inputMode="numeric"
                                     value={portInput}
                                     disabled={busy}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onFocus={(e) => e.currentTarget.select()}
                                     onChange={(e) => setPortInput(e.target.value.replace(/[^0-9]/g, ""))}
                                     style={{ borderRadius: "4px", padding: "4px 8px", width: "84px", textAlign: "right" }}
                                 />
@@ -818,10 +820,12 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
 
                         <div style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "10px" }}>
                             <input
-                                className="search-input"
+                                className="search-input window-no-drag"
                                 inputMode="numeric"
                                 value={portModalPort}
                                 disabled={portModalBusy}
+                                onMouseDown={(e) => e.stopPropagation()}
+                                onFocus={(e) => e.currentTarget.select()}
                                 onChange={(e) => setPortModalPort(e.target.value.replace(/[^0-9]/g, ""))}
                                 style={{ borderRadius: "4px", padding: "4px 8px", width: "84px", textAlign: "right" }}
                             />
@@ -883,12 +887,13 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                                             )}
                                             <div style={STYLES.subNote}>
                                                 {proc.localAddress} · {proc.state}
+                                                {!proc.canTerminate && !proc.isCurrentProcess && " · 进程已退出或无法访问"}
                                             </div>
                                         </div>
                                         <button
                                             type="button"
                                             className="btn-icon"
-                                            disabled={portModalBusy || proc.isCurrentProcess}
+                                            disabled={portModalBusy || proc.isCurrentProcess || !proc.canTerminate}
                                             onClick={() => void stopProcess(proc.pid)}
                                             style={{
                                                 ...STYLES.actionButton,

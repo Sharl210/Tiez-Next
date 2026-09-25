@@ -1,4 +1,16 @@
-/* Settings Panel */
+/* 设置页输入控件必须显式退出窗口拖拽区，否则 WebView2 会把点击当成拖动窗口。 */
+.settings-view input,
+.settings-view textarea,
+.settings-view select,
+.modal-overlay input,
+.modal-overlay textarea,
+.modal-overlay select {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  user-select: text;
+  pointer-events: auto;
+}
+
 .settings-view {
   background: transparent;
   padding: 12px 8px;

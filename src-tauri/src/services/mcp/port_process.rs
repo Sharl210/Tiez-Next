@@ -35,6 +35,10 @@ fn parse_netstat_line(line: &str, port: u16) -> Option<(String, String, u32)> {
     if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("TCP") {
         return None;
     }
+    // 只有 LISTENING 真正占住绑定端口；ESTABLISHED/TIME_WAIT 不应被当成可停止的监听进程。
+    if !fields[3].eq_ignore_ascii_case("LISTENING") {
+        return None;
+    }
     if port_from_local_address(fields[1])? != port {
         return None;
     }
@@ -70,7 +74,7 @@ fn tasklist_process_name(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn process_identity(pid: u32) -> (String, Option<String>, bool) {
+fn process_identity(pid: u32) -> Option<(String, Option<String>, bool)> {
     use std::path::Path;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
@@ -81,8 +85,8 @@ fn process_identity(pid: u32) -> (String, Option<String>, bool) {
     let current = unsafe { GetCurrentProcessId() } == pid;
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) };
     let Ok(handle) = handle else {
-        let name = tasklist_process_name(pid).unwrap_or_else(|| "未知进程".to_string());
-        return (name, None, !current);
+        let name = tasklist_process_name(pid)?;
+        return Some((name, None, false));
     };
     let mut path_buf = [0u16; 2048];
     let length = unsafe { GetModuleFileNameExW(Some(handle), None, &mut path_buf) };
@@ -99,12 +103,12 @@ fn process_identity(pid: u32) -> (String, Option<String>, bool) {
         .map(str::to_string)
         .or_else(|| tasklist_process_name(pid))
         .unwrap_or_else(|| "未知进程".to_string());
-    (name, path, !current)
+    Some((name, path, !current))
 }
 
 #[cfg(not(windows))]
-fn process_identity(_pid: u32) -> (String, Option<String>, bool) {
-    ("仅 Windows 可用".to_string(), None, false)
+fn process_identity(_pid: u32) -> Option<(String, Option<String>, bool)> {
+    Some(("仅 Windows 可用".to_string(), None, false))
 }
 
 /// 查询指定 TCP 端口的占用进程。
@@ -137,6 +141,9 @@ pub fn inspect_mcp_port_occupancy(port: u16) -> Result<Vec<PortProcess>, String>
             let identity = identities
                 .entry(pid)
                 .or_insert_with(|| process_identity(pid));
+            let Some(identity) = identity.as_ref() else {
+                continue;
+            };
             result.push(PortProcess {
                 pid,
                 process_name: identity.0.clone(),
