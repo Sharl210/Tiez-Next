@@ -43,9 +43,18 @@ fn parse_netstat_line(line: &str, port: u16) -> Option<(String, String, u32)> {
 }
 
 #[cfg(windows)]
+fn hidden_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(windows)]
 fn tasklist_process_name(pid: u32) -> Option<String> {
     let filter = format!("PID eq {}", pid);
-    let output = std::process::Command::new("tasklist.exe")
+    let output = hidden_command("tasklist.exe")
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
         .output()
         .ok()?;
@@ -111,7 +120,7 @@ pub fn inspect_mcp_port_occupancy(port: u16) -> Result<Vec<PortProcess>, String>
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("netstat.exe")
+        let output = hidden_command("netstat.exe")
             .args(["-ano", "-p", "tcp"])
             .output()
             .map_err(|e| format!("无法执行 Windows netstat：{}", e))?;
@@ -120,18 +129,21 @@ pub fn inspect_mcp_port_occupancy(port: u16) -> Result<Vec<PortProcess>, String>
         }
         let text = String::from_utf8_lossy(&output.stdout);
         let mut result = Vec::new();
+        let mut identities = std::collections::HashMap::new();
         for line in text.lines() {
             let Some((local_address, state, pid)) = parse_netstat_line(line, port) else {
                 continue;
             };
-            let (process_name, executable_path, can_terminate) = process_identity(pid);
+            let identity = identities
+                .entry(pid)
+                .or_insert_with(|| process_identity(pid));
             result.push(PortProcess {
                 pid,
-                process_name,
-                executable_path,
+                process_name: identity.0.clone(),
+                executable_path: identity.1.clone(),
                 local_address,
                 state,
-                can_terminate,
+                can_terminate: identity.2,
                 is_current_process: pid == std::process::id(),
             });
         }

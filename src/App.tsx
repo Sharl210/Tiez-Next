@@ -900,6 +900,7 @@ const App = () => {
       if (type === 'theme') localStorage.setItem('tiez_theme', path);
       if (type === 'color_mode') localStorage.setItem('tiez_color_mode', path);
       if (type === 'compact_mode') localStorage.setItem('tiez_compact_mode', path);
+      if (type === 'show_search_box') localStorage.setItem('tiez_show_search_box', path);
     } catch (e) {
       // Ignore localStorage errors
     }

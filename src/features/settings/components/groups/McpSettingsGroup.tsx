@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
     ChevronDown,
@@ -149,10 +149,14 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
     const [portModalBusy, setPortModalBusy] = useState(false);
     const [portModalError, setPortModalError] = useState("");
     const [portModalInfo, setPortModalInfo] = useState("");
+    const [adminProcess, setAdminProcess] = useState<PortProcess | null>(null);
+    const portOperationInFlightRef = useRef(false);
 
     const isWindows = /Windows/i.test(navigator.userAgent);
 
-    const inspectPort = useCallback(async (port: number, clearFeedback = true): Promise<PortProcess[] | null> => {
+    const inspectPort = useCallback(async (port: number, clearFeedback = true, nested = false): Promise<PortProcess[] | null> => {
+        if (!nested && portOperationInFlightRef.current) return null;
+        if (!nested) portOperationInFlightRef.current = true;
         setPortModalBusy(true);
         setPortModalError("");
         if (clearFeedback) setPortModalInfo("");
@@ -168,10 +172,13 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
             return null;
         } finally {
             setPortModalBusy(false);
+            if (!nested) portOperationInFlightRef.current = false;
         }
     }, [t]);
 
     const stopProcess = useCallback(async (pid: number) => {
+        if (portOperationInFlightRef.current) return;
+        portOperationInFlightRef.current = true;
         const process = portProcesses.find((item) => item.pid === pid);
         const processLabel = process?.processName || `PID ${pid}`;
         const port = Number.parseInt(portModalPort, 10);
@@ -185,43 +192,27 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
         try {
             const result = await invoke<StopProcessResult>("stop_mcp_port_process", { pid });
             if (!result.stopped && result.requiresAdmin) {
-                const elevated = await invoke<StopProcessResult>("stop_mcp_port_process_as_admin", { pid });
-                if (!elevated.launchedElevated) {
-                    setPortModalError(elevated.message);
-                    return;
-                }
+                setAdminProcess(process ?? {
+                    pid,
+                    processName: processLabel,
+                    executablePath: null,
+                    localAddress: "",
+                    state: "",
+                    canTerminate: false,
+                    isCurrentProcess: false,
+                });
                 setPortModalInfo(
-                    t("mcp_port_admin_request")
+                    t("mcp_port_admin_needed")
                         .replace("{process}", processLabel)
                         .replace("{pid}", String(pid)),
                 );
-                // UAC/taskkill 是异步的：稍后复查，不能把“已发起”冒充“已停止”。
-                window.setTimeout(() => {
-                    void (async () => {
-                        const latest = await inspectPort(port, false);
-                        if (latest && !latest.some((item) => item.pid === pid)) {
-                            setPortModalInfo(
-                                t("mcp_port_stopped")
-                                    .replace("{process}", processLabel)
-                                    .replace("{pid}", String(pid))
-                                    .replace("{port}", String(port)),
-                            );
-                        } else {
-                            setPortModalError(
-                                t("mcp_port_still_occupied")
-                                    .replace("{process}", processLabel)
-                                    .replace("{port}", String(port)),
-                            );
-                        }
-                    })();
-                }, 900);
                 return;
             }
             if (!result.stopped) {
                 setPortModalError(result.message);
                 return;
             }
-            const latest = await inspectPort(port, false);
+            const latest = await inspectPort(port, false, true);
             if (latest && !latest.some((item) => item.pid === pid)) {
                 setPortModalInfo(
                     t("mcp_port_stopped")
@@ -229,7 +220,7 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                         .replace("{pid}", String(pid))
                         .replace("{port}", String(port)),
                 );
-            } else {
+            } else if (latest) {
                 setPortModalError(
                     t("mcp_port_still_occupied")
                         .replace("{process}", processLabel)
@@ -239,9 +230,65 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
         } catch (e) {
             setPortModalError(String(e));
         } finally {
+            portOperationInFlightRef.current = false;
             setPortModalBusy(false);
         }
     }, [portProcesses, portModalPort, inspectPort, t]);
+
+    const confirmAdminStop = useCallback(async () => {
+        const process = adminProcess;
+        if (!process || portOperationInFlightRef.current) return;
+        portOperationInFlightRef.current = true;
+        const port = Number.parseInt(portModalPort, 10);
+        setAdminProcess(null);
+        setPortModalBusy(true);
+        setPortModalError("");
+        let waitingForVerification = false;
+        try {
+            const elevated = await invoke<StopProcessResult>("stop_mcp_port_process_as_admin", { pid: process.pid });
+            if (!elevated.launchedElevated) {
+                setPortModalError(elevated.message);
+                return;
+            }
+            waitingForVerification = true;
+            setPortModalInfo(
+                t("mcp_port_admin_request")
+                    .replace("{process}", process.processName)
+                    .replace("{pid}", String(process.pid)),
+            );
+            window.setTimeout(() => {
+                void (async () => {
+                    try {
+                        const latest = await inspectPort(port, false, true);
+                        if (latest && !latest.some((item) => item.pid === process.pid)) {
+                            setPortModalInfo(
+                                t("mcp_port_stopped")
+                                    .replace("{process}", process.processName)
+                                    .replace("{pid}", String(process.pid))
+                                    .replace("{port}", String(port)),
+                            );
+                        } else if (latest) {
+                            setPortModalError(
+                                t("mcp_port_still_occupied")
+                                    .replace("{process}", process.processName)
+                                    .replace("{port}", String(port)),
+                            );
+                        }
+                    } finally {
+                        portOperationInFlightRef.current = false;
+                        setPortModalBusy(false);
+                    }
+                })();
+            }, 900);
+        } catch (e) {
+            setPortModalError(String(e));
+        } finally {
+            if (!waitingForVerification) {
+                portOperationInFlightRef.current = false;
+                setPortModalBusy(false);
+            }
+        }
+    }, [adminProcess, portModalPort, inspectPort, t]);
 
     const refreshPortModal = useCallback(() => {
         const p = Number.parseInt(portModalPort, 10);
@@ -859,6 +906,27 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
 
                         <div style={{ ...STYLES.subNote, marginTop: "10px" }}>
                             {t("mcp_port_resolve_desc") || "输入端口号检测占用进程，点击停止可结束对应进程。权限不足时会请求管理员权限。"}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {adminProcess && (
+                <div className="modal-overlay" onClick={() => setAdminProcess(null)} style={{ zIndex: 3500 }}>
+                    <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+                        <h3 className="modal-title">需要管理员权限</h3>
+                        <p style={{ fontSize: "12px", lineHeight: 1.6 }}>
+                            {t("mcp_port_admin_needed")
+                                .replace("{process}", adminProcess.processName)
+                                .replace("{pid}", String(adminProcess.pid))}
+                        </p>
+                        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "14px" }}>
+                            <button type="button" className="btn-icon" onClick={() => setAdminProcess(null)}>
+                                取消
+                            </button>
+                            <button type="button" className="btn-icon" onClick={() => void confirmAdminStop()} style={{ color: DANGER_COLOR }}>
+                                请求管理员权限
+                            </button>
                         </div>
                     </div>
                 </div>

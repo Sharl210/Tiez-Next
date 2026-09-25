@@ -30,6 +30,18 @@
   box-shadow: var(--button-active-shadow);
 }
 
+.btn-icon.search-toggle-btn--on {
+  background: var(--accent-soft);
+  color: var(--accent-color);
+  border-color: var(--line-soft);
+  box-shadow: 0 0 0 2px var(--accent-soft), var(--button-shadow);
+}
+
+.btn-icon.search-toggle-btn--on:hover {
+  background: var(--accent-soft);
+  border-color: var(--button-hover-border-color);
+}
+
 .btn-icon.active {
   background: var(--button-active-filled-background);
   color: var(--button-active-filled-color);

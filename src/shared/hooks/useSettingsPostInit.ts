@@ -341,7 +341,13 @@ export const useSettingsPostInit = ({
     const edgeDockingEnabled = settings["app.edge_docking"] === "true";
     setEdgeDocking(edgeDockingEnabled);
 
-    if (settings["app.show_search_box"] === "false") setShowSearchBox(false);
+    const showSearchBoxSetting = settings["app.show_search_box"] !== "false";
+    setShowSearchBox(showSearchBoxSetting);
+    try {
+      localStorage.setItem("tiez_show_search_box", showSearchBoxSetting ? "true" : "false");
+    } catch {
+      // Ignore localStorage errors; the database setting remains authoritative.
+    }
     setScrollTopButtonEnabled(settings["app.show_scroll_top_button"] !== "false");
     if (settings["app.arrow_key_selection"] === "false") setArrowKeySelection(false);
 

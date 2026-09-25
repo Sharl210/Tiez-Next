@@ -104,7 +104,15 @@ export const useAppState = (): AppState => {
   setRuntimeLocale(language);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [isWindowPinned, setIsWindowPinned] = useState(false);
-  const [showSearchBox, setShowSearchBox] = useState(true);
+  // 与设置加载同一首帧读取：避免先显示搜索框、再异步恢复为关闭状态造成闪烁。
+  // Tauri 的持久设置仍是权威来源；localStorage 只是同步启动快照，加载后会校正。
+  const [showSearchBox, setShowSearchBox] = useState(() => {
+    try {
+      return localStorage.getItem("tiez_show_search_box") !== "false";
+    } catch {
+      return true;
+    }
+  });
   const [scrollTopButtonEnabled, setScrollTopButtonEnabled] = useState(true);
   const [arrowKeySelection, setArrowKeySelection] = useState(true);
   const [hideTrayIcon, setHideTrayIcon] = useState(false);

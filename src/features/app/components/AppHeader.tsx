@@ -142,11 +142,20 @@ const AppHeader = ({
              * 改为按钮触发后，搜索在任何位置都能打开，且不干扰候选列表滚动。
              */}
             <button
-              className="btn-icon"
+              className={`btn-icon search-toggle-btn ${showSearchBox ? 'search-toggle-btn--on' : ''}`}
               title={t('search') || '搜索'}
               aria-label={t('search') || '搜索'}
               aria-pressed={showSearchBox}
-              onClick={() => setShowSearchBox(!showSearchBox)}
+              onClick={() => {
+                const next = !showSearchBox;
+                setShowSearchBox(next);
+                try {
+                  localStorage.setItem('tiez_show_search_box', next ? 'true' : 'false');
+                } catch {
+                  // The database setting below remains authoritative.
+                }
+                invoke('save_setting', { key: 'app.show_search_box', value: String(next) }).catch(console.error);
+              }}
             >
               <Search size={16} />
             </button>
