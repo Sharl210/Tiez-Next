@@ -14,6 +14,7 @@ interface AdvancedSettingsGroupProps {
     appCleanupPolicies: AppCleanupPolicy[];
     setAppCleanupPolicies: (val: AppCleanupPolicy[]) => void;
     installedApps: InstalledAppOption[];
+    advancedSidebarLayout?: string;
 }
 
 interface EditableRule {
@@ -92,17 +93,51 @@ const AdvancedSettingsGroup = ({
     setCleanupRules,
     appCleanupPolicies,
     setAppCleanupPolicies,
-    installedApps
+    installedApps,
+    advancedSidebarLayout
 }: AdvancedSettingsGroupProps) => {
+    const cachedLayout = useMemo(() => {
+        try {
+            const source = advancedSidebarLayout || localStorage.getItem("tiez_advanced_sidebar_layout") || "";
+            const parsed = JSON.parse(source || "null");
+            return {
+                width: typeof parsed?.width === "number" ? parsed.width : 120,
+                height: typeof parsed?.height === "number" ? parsed.height : 180,
+            };
+        } catch {
+            return { width: 120, height: 180 };
+        }
+    }, [advancedSidebarLayout]);
     const [searchText, setSearchText] = useState("");
     const [selectedSourceId, setSelectedSourceId] = useState("global");
     const [expandedRuleIndex, setExpandedRuleIndex] = useState<number | null>(0);
     const [draftRules, setDraftRules] = useState<EditableRule[]>(parseRules(cleanupRules));
-    const [sidebarWidth, setSidebarWidth] = useState(120);
-    const [sidebarHeight, setSidebarHeight] = useState(180);
+    const [sidebarWidth, setSidebarWidth] = useState(() => cachedLayout.width);
+    const [sidebarHeight, setSidebarHeight] = useState(() => cachedLayout.height);
+    const sidebarWidthRef = useRef(sidebarWidth);
+    const sidebarHeightRef = useRef(sidebarHeight);
     const [isResizing, setIsResizing] = useState(false);
     const [isStacked, setIsStacked] = useState(false);
     const workbenchRef = useRef<HTMLElement | null>(null);
+
+    useEffect(() => {
+        if (!advancedSidebarLayout) return;
+        try {
+            if (localStorage.getItem("tiez_advanced_sidebar_layout")) return;
+            const parsed = JSON.parse(advancedSidebarLayout);
+            if (typeof parsed?.width === "number") {
+                sidebarWidthRef.current = parsed.width;
+                setSidebarWidth(parsed.width);
+            }
+            if (typeof parsed?.height === "number") {
+                sidebarHeightRef.current = parsed.height;
+                setSidebarHeight(parsed.height);
+            }
+            localStorage.setItem("tiez_advanced_sidebar_layout", advancedSidebarLayout);
+        } catch {
+            // Keep the safe defaults when the persisted layout is malformed.
+        }
+    }, [advancedSidebarLayout]);
 
     const configuredAppPolicies = appCleanupPolicies;
 
@@ -198,16 +233,25 @@ const AdvancedSettingsGroup = ({
             if (isStacked) {
                 const maxHeight = Math.max(140, bounds.height - 220);
                 const nextHeight = Math.min(Math.max(event.clientY - bounds.top, 120), maxHeight);
+                sidebarHeightRef.current = nextHeight;
                 setSidebarHeight(nextHeight);
                 return;
             }
 
             const nextWidth = Math.min(Math.max(event.clientX - bounds.left, 80), 280);
+            sidebarWidthRef.current = nextWidth;
             setSidebarWidth(nextWidth);
         };
 
         const handleMouseUp = () => {
             setIsResizing(false);
+            const layout = JSON.stringify({ width: sidebarWidthRef.current, height: sidebarHeightRef.current });
+            try {
+                localStorage.setItem("tiez_advanced_sidebar_layout", layout);
+            } catch {
+                // The database setting remains the durable source when available.
+            }
+            invoke("save_setting", { key: "app.advanced_sidebar_layout", value: layout }).catch(console.error);
             document.body.style.cursor = "";
             document.body.style.userSelect = "";
         };

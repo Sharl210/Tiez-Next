@@ -480,6 +480,7 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                         appCleanupPolicies={appCleanupPolicies}
                         setAppCleanupPolicies={setAppCleanupPolicies}
                         installedApps={installedApps}
+                        advancedSidebarLayout={appSettings["app.advanced_sidebar_layout"]}
                     />
 
                     <AiProfileModal

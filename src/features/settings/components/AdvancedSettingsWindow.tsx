@@ -273,6 +273,7 @@ const AdvancedSettingsWindow = () => {
                 appCleanupPolicies={appCleanupPolicies}
                 setAppCleanupPolicies={setAppCleanupPolicies}
                 installedApps={installedApps}
+                advancedSidebarLayout={settings?.["app.advanced_sidebar_layout"]}
             />
         </div>
     );

@@ -221,24 +221,69 @@ pub fn stop_mcp_port_process_as_admin(pid: u32) -> Result<StopProcessResult, Str
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-        let exe = OsStr::new("taskkill.exe").encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let verb = OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let args = format!("/PID {} /F", pid);
-        let args_w = OsStr::new(&args).encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let result = unsafe {
-            ShellExecuteW(None, PCWSTR::from_raw(verb.as_ptr()), PCWSTR::from_raw(exe.as_ptr()), PCWSTR::from_raw(args_w.as_ptr()), PCWSTR::null(), SW_HIDE)
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        use windows::Win32::UI::Shell::{
+            ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS,
         };
-        if result.0 as usize <= 32 {
-            return Err("管理员权限请求被取消或无法启动 taskkill".to_string());
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        let exe = OsStr::new("taskkill.exe")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let verb = OsStr::new("runas")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // `/T` 也结束该进程可能创建的子进程；这仍然只针对用户明确选择的 PID。
+        let args = format!("/PID {} /F /T", pid);
+        let args_w = OsStr::new(&args)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut execute_info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: PCWSTR::from_raw(verb.as_ptr()),
+            lpFile: PCWSTR::from_raw(exe.as_ptr()),
+            lpParameters: PCWSTR::from_raw(args_w.as_ptr()),
+            nShow: SW_HIDE.0,
+            ..Default::default()
+        };
+
+        unsafe {
+            if ShellExecuteExW(&mut execute_info).is_err() {
+                return Err("管理员权限请求被取消或无法启动 taskkill".to_string());
+            }
+            let wait_result = WaitForSingleObject(execute_info.hProcess, 10_000);
+            if wait_result != WAIT_OBJECT_0 {
+                CloseHandle(execute_info.hProcess).ok();
+                return Ok(StopProcessResult {
+                    stopped: false,
+                    launched_elevated: true,
+                    requires_admin: false,
+                    message: "管理员停止命令仍在运行，稍后将复查端口".to_string(),
+                });
+            }
+            let mut exit_code = 1u32;
+            let exit_result = GetExitCodeProcess(execute_info.hProcess, &mut exit_code);
+            CloseHandle(execute_info.hProcess).ok();
+            if exit_result.is_ok() && exit_code == 0 {
+                return Ok(StopProcessResult {
+                    stopped: true,
+                    launched_elevated: true,
+                    requires_admin: false,
+                    message: "管理员停止命令已成功执行".to_string(),
+                });
+            }
+            Ok(StopProcessResult {
+                stopped: false,
+                launched_elevated: true,
+                requires_admin: false,
+                message: format!("管理员停止命令失败（退出码 {}）", exit_code),
+            })
         }
-        Ok(StopProcessResult {
-            stopped: false,
-            launched_elevated: true,
-            requires_admin: false,
-            message: "已发起管理员停止请求，请稍候刷新".to_string(),
-        })
     }
 }
 
