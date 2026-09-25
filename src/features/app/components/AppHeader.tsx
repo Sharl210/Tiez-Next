@@ -142,8 +142,10 @@ const AppHeader = ({
              * 改为按钮触发后，搜索在任何位置都能打开，且不干扰候选列表滚动。
              */}
             <button
-              className={`btn-icon ${showSearchBox ? 'active' : ''}`}
+              className="btn-icon"
               title={t('search') || '搜索'}
+              aria-label={t('search') || '搜索'}
+              aria-pressed={showSearchBox}
               onClick={() => setShowSearchBox(!showSearchBox)}
             >
               <Search size={16} />

@@ -1,6 +1,6 @@
 [package]
 name = "tiez-next"
-version = "0.5.12"
+version = "0.5.13"
 description = "Tiez-Next — a cross-platform clipboard manager"
 authors = ["Sharl210"]
 edition = "2021"

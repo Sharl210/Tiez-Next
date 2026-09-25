@@ -152,55 +152,96 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
 
     const isWindows = /Windows/i.test(navigator.userAgent);
 
-    const inspectPort = useCallback(async (port: number) => {
+    const inspectPort = useCallback(async (port: number, clearFeedback = true): Promise<PortProcess[] | null> => {
         setPortModalBusy(true);
         setPortModalError("");
-        setPortModalInfo("");
+        if (clearFeedback) setPortModalInfo("");
         try {
             const result = await invoke<PortProcess[]>("inspect_mcp_port_occupancy", { port });
             setPortProcesses(result);
-            if (result.length === 0) {
-                setPortModalInfo(`端口 ${port} 当前没有被占用`);
+            if (clearFeedback && result.length === 0) {
+                setPortModalInfo(t("mcp_port_free").replace("{port}", String(port)));
             }
+            return result;
         } catch (e) {
             setPortModalError(String(e));
+            return null;
         } finally {
             setPortModalBusy(false);
         }
-    }, []);
+    }, [t]);
 
     const stopProcess = useCallback(async (pid: number) => {
+        const process = portProcesses.find((item) => item.pid === pid);
+        const processLabel = process?.processName || `PID ${pid}`;
+        const port = Number.parseInt(portModalPort, 10);
         setPortModalBusy(true);
         setPortModalError("");
-        setPortModalInfo("");
+        setPortModalInfo(
+            t("mcp_port_stopping")
+                .replace("{process}", processLabel)
+                .replace("{pid}", String(pid)),
+        );
         try {
             const result = await invoke<StopProcessResult>("stop_mcp_port_process", { pid });
-            if (result.stopped) {
-                setPortModalInfo(`已停止进程 ${pid}`);
-            } else if (result.requiresAdmin) {
-                // 权限不足：发起管理员提权请求
-                try {
-                    const elevated = await invoke<StopProcessResult>("stop_mcp_port_process_as_admin", { pid });
-                    if (elevated.launchedElevated) {
-                        setPortModalInfo(`已发起管理员停止进程 ${pid} 的请求，请稍候刷新`);
-                    } else {
-                        setPortModalError(elevated.message);
-                    }
-                } catch (e2) {
-                    setPortModalError(String(e2));
+            if (!result.stopped && result.requiresAdmin) {
+                const elevated = await invoke<StopProcessResult>("stop_mcp_port_process_as_admin", { pid });
+                if (!elevated.launchedElevated) {
+                    setPortModalError(elevated.message);
+                    return;
                 }
-            } else {
-                setPortModalError(result.message);
+                setPortModalInfo(
+                    t("mcp_port_admin_request")
+                        .replace("{process}", processLabel)
+                        .replace("{pid}", String(pid)),
+                );
+                // UAC/taskkill 是异步的：稍后复查，不能把“已发起”冒充“已停止”。
+                window.setTimeout(() => {
+                    void (async () => {
+                        const latest = await inspectPort(port, false);
+                        if (latest && !latest.some((item) => item.pid === pid)) {
+                            setPortModalInfo(
+                                t("mcp_port_stopped")
+                                    .replace("{process}", processLabel)
+                                    .replace("{pid}", String(pid))
+                                    .replace("{port}", String(port)),
+                            );
+                        } else {
+                            setPortModalError(
+                                t("mcp_port_still_occupied")
+                                    .replace("{process}", processLabel)
+                                    .replace("{port}", String(port)),
+                            );
+                        }
+                    })();
+                }, 900);
+                return;
             }
-            // 刷新列表
-            const p = Number.parseInt(portModalPort, 10);
-            if (!Number.isNaN(p)) await inspectPort(p);
+            if (!result.stopped) {
+                setPortModalError(result.message);
+                return;
+            }
+            const latest = await inspectPort(port, false);
+            if (latest && !latest.some((item) => item.pid === pid)) {
+                setPortModalInfo(
+                    t("mcp_port_stopped")
+                        .replace("{process}", processLabel)
+                        .replace("{pid}", String(pid))
+                        .replace("{port}", String(port)),
+                );
+            } else {
+                setPortModalError(
+                    t("mcp_port_still_occupied")
+                        .replace("{process}", processLabel)
+                        .replace("{port}", String(port)),
+                );
+            }
         } catch (e) {
             setPortModalError(String(e));
         } finally {
             setPortModalBusy(false);
         }
-    }, [portModalPort, inspectPort]);
+    }, [portProcesses, portModalPort, inspectPort, t]);
 
     const refreshPortModal = useCallback(() => {
         const p = Number.parseInt(portModalPort, 10);
@@ -769,7 +810,24 @@ const McpSettingsGroup = ({ t, collapsed, onToggle }: McpSettingsGroupProps) => 
                                     >
                                         <div style={{ minWidth: 0, flex: 1 }}>
                                             <div style={{ fontSize: "12px", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                                {proc.processName} <span style={{ opacity: 0.6 }}>(PID {proc.pid})</span>
+                                                {proc.processName}
+                                                <span style={{ opacity: 0.6 }}>（PID {proc.pid}）</span>
+                                                {proc.isCurrentProcess && (
+                                                    <span
+                                                        style={{
+                                                            display: "inline-block",
+                                                            marginLeft: "6px",
+                                                            padding: "1px 5px",
+                                                            borderRadius: "4px",
+                                                            color: "var(--accent-color)",
+                                                            border: "1px solid var(--accent-color)",
+                                                            fontSize: "10px",
+                                                            fontWeight: 600,
+                                                        }}
+                                                    >
+                                                        本 APP 自身
+                                                    </span>
+                                                )}
                                             </div>
                                             {proc.executablePath && (
                                                 <div style={STYLES.subNote}>

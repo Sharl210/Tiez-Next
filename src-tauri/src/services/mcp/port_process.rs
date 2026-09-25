@@ -43,9 +43,27 @@ fn parse_netstat_line(line: &str, port: u16) -> Option<(String, String, u32)> {
 }
 
 #[cfg(windows)]
+fn tasklist_process_name(pid: u32) -> Option<String> {
+    let filter = format!("PID eq {}", pid);
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let line = output_text.lines().next()?.trim();
+    if !line.starts_with('"') {
+        return None;
+    }
+    line.split('"').nth(1).map(str::to_string)
+}
+
+#[cfg(windows)]
 fn process_identity(pid: u32) -> (String, Option<String>, bool) {
     use std::path::Path;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
@@ -54,7 +72,8 @@ fn process_identity(pid: u32) -> (String, Option<String>, bool) {
     let current = unsafe { GetCurrentProcessId() } == pid;
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) };
     let Ok(handle) = handle else {
-        return ("未知进程".to_string(), None, !current);
+        let name = tasklist_process_name(pid).unwrap_or_else(|| "未知进程".to_string());
+        return (name, None, !current);
     };
     let mut path_buf = [0u16; 2048];
     let length = unsafe { GetModuleFileNameExW(Some(handle), None, &mut path_buf) };
@@ -68,8 +87,9 @@ fn process_identity(pid: u32) -> (String, Option<String>, bool) {
         .as_deref()
         .and_then(|value| Path::new(value).file_name())
         .and_then(|value| value.to_str())
-        .unwrap_or("未知进程")
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| tasklist_process_name(pid))
+        .unwrap_or_else(|| "未知进程".to_string());
     (name, path, !current)
 }
 
