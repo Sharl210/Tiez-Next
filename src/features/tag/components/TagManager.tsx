@@ -3,8 +3,8 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
-    Clock, MousePointer2, ChevronLeft, Plus, Search, CheckSquare, Copy,
-    Sparkles, StickyNote
+    Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
+    Sparkles
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
@@ -1541,7 +1541,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                                                 openItemEditor(item, 'note');
                                                             }}
                                                         >
-                                                            <StickyNote size={10} />
+                                                            <Sparkles size={10} />
                                                         </button>
                                                     )}
                                                     <button
@@ -1557,7 +1557,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                                         }}
                                                         title={t('open')}
                                                     >
-                                                         <Sparkles size={11} />
+                                                         <ExternalLink size={10} />
                                                     </button>
                                                 </>
                                             )}
@@ -1592,7 +1592,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                         grid layout. */}
                                     {item.note ? (
                                         <div className="card-note" title={item.note}>
-                                            <Sparkles size={9} />
+                                            <Sparkles className="card-note-sparkle" size={9} />
                                             <span className="card-note-text">{item.note}</span>
                                         </div>
                                     ) : null}
@@ -2109,6 +2109,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                    text in the element title attribute. */
                 .card-note { display: flex; align-items: flex-start; gap: 4px; margin-top: 6px; padding: 4px 6px; border-radius: var(--data-panel-radius); background: var(--bg-input); color: var(--text-secondary); font-size: 10px; line-height: 1.35; }
                 .card-note svg { flex-shrink: 0; margin-top: 2px; }
+                .card-note-sparkle { color: var(--accent-color); }
                 .card-note-text { flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; white-space: pre-wrap; }
                 /* The stacked list renders cards as a grid whose grid-template-areas
                    live in the shared stylesheet, which is outside this change. The note

@@ -1978,7 +1978,6 @@ const ClipboardItem = ({
                     <div className="confirm-dialog-buttons">
                         {bodyEditIsRich && (
                             <button className="confirm-dialog-button rich-to-plain-button" disabled={bodyEditSaving} onClick={() => onBodyEditSave(bodyEditorRichRef.current?.innerText ?? bodyDraft, '')} title={t('convert_rich_to_plain_hint')}>
-                                <Sparkles size={12} aria-hidden="true" />
                                 <span>{t('convert_rich_to_plain')}</span>
                             </button>
                         )}
@@ -2326,7 +2325,7 @@ const ClipboardItem = ({
                         )}
                         {isNoteEditable(item.content_type) && onEditNote && (
                             <button
-                                className={`btn-icon note-edit-btn entry-note-mark ${noteEditorOpen ? "active" : ""}`}
+                                className={`btn-icon note-edit-btn ${noteEditorOpen ? "active" : ""}`}
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onEditNote(e);
