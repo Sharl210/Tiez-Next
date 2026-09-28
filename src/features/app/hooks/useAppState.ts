@@ -28,6 +28,7 @@ export const useAppState = (): AppState => {
   );
   const [history, setHistory] = useState<ClipboardEntry[]>([]);
   const [search, setSearch] = useState("");
+  const [searchRegex, setSearchRegex] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [searchIsFocused, setSearchIsFocused] = useState(false);
   const [showTagFilter, setShowTagFilter] = useState(false);
@@ -207,6 +208,8 @@ export const useAppState = (): AppState => {
     setHistory,
     search,
     setSearch,
+    searchRegex,
+    setSearchRegex,
     isComposing,
     setIsComposing,
     searchIsFocused,

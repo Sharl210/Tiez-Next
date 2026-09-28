@@ -111,18 +111,32 @@ pub fn search_clipboard_history(
     search_term: String,
     limit: i32,
     tag_only: Option<bool>,
+    regex: Option<bool>,
 ) -> AppResult<Vec<ClipboardEntry>> {
     let is_tag_only = tag_only.unwrap_or(false);
-    let mut history = state.repo.search(&search_term, limit, is_tag_only)?;
+    let is_regex = regex.unwrap_or(false);
+    let mut history = if is_regex {
+        let mut rows = state.repo.get_history(10_000, 0, None)?;
+        let re = regex::Regex::new(&search_term).map_err(|e| AppError::from(e.to_string()))?;
+        rows.retain(|item| re.is_match(&item.content) || re.is_match(&item.preview) || re.is_match(&item.note) || re.is_match(&item.source_app) || item.tags.iter().any(|tag| re.is_match(tag)) || item.html_content.as_deref().map(|html| re.is_match(html)).unwrap_or(false));
+        rows.truncate(limit.max(0) as usize);
+        rows
+    } else {
+        state.repo.search(&search_term, limit, is_tag_only)?
+    };
 
     let term = search_term.to_lowercase();
     let session_items = session.inner().0.lock().unwrap();
     for item in session_items.iter().rev() {
-        let matches = if is_tag_only {
+        let matches = if is_regex {
+            regex::Regex::new(&search_term).map(|re| re.is_match(&item.content) || re.is_match(&item.note) || re.is_match(&item.source_app) || re.is_match(&item.html_content.clone().unwrap_or_default()) || item.tags.iter().any(|tag| re.is_match(tag))).unwrap_or(false)
+        } else if is_tag_only {
             item.tags.iter().any(|t| t.to_lowercase().contains(&term))
         } else {
             item.content.to_lowercase().contains(&term)
                 || item.source_app.to_lowercase().contains(&term)
+                || item.note.to_lowercase().contains(&term)
+                || item.html_content.as_deref().map(|html| html.to_lowercase().contains(&term)).unwrap_or(false)
                 || item.tags.iter().any(|t| t.to_lowercase().contains(&term))
         };
 
@@ -225,18 +239,7 @@ pub fn get_tag_items(state: State<'_, DbState>, tag: String) -> AppResult<Vec<Cl
     for item in &mut history {
         normalize_rich_text_item_content(item);
 
-        if (item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text")
-            && item.content.chars().count() > 50000
-        {
-            item.content = format!(
-                "{}... [Content Truncated]",
-                item.content.chars().take(50000).collect::<String>()
-            );
-        }
-
+        // 标签管理需要完整正文；不要在命令层改写或追加截断标记。
         if item.content_type == "text"
             || item.content_type == "code"
             || item.content_type == "url"

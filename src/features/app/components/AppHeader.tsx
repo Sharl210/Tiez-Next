@@ -33,6 +33,8 @@ interface AppHeaderProps {
   setShowSearchBox: (val: boolean) => void;
   search: string;
   setSearch: (val: string) => void;
+  searchRegex: boolean;
+  setSearchRegex: (val: boolean) => void;
   setIsComposing: (val: boolean) => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
   showTagFilter: boolean;
@@ -69,6 +71,8 @@ const AppHeader = ({
   setShowSearchBox,
   search,
   setSearch,
+  searchRegex,
+  setSearchRegex,
   setIsComposing,
   searchInputRef,
   showTagFilter,
@@ -118,6 +122,12 @@ const AppHeader = ({
         </div>
       </div>
       <div className="header-actions window-no-drag">
+        {showTagManager && tagManagerEnabled && (
+          <button className="btn-icon" title={t('tag_search_entries')} aria-label={t('tag_search_entries')} onClick={() => window.dispatchEvent(new Event('tag-manager-search-open'))}>
+            <Search size={16} />
+          </button>
+        )}
+
         {/* Pin Button - Always visible but single instance */}
         <button
           className={`btn-icon ${isWindowPinned ? 'active' : ''}`}
@@ -209,6 +219,11 @@ const AppHeader = ({
             style={{ flexShrink: 0 }}
           >
             <div className="search-container window-no-drag">
+              <button
+                className={`main-search-mode-btn ${searchRegex ? 'active' : ''}`}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setSearchRegex(!searchRegex)}
+              >{searchRegex ? '正则' : '普通'}</button>
               <div style={{ position: 'relative' }}>
                 <Search size={14} className="search-icon" />
                 <input

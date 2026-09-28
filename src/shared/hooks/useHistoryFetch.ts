@@ -5,6 +5,7 @@ import type { ClipboardEntry } from "../types";
 
 interface UseHistoryFetchOptions {
   debouncedSearch: string;
+  searchRegex: boolean;
   typeFilter: string | null;
   persistentLimitEnabled: boolean;
   persistentLimit: number;
@@ -21,6 +22,7 @@ interface UseHistoryFetchOptions {
 
 export const useHistoryFetch = ({
   debouncedSearch,
+  searchRegex,
   typeFilter,
   persistentLimitEnabled,
   persistentLimit,
@@ -75,7 +77,8 @@ export const useHistoryFetch = ({
             data = await invoke<ClipboardEntry[]>("search_clipboard_history", {
               searchTerm: term,
               limit: 200,
-              tagOnly
+              tagOnly,
+              regex: searchRegex
             });
           } catch (e) {
             console.error("Search failed, falling back", e);

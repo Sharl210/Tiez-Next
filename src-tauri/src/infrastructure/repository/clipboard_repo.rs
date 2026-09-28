@@ -1226,7 +1226,10 @@ impl ClipboardRepository for SqliteClipboardRepository {
                      )
                        AND (
                          ch.content LIKE '%' || ?1 || '%'
-                         OR ch.source_app LIKE '%' || ?1 || '%'
+                         OR ch.preview LIKE '%' || ?1 || '%'
+                     OR ch.html_content LIKE '%' || ?1 || '%'
+                     OR ch.note LIKE '%' || ?1 || '%'
+                     OR ch.source_app LIKE '%' || ?1 || '%'
                          OR et.tag LIKE '%' || ?1 || '%'
                        )
                      ORDER BY ch.timestamp DESC, ch.id DESC

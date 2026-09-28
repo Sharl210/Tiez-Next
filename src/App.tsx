@@ -145,6 +145,8 @@ const App = () => {
     setHistory,
     search,
     setSearch,
+    searchRegex,
+    setSearchRegex,
     isComposing,
     setIsComposing,
     searchIsFocused,
@@ -371,6 +373,7 @@ const App = () => {
   const PAGE_SIZE = 80;
   const { fetchHistory, loadMoreHistory } = useHistoryFetch({
     debouncedSearch,
+    searchRegex,
     typeFilter,
     persistentLimitEnabled,
     persistentLimit,
@@ -1138,6 +1141,8 @@ const App = () => {
         setShowSearchBox={setShowSearchBox}
         search={search}
         setSearch={setSearch}
+        searchRegex={searchRegex}
+        setSearchRegex={setSearchRegex}
         setIsComposing={setIsComposing}
         searchInputRef={searchInputRef}
         showTagFilter={showTagFilter}

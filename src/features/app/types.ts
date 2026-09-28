@@ -38,6 +38,8 @@ export interface AppState {
   setHistory: StateSetter<ClipboardEntry[]>;
   search: string;
   setSearch: StateSetter<string>;
+  searchRegex: boolean;
+  setSearchRegex: StateSetter<boolean>;
   isComposing: boolean;
   setIsComposing: StateSetter<boolean>;
   searchIsFocused: boolean;

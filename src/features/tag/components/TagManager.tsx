@@ -944,6 +944,12 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     useEffect(() => {
+        const openSearch = () => setEntrySearchOpen(true);
+        window.addEventListener('tag-manager-search-open', openSearch);
+        return () => window.removeEventListener('tag-manager-search-open', openSearch);
+    }, []);
+
+    useEffect(() => {
         const targetId = pendingSearchTargetRef.current;
         if (targetId == null || !tagItems.some((item) => item.id === targetId)) return;
         pendingSearchTargetRef.current = null;
@@ -962,28 +968,31 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             return;
         }
         let cancelled = false;
-        invoke<ClipboardEntry[]>("get_clipboard_history", { limit: 10000, offset: 0, contentType: null })
-            .then((items) => {
+        Promise.all(tags.map((tag) => invoke<ClipboardEntry[]>("get_tag_items", { tag: tag.name })))
+            .then((pages) => {
                 if (cancelled) return;
+                const unique = new Map<number, ClipboardEntry>();
+                pages.flat().forEach((item) => unique.set(item.id, item));
                 const matcher = entrySearchPattern
-                    ? (() => { try { return new RegExp(query, "i"); } catch { return null; } })()
+                    ? (() => { try { return new RegExp(entrySearch, "i"); } catch { return null; } })()
                     : null;
-                const matched = (items || []).filter((item) => {
-                    const haystack = [item.content, item.preview, item.note, item.source_app, ...(item.tags || [])].join("\n");
+                const matched = [...unique.values()].filter((item) => {
+                    const haystack = [item.content, item.preview, item.note, item.source_app, ...item.tags].join("\n");
                     return matcher ? matcher.test(haystack) : haystack.toLowerCase().includes(query);
                 });
                 matched.sort((a, b) => {
-                    const aText = `${a.content} ${a.note || ""}`.toLowerCase();
-                    const bText = `${b.content} ${b.note || ""}`.toLowerCase();
-                    const ap = aText.startsWith(query) ? 0 : 1;
-                    const bp = bText.startsWith(query) ? 0 : 1;
-                    return ap - bp || b.timestamp - a.timestamp;
+                    const prefix = (item: ClipboardEntry) => {
+                        const content = item.content.toLowerCase();
+                        const note = (item.note || "").toLowerCase();
+                        return content.startsWith(query) || note.startsWith(query) ? 0 : 1;
+                    };
+                    return prefix(a) - prefix(b) || b.timestamp - a.timestamp;
                 });
                 setEntrySearchItems(matched);
             })
             .catch(() => { if (!cancelled) setEntrySearchItems([]); });
         return () => { cancelled = true; };
-    }, [entrySearch, entrySearchPattern]);
+    }, [entrySearch, entrySearchPattern, tags]);
 
     useEffect(() => () => {
         setEntrySearch("");
@@ -1248,14 +1257,6 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <option value="size_asc">{t('tag_sort_size_asc') || '按体积 小→大'}</option>
                         </select>
                     )}
-                    <button
-                        className="collapse-toggle"
-                        title={t('tag_search_entries') || '搜索所有标签条目'}
-                        aria-label={t('tag_search_entries') || '搜索所有标签条目'}
-                        onClick={() => setEntrySearchOpen(true)}
-                    >
-                        <Search size={14} />
-                    </button>
                     <button
                         className="collapse-toggle"
                         title={isCollapsed ? (t('open') || '展开') : (t('collapse') || '收起')}
@@ -1908,7 +1909,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <button className="action-btn" onClick={() => setEntrySearchOpen(false)} aria-label="关闭搜索"><X size={16} /></button>
                         </div>
                         <div className="entry-search-input-wrap">
-                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '模式' : '普通'}</button>
+                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
                             <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
                         </div>
                         <div className="entry-search-results">
@@ -2188,11 +2189,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .card-media { min-height: 60px; border-radius: var(--data-panel-radius); margin: 8px 0; overflow: hidden; background: var(--bg-input); display: flex; justify-content: center; align-items: center; }
                 .card-media img { max-width: 100%; max-height: 140px; object-fit: contain; border-radius: var(--data-panel-radius); }
                 
-                .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(15,23,42,.28); backdrop-filter: blur(8px); }
-                .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: var(--bg-panel); box-shadow: var(--shadow-lg); overflow: hidden; }
+                .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(245,248,255,.34); backdrop-filter: blur(18px) saturate(135%); }
+                .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: rgba(255,255,255,.72); backdrop-filter: blur(24px) saturate(145%); }
                 .entry-search-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: var(--text-primary); }
                 .entry-search-input-wrap { display: flex; align-items: center; gap: 8px; margin: 0 14px 12px; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: 12px; color: var(--accent-color); background: var(--bg-input); }
-                .entry-search-input-wrap input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; }
+                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 4px 8px; background: var(--bg-panel); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+                .entry-search-mode.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
+ flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; }
                 .entry-search-results { overflow-y: auto; padding: 0 10px 10px; }
                 .entry-search-result { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 11px 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
                 .entry-search-result:hover { background: var(--accent-soft); }
