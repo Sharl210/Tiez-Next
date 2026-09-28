@@ -356,7 +356,12 @@ pub fn mirror_body_edit_in_session(
         return;
     }
     if let Some(h) = html {
-        item.html_content = if h.is_empty() { None } else { Some(h.to_string()) };
+        if h.is_empty() {
+            item.html_content = None;
+            item.content_type = "text".to_string();
+        } else if item.content_type == "rich_text" {
+            item.html_content = Some(h.to_string());
+        }
     }
 }
 
@@ -585,7 +590,7 @@ mod r13_session_mirror_tests {
         let mut item = rich_item();
         mirror_body_edit_in_session(&mut item, "纯了", "纯了", Some(""));
         assert_eq!(item.html_content, None, "显式清空应当生效");
-        assert_eq!(item.content_type, "rich_text", "清空格式不等于改类型");
+        assert_eq!(item.content_type, "text", "转换为纯文本必须同步改类型");
     }
 
     #[test]

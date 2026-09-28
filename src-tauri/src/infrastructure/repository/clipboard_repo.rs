@@ -784,7 +784,7 @@ impl SqliteClipboardRepository {
         preview: &str,
         html_content: Option<&str>,
     ) -> Result<(), String> {
-        let (old_content_raw, content_type, old_html_raw, tags_json) = conn
+        let (old_content_raw, mut content_type, old_html_raw, tags_json) = conn
             .query_row(
                 "SELECT content, content_type, html_content, tags FROM clipboard_history WHERE id = ?",
                 params![id],
@@ -830,7 +830,8 @@ impl SqliteClipboardRepository {
         //
         // 派生放在短路判断**之前**：否则"正文列是 HTML、库里是纯文本"会让每次"打开就
         // 保存"都判定为有变化，白白写一次库并触发刷新。
-        let is_rich_write = content_type == "rich_text" && html_content.is_some();
+        let is_plain_conversion = content_type == "rich_text" && html_content == Some("");
+        let is_rich_write = content_type == "rich_text" && html_content.is_some() && !is_plain_conversion;
         let derived_content: Option<String> = if is_rich_write {
             Some(crate::services::clipboard::derive_rich_text_content(content, html_content))
         } else {
@@ -844,6 +845,10 @@ impl SqliteClipboardRepository {
         // 它对富文本条目**永远为假** —— 于是"打开弹窗、什么都不改、点保存"也会走完整
         // 更新路径。反过来，只改格式（加粗、换色）而正文不变时，正文比较相等，
         // 若不把 HTML 的差异算进去就会把用户的格式改动当"无变化"丢弃。
+        if is_plain_conversion {
+            content_type = "text".to_string();
+        }
+
         let html_changed = match html_content {
             Some(new_html) => old_html.as_deref() != Some(new_html),
             None => false,
@@ -880,7 +885,7 @@ impl SqliteClipboardRepository {
             // 保持原值不变（它们本来就没写过 HTML）。若不加这一层，往一个 `text`
             // 条目写 HTML 会造出"类型是纯文本、却带着 HTML"的行，渲染侧对待它的方式
             // 与数据库声明的类型不一致 —— 这是比降级更难排查的一类错位。
-            let new_html_stored: Option<String> = if content_type != "rich_text" {
+            let new_html_stored: Option<String> = if is_plain_conversion || content_type != "rich_text" {
                 old_html.clone()
             } else {
                 match html_content {
