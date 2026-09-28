@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
+import { getClipboardTypeLabel } from "../lib/contentTypeLabel";
 import { TagAssignMenu } from "./TagAssignMenu";
 import { getEntryNote, isNoteEditable, MAX_ENTRY_NOTE_CHARS } from "../types";
 import {
@@ -824,6 +825,14 @@ const ClipboardItem = ({
     const [snapshotFailed, setSnapshotFailed] = useState(false);
     const [richImageFallbackFailed, setRichImageFallbackFailed] = useState(false);
     const [sourceAppIcon, setSourceAppIcon] = useState<string | null>(() => peekSourceAppIcon(item.source_app_path) ?? null);
+    const [imagePreviewNonce, setImagePreviewNonce] = useState(0);
+    useEffect(() => {
+        if (item.content_type !== "image") return;
+        const refresh = () => setImagePreviewNonce((value) => value + 1);
+        window.addEventListener("focus", refresh);
+        return () => window.removeEventListener("focus", refresh);
+    }, [item.content_type]);
+
     const filePaths = useMemo(
         () => item.content_type === "file" ? item.content.split('\n').filter((p) => p.trim()) : [],
         [item.content, item.content_type]
@@ -2287,6 +2296,7 @@ const ClipboardItem = ({
                             ? renderSourceAppIcon(sourceAppIcon, item.content_type, item.source_app)
                             : getIcon(item.content_type)}
                         <span>{item.source_app}</span>
+                        <span className="clipboard-type-bubble">{getClipboardTypeLabel(item.content_type, item.content)}</span>
                     </div>
                 </div>
 
@@ -2439,13 +2449,11 @@ const ClipboardItem = ({
                             </div>
                         ) : (
                             <img
+                                key={`${item.id}-${imagePreviewNonce}`}
                                 src={
                                     item.content.startsWith("data:")
                                         ? item.content
-                                        : (
-                                            toTauriLocalImageSrc(item.content) ||
-                                            (item.is_external ? convertFileSrc(item.content) : item.content)
-                                        )
+                                        : `${toTauriLocalImageSrc(item.content) || (item.is_external ? convertFileSrc(item.content) : item.content)}${imagePreviewNonce ? `${item.content.includes("?") ? "&" : "?"}t=${imagePreviewNonce}` : ""}`
                                 }
                                 alt={t('image_preview')}
                                 className="image-preview"

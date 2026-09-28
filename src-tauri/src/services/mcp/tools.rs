@@ -907,12 +907,27 @@ fn string_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
     }
 }
 
+fn entry_type_label(entry: &crate::domain::models::ClipboardEntry) -> String {
+    match entry.content_type.as_str() {
+        "rich_text" => "富文本".to_string(),
+        "text" | "code" | "url" => "纯文本".to_string(),
+        "image" | "file" | "video" => {
+            let path = entry.content.lines().map(str::trim).find(|v| !v.is_empty()).unwrap_or("");
+            let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            let name = leaf.rsplit_once('.').map(|(_, ext)| ext).filter(|ext| !ext.is_empty() && ext.len() <= 12 && ext.chars().all(|c| c.is_ascii_alphanumeric()));
+            name.map(|ext| format!(".{}文件", ext.to_lowercase())).unwrap_or_else(|| "文件".to_string())
+        }
+        _ => "纯文本".to_string(),
+    }
+}
+
 /// 条目 → JSON。`include_content=false` 时用 `preview` 代替 `content`，
 /// 便于在大库上做概览而不必搬运全部正文。
 fn entry_json(entry: &crate::domain::models::ClipboardEntry, include_content: bool) -> Value {
     let mut map = Map::new();
     map.insert("id".into(), json!(entry.id));
     map.insert("contentType".into(), json!(entry.content_type));
+    map.insert("typeLabel".into(), json!(entry_type_label(entry)));
     map.insert(
         "contentChars".into(),
         json!(entry.content.chars().count()),

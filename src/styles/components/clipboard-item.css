@@ -1,4 +1,18 @@
-/* Clipboard Item Meta */
+.clipboard-type-bubble {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  padding: 1px 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 9px;
+  line-height: 1.35;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
 .item-meta {
   display: flex;
   justify-content: space-between;
