@@ -460,6 +460,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     const [tags, setTags] = useState<TagInfo[]>([]);
     const [tagSearch, setTagSearch] = useState('');
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
+    const [entrySearchOpen, setEntrySearchOpen] = useState(false);
+    const [entrySearch, setEntrySearch] = useState('');
+    const [entrySearchItems, setEntrySearchItems] = useState<ClipboardEntry[]>([]);
+    const [entrySearchPattern, setEntrySearchPattern] = useState(false);
+    const entrySearchInputRef = useRef<HTMLInputElement | null>(null);
+    const pendingSearchTargetRef = useRef<number | null>(null);
+
     const [tagItems, setTagItems] = useState<ClipboardEntry[]>([]);
     const [tagColors, setTagColors] = useState<Record<string, string>>({});
     const [editingTag, setEditingTag] = useState<string | null>(null);
@@ -936,6 +943,53 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         finally { setLoading(false); }
     };
 
+    useEffect(() => {
+        const targetId = pendingSearchTargetRef.current;
+        if (targetId == null || !tagItems.some((item) => item.id === targetId)) return;
+        pendingSearchTargetRef.current = null;
+        requestAnimationFrame(() => document.querySelector(`[data-entry-id="${targetId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+    }, [tagItems]);
+    useEffect(() => {
+        if (!entrySearchOpen) return;
+        const id = window.setTimeout(() => entrySearchInputRef.current?.focus(), 0);
+        return () => window.clearTimeout(id);
+    }, [entrySearchOpen]);
+
+    useEffect(() => {
+        const query = entrySearch.trim().toLowerCase();
+        if (!query) {
+            setEntrySearchItems([]);
+            return;
+        }
+        let cancelled = false;
+        invoke<ClipboardEntry[]>("get_clipboard_history", { limit: 10000, offset: 0, contentType: null })
+            .then((items) => {
+                if (cancelled) return;
+                const matcher = entrySearchPattern
+                    ? (() => { try { return new RegExp(query, "i"); } catch { return null; } })()
+                    : null;
+                const matched = (items || []).filter((item) => {
+                    const haystack = [item.content, item.preview, item.note, item.source_app, ...(item.tags || [])].join("\n");
+                    return matcher ? matcher.test(haystack) : haystack.toLowerCase().includes(query);
+                });
+                matched.sort((a, b) => {
+                    const aText = `${a.content} ${a.note || ""}`.toLowerCase();
+                    const bText = `${b.content} ${b.note || ""}`.toLowerCase();
+                    const ap = aText.startsWith(query) ? 0 : 1;
+                    const bp = bText.startsWith(query) ? 0 : 1;
+                    return ap - bp || b.timestamp - a.timestamp;
+                });
+                setEntrySearchItems(matched);
+            })
+            .catch(() => { if (!cancelled) setEntrySearchItems([]); });
+        return () => { cancelled = true; };
+    }, [entrySearch, entrySearchPattern]);
+
+    useEffect(() => () => {
+        setEntrySearch("");
+        setEntrySearchItems([]);
+        setEntrySearchOpen(false);
+    }, []);
     const createTag = async (rawName: string) => {
         const trimmed = rawName.trim();
         if (!trimmed) return;
@@ -1194,6 +1248,14 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <option value="size_asc">{t('tag_sort_size_asc') || '按体积 小→大'}</option>
                         </select>
                     )}
+                    <button
+                        className="collapse-toggle"
+                        title={t('tag_search_entries') || '搜索所有标签条目'}
+                        aria-label={t('tag_search_entries') || '搜索所有标签条目'}
+                        onClick={() => setEntrySearchOpen(true)}
+                    >
+                        <Search size={14} />
+                    </button>
                     <button
                         className="collapse-toggle"
                         title={isCollapsed ? (t('open') || '展开') : (t('collapse') || '收起')}
@@ -1487,6 +1549,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                 return (
                                 <div
                                     key={item.id}
+                                    data-entry-id={item.id}
                                     className={`themed-card ${selectedItemIds.has(item.id) ? 'selected' : ''}`}
                                     onClick={() => {
                                         if (isManageMode) {
@@ -1582,7 +1645,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                             />
                                         </div>
                                     ) : (
-                                        <div className="card-body-text">{item.preview || item.content}</div>
+                                        <div className="card-body-text">{item.content}</div>
                                     )}
 
                                     {/* R6: the note is shown on the card, for every content type.
@@ -1833,6 +1896,34 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <button className="confirm-dialog-button primary" onClick={handleSaveItem}>
                                 {t('save')}
                             </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {entrySearchOpen && (
+                <div className="entry-search-modal-overlay" role="dialog" aria-modal="true" aria-label={t('tag_search_entries') || '搜索所有标签条目'}>
+                    <div className="entry-search-modal">
+                        <div className="entry-search-modal-header">
+                            <strong>{t('tag_search_entries')}</strong>
+                            <button className="action-btn" onClick={() => setEntrySearchOpen(false)} aria-label="关闭搜索"><X size={16} /></button>
+                        </div>
+                        <div className="entry-search-input-wrap">
+                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '模式' : '普通'}</button>
+                            <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
+                        </div>
+                        <div className="entry-search-results">
+                            {!entrySearch.trim() ? <div className="entry-search-empty">{t('tag_search_empty')}</div> : entrySearchItems.length === 0 ? <div className="entry-search-empty">{t('tag_search_no_results')}</div> : entrySearchItems.map((item) => (
+                                <button key={item.id} className="entry-search-result" onClick={() => {
+                                    const targetTag = item.tags?.[0];
+                                    if (!targetTag) return;
+                                    pendingSearchTargetRef.current = item.id;
+                                    setEntrySearchOpen(false);
+                                    void loadTagItems(targetTag);
+                                }}>
+                                    <span className="entry-search-result-text">{item.content}</span>
+                                    <span className="entry-search-result-meta">{item.tags?.join(' · ') || '无标签'}</span>
+                                </button>
+                            ))}
                         </div>
                     </div>
                 </div>
@@ -2097,7 +2188,18 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .card-media { min-height: 60px; border-radius: var(--data-panel-radius); margin: 8px 0; overflow: hidden; background: var(--bg-input); display: flex; justify-content: center; align-items: center; }
                 .card-media img { max-width: 100%; max-height: 140px; object-fit: contain; border-radius: var(--data-panel-radius); }
                 
-                .card-body-text { font-size: 13px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; color: var(--text-primary); }
+                .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(15,23,42,.28); backdrop-filter: blur(8px); }
+                .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: var(--bg-panel); box-shadow: var(--shadow-lg); overflow: hidden; }
+                .entry-search-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: var(--text-primary); }
+                .entry-search-input-wrap { display: flex; align-items: center; gap: 8px; margin: 0 14px 12px; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: 12px; color: var(--accent-color); background: var(--bg-input); }
+                .entry-search-input-wrap input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; }
+                .entry-search-results { overflow-y: auto; padding: 0 10px 10px; }
+                .entry-search-result { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 11px 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
+                .entry-search-result:hover { background: var(--accent-soft); }
+                .entry-search-result-text { width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+                .entry-search-result-meta, .entry-search-empty { color: var(--text-secondary); font-size: 11px; }
+                .entry-search-empty { padding: 28px 12px; text-align: center; }
+                .card-body-text { font-size: 13px; line-height: 1.4; word-break: break-word; white-space: pre-wrap; color: var(--text-primary); }
                 .card-footer { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--text-secondary); opacity: 0.8; }
                 .meta-usage { display: flex; align-items: center; gap: 4px; }
 
@@ -2773,13 +2875,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     line-height: 1.7;
                     font-weight: 500;
                     color: var(--text-primary);
-                    -webkit-line-clamp: 5;
+                    /* full content */
                     min-height: 122px;
                 }
 
                 .theme-mica .items-list .card-body-text,
                 .theme-acrylic .items-list .card-body-text {
-                    -webkit-line-clamp: 3;
+                    /* full content */
                     min-height: 84px;
                 }
 
