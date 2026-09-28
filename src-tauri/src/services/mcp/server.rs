@@ -464,13 +464,49 @@ fn tools_list_result(state: &ServerState) -> Value {
                     );
                 }
             }
+            if let Some(schema) = value.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                let properties = schema.entry("properties").or_insert_with(|| json!({}));
+                if let Some(properties) = properties.as_object_mut() {
+                    properties.insert("page".into(), json!({"type":"integer","minimum":0,"description":"分页页码，从0开始；响应超出字符预算时使用"}));
+                    properties.insert("pageSizeChars".into(), json!({"type":"integer","minimum":1000,"maximum":100000,"description":"单页字符预算，默认100000"}));
+                }
+            }
             value
         })
         .collect();
+
     json!({ "tools": list })
 }
 
-/// 把工具执行结果包成 MCP 的 `CallToolResult`。
+const MCP_OUTPUT_PAGE_CHARS: usize = 100_000;
+
+fn paginate_tool_outcome(outcome: ToolOutcome, args: &Value) -> ToolOutcome {
+    let page = args.get("page").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let requested = args.get("pageSizeChars").and_then(Value::as_u64).unwrap_or(MCP_OUTPUT_PAGE_CHARS as u64) as usize;
+    let budget = requested.clamp(1_000, MCP_OUTPUT_PAGE_CHARS);
+    let serialized = serde_json::to_string_pretty(&outcome.value).unwrap_or_else(|_| outcome.value.to_string());
+    if serialized.chars().count() <= budget {
+        return outcome;
+    }
+
+    let mut page_start = page.saturating_mul(budget.saturating_sub(512));
+    let chars: Vec<char> = serialized.chars().collect();
+    if page_start >= chars.len() { page_start = chars.len(); }
+    let page_end = (page_start + budget.saturating_sub(512)).min(chars.len());
+    let chunk: String = chars[page_start..page_end].iter().collect();
+    let has_more = page_end < chars.len();
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("page".into(), json!(page));
+    wrapper.insert("pageSizeChars".into(), json!(budget));
+    wrapper.insert("hasMore".into(), json!(has_more));
+    wrapper.insert("nextPage".into(), if has_more { json!(page + 1) } else { Value::Null });
+    wrapper.insert("totalChars".into(), json!(chars.len()));
+    wrapper.insert("dataChunk".into(), json!(chunk));
+    wrapper.insert("dataFormat".into(), json!("serialized-json-fragment"));
+    ToolOutcome { value: Value::Object(wrapper), is_error: outcome.is_error }
+}
+
+
 ///
 /// 同时给 `structuredContent` 与序列化后的 `content[0].text`：规范建议结构化结果
 /// 附带一份文本副本以兼容旧客户端，这里照做。
@@ -546,7 +582,7 @@ fn call_tool(state: &ServerState, params: Option<&Value>) -> Result<ToolOutcome,
         store: &state.store,
         effects: state.effects.as_ref(),
     };
-    let outcome = tools::invoke(&ctx, name, args);
+    let outcome = paginate_tool_outcome(tools::invoke(&ctx, name, args), args);
 
     state.audit.record(
         Some(name),

@@ -32,6 +32,8 @@ interface UseClipboardItemRendererOptions {
   quickPasteHintsById: Record<number, QuickPasteHint>;
   processingAiId: number | null;
   aiEnabled: boolean;
+  searchQuery: string;
+  searchRegex: boolean;
   aiOptionsOpenId: number | null;
   setAiOptionsOpenId: Dispatch<SetStateAction<number | null>>;
   copyToClipboard: (
@@ -82,6 +84,8 @@ export const useClipboardItemRenderer = ({
   quickPasteHintsById,
   processingAiId,
   aiEnabled,
+  searchQuery,
+  searchRegex,
   aiOptionsOpenId,
   setAiOptionsOpenId,
   copyToClipboard,
@@ -311,6 +315,8 @@ export const useClipboardItemRenderer = ({
           }}
           isAIProcessing={processingAiId === item.id}
           aiEnabled={aiEnabled}
+          searchQuery={searchQuery}
+          searchRegex={searchRegex}
           aiOptionsOpen={aiOptionsOpenId === item.id}
           onAIOptionsToggle={() =>
             setAiOptionsOpenId((prev) => (prev === item.id ? null : item.id))

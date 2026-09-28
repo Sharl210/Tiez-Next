@@ -53,3 +53,5 @@ docs/css-variable-fix-report.md
 
 # 代理的临时扫描脚本目录（不入库）
 .tmp-scan/
+
+Plan_Mode_Books/

@@ -1032,7 +1032,7 @@ const App = () => {
 
   useListSelectionReset({ filteredHistory, setSelectedIndex });
 
-  useSearchFetchTrigger({ debouncedSearch, isComposing, typeFilter, fetchHistory });
+  useSearchFetchTrigger({ debouncedSearch, searchRegex, isComposing, typeFilter, fetchHistory });
 
   useScrollToSelection({
     filteredHistory,
@@ -1082,6 +1082,8 @@ const App = () => {
     quickPasteHintsById,
     processingAiId,
     aiEnabled,
+    searchQuery: search,
+    searchRegex,
     aiOptionsOpenId,
     setAiOptionsOpenId,
     copyToClipboard,

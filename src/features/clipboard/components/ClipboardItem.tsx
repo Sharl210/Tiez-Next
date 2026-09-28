@@ -1,4 +1,5 @@
 import { useRef, useEffect, useLayoutEffect, useState, useMemo, memo } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -53,6 +54,26 @@ import { TAG_SUGGEST_VISIBLE_ROWS } from "../constants";
 import { selectTagSuggestions } from "../lib/tagSuggestions";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
+
+const highlightSearchText = (text: string, query: string, regex: boolean): ReactNode => {
+    const term = query.trim().replace(/^tag:/i, "");
+    if (!term) return text;
+    let matcher: RegExp;
+    try { matcher = regex ? new RegExp(term, "gi") : new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"); } catch { return text; }
+    const output: React.ReactNode[] = [];
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = matcher.exec(text))) {
+        if (match.index > cursor) output.push(text.slice(cursor, match.index));
+        output.push(<mark key={`${match.index}-${match[0]}`} className="search-hit">{match[0]}</mark>);
+        cursor = match.index + match[0].length;
+        if (!match[0].length) matcher.lastIndex += 1;
+    }
+    if (!output.length) return text;
+    if (cursor < text.length) output.push(text.slice(cursor));
+    return output;
+};
+
 
 /**
  * R6: how much of an entry note is shown inline before it is cut off. The full text
@@ -773,6 +794,8 @@ const ClipboardItem = ({
     onNoteEditSave,
     onNoteEditCancel,
     aiEnabled,
+    searchQuery = "",
+    searchRegex = false,
     aiOptionsOpen,
     onAIOptionsToggle,
     tagColors,
@@ -2611,7 +2634,7 @@ const ClipboardItem = ({
                                 </span>
                             </div>
                         )
-                        : item.preview
+                        : highlightSearchText(item.preview || item.content, searchQuery, searchRegex)
                 )}
                 {overlayTagsInPreview && renderTagsContainer(true)}
                 </div>

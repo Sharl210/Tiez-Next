@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import {
@@ -114,6 +115,26 @@ export const htmlToPlainText = (html: string): string => {
 };
 
 export type CardEditMode = 'body' | 'note';
+
+const renderSearchHighlight = (text: string, query: string, regex: boolean): ReactNode => {
+    const raw = query.trim();
+    if (!raw) return text;
+    let matcher: RegExp;
+    try { matcher = new RegExp(regex ? raw : raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"); } catch { return text; }
+    const parts: React.ReactNode[] = [];
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = matcher.exec(text))) {
+        if (match.index > cursor) parts.push(text.slice(cursor, match.index));
+        parts.push(<mark key={`${match.index}-${match[0]}`} className="search-hit">{match[0]}</mark>);
+        cursor = match.index + match[0].length;
+        if (!match[0].length) matcher.lastIndex += 1;
+    }
+    if (!parts.length) return text;
+    if (cursor < text.length) parts.push(text.slice(cursor));
+    return parts;
+};
+
 
 /**
  * 编辑弹窗的保存计划 —— 抽成纯函数，好让"备注弹窗绝不会写正文"这条不变量
@@ -469,6 +490,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
     const [tagItems, setTagItems] = useState<ClipboardEntry[]>([]);
     const [tagColors, setTagColors] = useState<Record<string, string>>({});
+    const [noteTagNames, setNoteTagNames] = useState<Set<string>>(new Set());
+
     const [editingTag, setEditingTag] = useState<string | null>(null);
     const [newTagName, setNewTagName] = useState('');
     const [loading, setLoading] = useState(false);
@@ -944,6 +967,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     useEffect(() => {
+        if (!tags.length) { setNoteTagNames(new Set()); return; }
+        let cancelled = false;
+        Promise.all(tags.map((tag) => invoke<ClipboardEntry[]>("get_tag_items", { tag: tag.name }))).then((pages) => {
+            if (cancelled) return;
+            const names = new Set<string>();
+            pages.forEach((items, index) => { if (items.some((item) => !!item.note?.trim())) names.add(tags[index].name); });
+            setNoteTagNames(names);
+        }).catch(() => {});
+        return () => { cancelled = true; };
+    }, [tags]);
+    useEffect(() => {
         const openSearch = () => setEntrySearchOpen(true);
         window.addEventListener('tag-manager-search-open', openSearch);
         return () => window.removeEventListener('tag-manager-search-open', openSearch);
@@ -1404,6 +1438,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                      * click anywhere on it selects the group.
                                      */}
                                     <span className="tag-name">{tag.name}</span>
+                                    {noteTagNames.has(tag.name) && <Sparkles className="tag-note-sparkle" size={13} aria-label="有备注" />}
                                     <span className="tag-badge">{tag.count}</span>
                                 </>
                             )}
@@ -1646,7 +1681,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                             />
                                         </div>
                                     ) : (
-                                        <div className="card-body-text">{item.content}</div>
+                                        <div className="card-body-text">{entrySearch ? renderSearchHighlight(item.content, entrySearch, entrySearchPattern) : item.content}</div>
                                     )}
 
                                     {/* R6: the note is shown on the card, for every content type.
@@ -1921,7 +1956,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                     setEntrySearchOpen(false);
                                     void loadTagItems(targetTag);
                                 }}>
-                                    <span className="entry-search-result-text">{item.content}</span>
+                                    <span className="entry-search-result-text">{renderSearchHighlight(item.content, entrySearch, entrySearchPattern)}</span>
                                     <span className="entry-search-result-meta">{item.tags?.join(' · ') || '无标签'}</span>
                                 </button>
                             ))}
@@ -2084,6 +2119,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     transition: transform 0.2s; 
                 }
                 .tag-color-dot:hover { transform: scale(1.2); }
+                .tag-note-sparkle { color: #f59e0b; flex-shrink: 0; }
                 .tag-name { 
                     flex: 1; 
                     font-size: 13px; 

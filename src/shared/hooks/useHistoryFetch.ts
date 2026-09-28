@@ -135,6 +135,7 @@ export const useHistoryFetch = ({
     },
     [
       debouncedSearch,
+      searchRegex,
       typeFilter,
       pageSize,
       persistentLimit,

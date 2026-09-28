@@ -1,3 +1,4 @@
+.search-hit { background: rgba(245, 158, 11, 0.42); color: inherit; border-radius: 3px; padding: 0 1px; }
 .clipboard-type-bubble {
   display: inline-flex;
   align-items: center;
@@ -445,7 +446,7 @@
    ========================================================================== */
 
 .entry-note-sparkle {
-  color: var(--accent-color, var(--text-secondary));
+  color: #f59e0b;
   /* 备注行整体有 opacity: 0.9，一个纯色图标在里面会显得发灰；
      略微提亮让它在那一行里真的"有颜色"，而不是被压成灰。 */
   filter: saturate(1.15);

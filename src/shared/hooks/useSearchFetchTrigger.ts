@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 interface UseSearchFetchTriggerOptions {
   debouncedSearch: string;
+  searchRegex?: boolean;
   isComposing: boolean;
   typeFilter?: string | null;
   fetchHistory: (reset?: boolean) => void;
@@ -9,6 +10,7 @@ interface UseSearchFetchTriggerOptions {
 
 export const useSearchFetchTrigger = ({
   debouncedSearch,
+  searchRegex,
   isComposing,
   typeFilter,
   fetchHistory
@@ -17,7 +19,7 @@ export const useSearchFetchTrigger = ({
     if (!isComposing) {
       fetchHistory(true);
     }
-  }, [debouncedSearch, isComposing, fetchHistory]);
+  }, [debouncedSearch, searchRegex, isComposing, fetchHistory]);
 
   useEffect(() => {
     fetchHistory(true);

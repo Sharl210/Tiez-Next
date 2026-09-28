@@ -32,6 +32,8 @@ export interface ClipboardItemProps {
   t: (key: string) => string;
   isAIProcessing?: boolean;
   aiEnabled?: boolean;
+  searchQuery?: string;
+  searchRegex?: boolean;
   tagColors?: Record<string, string>;
   aiOptionsOpen?: boolean;
   richTextSnapshotPreview?: boolean;
