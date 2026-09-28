@@ -58,6 +58,16 @@ body:has(.modal-overlay) #root {
   max-width: 500px;
 }
 
+.rich-to-plain-button {
+  color: var(--accent-color) !important;
+  border-color: var(--accent-color) !important;
+  background: var(--bg-input) !important;
+}
+
+.rich-to-plain-button:hover {
+  background: var(--accent-soft) !important;
+}
+
 .modal-title {
   font-size: 14px;
   font-weight: var(--modal-title-font-weight);

@@ -3,7 +3,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
-    Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
+    Clock, MousePointer2, ChevronLeft, Plus, Search, CheckSquare, Copy,
     Sparkles, StickyNote
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
@@ -1557,7 +1557,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                                         }}
                                                         title={t('open')}
                                                     >
-                                                        <ExternalLink size={10} />
+                                                         <Sparkles size={11} />
                                                     </button>
                                                 </>
                                             )}

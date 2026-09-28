@@ -156,10 +156,19 @@ pub fn catalog() -> Vec<ToolSpec> {
             input_schema: obj(
                 json!({
                     "id": id_prop,
-                    "content": {"type": "string", "description": "新的完整正文"},
+                    "content": {"type": "string", "description": "新的完整正文；富文本条目可同时传 htmlContent 以保留格式"},
+                    "htmlContent": {"type": "string", "description": "富文本 HTML；仅 rich_text 使用，传入后不会自动降级为纯文本"},
                 }),
                 vec!["id", "content"],
             ),
+        },
+        ToolSpec {
+            name: "convert_entry_to_plain_text",
+            title: "富文本转换为纯文本",
+            description: "将 rich_text 条目的 HTML 转换为纯文本，并明确移除富文本格式。与修改正文分开，避免编辑时自动降级。",
+            access: Access::Write,
+            destructive: false,
+            input_schema: obj(json!({ "id": id_prop }), vec!["id"]),
         },
         ToolSpec {
             name: "update_entry_note",
@@ -1741,10 +1750,11 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
             // R13：AI 通过 MCP 改正文时同样**不降级**。富文本条目要得到一份与
             // 新正文一致的 HTML（否则界面按 HTML 画、复制走 content，两者不一致），
             // 非富文本条目则完全不传 HTML。
+            let requested_html = args.get("htmlContent").and_then(Value::as_str);
             let html_for_write: Option<String> =
                 match ClipboardRepository::get_entry_by_id(&store.repo, target_id) {
                     Ok(Some(e)) if e.content_type == "rich_text" => {
-                        Some(mutation::plain_text_to_html(&content))
+                        Some(requested_html.map(str::to_string).unwrap_or_else(|| mutation::plain_text_to_html(&content)))
                     }
                     _ => None,
                 };
@@ -1761,6 +1771,22 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
                     ToolOutcome::ok(json!({ "id": target_id, "updated": true }))
                 }
                 Err(e) => ToolOutcome::failed(format!("修改正文失败：{}", e)),
+            }
+        }
+
+        "convert_entry_to_plain_text" => {
+            let id = match i64_arg(args, "id") { Ok(v) => v, Err(e) => return ToolOutcome::failed(e) };
+            let target_id = match adopt_session_entry(ctx, id, "富文本转换为纯文本") { Ok(v) => v, Err(e) => return ToolOutcome::failed(e) };
+            let entry = match ClipboardRepository::get_entry_by_id(&store.repo, target_id) {
+                Ok(Some(v)) => v,
+                Ok(None) => return ToolOutcome::failed("条目不存在".to_string()),
+                Err(e) => return ToolOutcome::failed(e.to_string()),
+            };
+            if entry.content_type != "rich_text" { return ToolOutcome::failed("只有 rich_text 条目支持此转换".to_string()); }
+            let plain = crate::services::clipboard::derive_rich_text_content(&entry.content, entry.html_content.as_deref());
+            match mutation::apply_entry_content(&store.repo, target_id, &plain, None) {
+                Ok(()) => { mirror_content_in_session(ctx, target_id, &plain, None); ctx.effects.emit_changed(); ctx.effects.request_cloud_sync(); ToolOutcome::ok(json!({ "id": target_id, "converted": true, "content": plain })) }
+                Err(e) => ToolOutcome::failed(format!("转换失败：{}", e)),
             }
         }
 
