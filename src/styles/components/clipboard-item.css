@@ -1,11 +1,11 @@
 .history-item.pinned {
-  background: rgba(191, 219, 254, 0.48);
-  border-color: rgba(96, 165, 250, 0.55);
+  background: color-mix(in srgb, var(--accent-color) 22%, var(--bg-content) 78%);
+  border-color: var(--accent-color);
 }
 
 .history-item.pinned:hover,
 .history-item.pinned:active {
-  background: rgba(191, 219, 254, 0.62);
+  background: color-mix(in srgb, var(--accent-color) 32%, var(--bg-content) 68%);
 }
 
 .clipboard-type-bubble {

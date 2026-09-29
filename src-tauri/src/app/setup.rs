@@ -2003,6 +2003,20 @@ fn setup_taskbar_listener(app: &App) {
     }
 }
 
+fn cursor_is_over_main_window(app: &AppHandle) -> bool {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let Some(window) = app.get_webview_window("main") else { return false; };
+        let Ok(hwnd) = window.hwnd() else { return false; };
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point).is_err() { return false; }
+        let mut rect = RECT::default();
+        if GetWindowRect(HWND(hwnd.0), &mut rect).is_err() { return false; }
+        return point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+    }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = app; false }
+}
 pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_shortcut::Shortcut) {
     use tauri_plugin_global_shortcut::Shortcut;
     let settings = app.state::<SettingsState>();
@@ -2052,7 +2066,7 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_sh
         val.replace("Win", "Super").parse::<Shortcut>()
     } {
         if shortcut == &search_s {
-            if !crate::app::window_manager::is_main_window_focused() {
+            if !crate::app::window_manager::is_main_window_focused() && !cursor_is_over_main_window(app) {
                 return;
             }
             let _ = app.emit("focus-search-input", ());

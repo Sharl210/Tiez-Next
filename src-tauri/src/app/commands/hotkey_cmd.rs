@@ -38,8 +38,8 @@ pub(crate) fn sync_registered_hotkeys(app_handle: &AppHandle) -> AppResult<()> {
     let rich_hotkey = settings.rich_paste_hotkey.lock().unwrap().clone();
     register_shortcut(app_handle, &rich_hotkey);
 
-    // Search shortcut is intentionally handled by the focused app WebView, not globally.
-    // Registering it here would reserve the user's shortcut from other applications.
+    let search_hotkey = settings.search_hotkey.lock().unwrap().clone();
+    register_shortcut(app_handle, &search_hotkey);
 
     Ok(())
 }

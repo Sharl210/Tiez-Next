@@ -60,6 +60,8 @@ const highlightSearchText = (text: string, query: string, regex: boolean): React
     if (!term) return text;
     let matcher: RegExp;
     try { matcher = regex ? new RegExp(term, "gi") : new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"); } catch { return text; }
+    if (regex && matcher.test("")) return text ? <mark className="search-hit">{text}</mark> : text;
+    matcher.lastIndex = 0;
     const output: React.ReactNode[] = [];
     let cursor = 0;
     let match: RegExpExecArray | null;

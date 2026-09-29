@@ -695,7 +695,7 @@ impl SqliteClipboardRepository {
             ).map_err(|e| e.to_string())?;
         } else {
             conn.execute(
-                "UPDATE clipboard_history SET is_pinned = 0, pinned_order = 0 WHERE id = ?",
+                "UPDATE clipboard_history SET is_pinned = 0, pinned_order = 0, timestamp = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = ?",
                 params![id],
             )
             .map_err(|e| e.to_string())?;

@@ -975,8 +975,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
     useEffect(() => {
         const openSearch = () => setEntrySearchOpen(true);
+        const toggleSearch = () => setEntrySearchOpen((open) => !open);
         window.addEventListener('tag-manager-search-open', openSearch);
-        return () => window.removeEventListener('tag-manager-search-open', openSearch);
+        window.addEventListener('tag-manager-search-toggle', toggleSearch);
+        return () => {
+            window.removeEventListener('tag-manager-search-open', openSearch);
+            window.removeEventListener('tag-manager-search-toggle', toggleSearch);
+        };
     }, []);
 
     useEffect(() => {
@@ -1949,10 +1954,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <button className="action-btn" onClick={() => setEntrySearchOpen(false)} aria-label="关闭搜索"><X size={16} /></button>
                         </div>
                         <div className="entry-search-input-row">
-                            <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
-                        </div>
-                        <div className="entry-search-options-row">
                             <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
+                            <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
                         </div>
                         <div className="entry-search-results">
                             {entrySearchLoading ? <div className="entry-search-empty"><div className="search-progress-track" role="progressbar" aria-label="正在搜索"><div className="search-progress-indicator" /></div>正在搜索…</div> : !entrySearch.trim() ? <div className="entry-search-empty">{t('tag_search_empty')}</div> : entrySearchItems.length === 0 ? <div className="entry-search-empty">{t('tag_search_no_results')}</div> : entrySearchItems.map((item) => (
@@ -2241,10 +2244,9 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(245,248,255,.34); backdrop-filter: blur(18px) saturate(135%); }
                 .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: rgba(255,255,255,.72); backdrop-filter: blur(24px) saturate(145%); }
                 .entry-search-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: var(--text-primary); }
-                .entry-search-input-row { display: flex; width: 100%; margin: 0 14px 6px; padding: 0; }
-                .entry-search-input-row input { width: 100%; height: 40px; border: 1px solid var(--accent-color); border-radius: 12px; padding: 0 14px; outline: 0; background: rgba(255,255,255,.9); color: var(--text-primary); user-select: text; font-size: 13px; box-shadow: 0 5px 18px rgba(15,23,42,.12); }
-                .entry-search-options-row { display: flex; justify-content: flex-start; padding: 0 14px 10px; }
-                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 10px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+                .entry-search-input-row { display: flex; align-items: center; gap: 8px; width: calc(100% - 28px); margin: 0 14px 12px; padding: 0; box-sizing: border-box; }
+                .entry-search-input-row input { flex: 1; min-width: 0; width: auto; height: 40px; border: 1px solid var(--accent-color); border-radius: 12px; padding: 0 14px; outline: 0; background: rgba(255,255,255,.9); color: var(--text-primary); user-select: text; font-size: 13px; box-shadow: 0 5px 18px rgba(15,23,42,.12); box-sizing: border-box; }
+                .entry-search-mode { flex: 0 0 auto; border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 10px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
                 .entry-search-mode.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
                 .entry-search-result-main { display: flex; align-items: center; gap: 10px; width: 100%; }
                 .entry-search-tag-bubble { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; color: #fff; font-weight: 700; white-space: nowrap; }

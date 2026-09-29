@@ -582,7 +582,11 @@ const App = () => {
       event.preventDefault();
       event.stopPropagation();
       if (effectiveShowTagManager) {
-        window.dispatchEvent(new Event('tag-manager-search-open'));
+        window.dispatchEvent(new Event('tag-manager-search-toggle'));
+      } else if (showSearchBox) {
+        setShowSearchBox(false);
+        setSearchIsFocused(false);
+        setSearch('');
       } else {
         setShowSearchBox(true);
         requestAnimationFrame(() => searchInputRef.current?.focus());
@@ -590,7 +594,7 @@ const App = () => {
     };
     window.addEventListener('keydown', onSearchHotkey, true);
     return () => window.removeEventListener('keydown', onSearchHotkey, true);
-  }, [searchHotkey, effectiveShowTagManager, isRecordingSearch, t, setShowSearchBox]);
+  }, [searchHotkey, effectiveShowTagManager, isRecordingSearch, showSearchBox, t, setShowSearchBox]);
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       if (isRecording || isRecordingSequential || isRecordingRich || isRecordingSearch) return;
