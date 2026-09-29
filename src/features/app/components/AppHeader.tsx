@@ -220,16 +220,16 @@ const AppHeader = ({
           >
             <div className="search-container window-no-drag">
               <div className="main-search-input-row">
-                <button
-                className={`main-search-mode-btn ${searchRegex ? 'active' : ''}`}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => setSearchRegex(!searchRegex)}
-              >{searchRegex ? '正则' : '普通'}</button>
-              <div className="main-search-field" style={{ position: 'relative' }}>
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  className={`search-input ${showTagFilter && search.trim().length === 0 && allTags.length > 0 ? 'dropdown-open' : ''}`}
+                <div className="main-search-field" style={{ position: 'relative' }}>
+                  <button
+                    className={`main-search-mode-btn ${searchRegex ? 'active' : ''}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setSearchRegex(!searchRegex)}
+                  >{searchRegex ? '正则' : '普通'}</button>
+                  <input
+                    ref={searchInputRef}
+                    type="text"
+                    className={`search-input ${showTagFilter && search.trim().length === 0 && allTags.length > 0 ? 'dropdown-open' : ''}`}
                   placeholder={t('search_placeholder')}
                   value={search}
                   onCompositionStart={() => setIsComposing(true)}

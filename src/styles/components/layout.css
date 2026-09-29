@@ -98,6 +98,9 @@ header {
   box-sizing: border-box;
 }
 
+.search-progress-track { height: 4px; max-width: 260px; margin: 0 auto 7px; overflow: hidden; border-radius: 999px; background: rgba(96,165,250,.2); }
+.search-progress-indicator { width: 42%; height: 100%; border-radius: inherit; background: #60a5fa; animation: search-progress-slide 1.1s ease-in-out infinite; }
+@keyframes search-progress-slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(270%); } }
 .search-container {
   display: flex;
   flex-direction: column;
@@ -123,6 +126,8 @@ header {
   cursor: pointer;
 }
 .main-search-mode-btn.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
+.main-search-field .main-search-mode-btn { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); z-index: 2; margin: 0; }
+.main-search-field .search-input { padding-left: 52px; }
 
 .search-input {
   width: 100%;

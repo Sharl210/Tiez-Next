@@ -207,6 +207,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
     }
 
+    // Migration 12: Tag creation timestamps for stable creation-order sorting
+    if current_version < 12 {
+        conn.execute("ALTER TABLE saved_tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute("UPDATE saved_tags SET created_at = rowid WHERE created_at = 0", [])?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+    }
+
     // Migration 11: User note/remark attached to an entry.
     // Has a default so upgrading an existing database is lossless, and so a build that
     // only knows about older columns still sees a valid table shape.

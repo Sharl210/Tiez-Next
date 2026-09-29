@@ -257,6 +257,7 @@ export function isSensitiveFeatureEnabled(
  */
 export type TagGroupSort =
     | 'name' | 'name_desc'
+    | 'created' | 'created_desc'
     | 'recent' | 'recent_asc'
     | 'count' | 'count_asc'
     | 'size' | 'size_asc';
@@ -490,6 +491,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
     const [entrySearchOpen, setEntrySearchOpen] = useState(false);
     const [entrySearch, setEntrySearch] = useState('');
+    const [entrySearchLoading, setEntrySearchLoading] = useState(false);
     const [entrySearchItems, setEntrySearchItems] = useState<ClipboardEntry[]>([]);
     const [entrySearchPattern, setEntrySearchPattern] = useState(false);
     const entrySearchInputRef = useRef<HTMLInputElement | null>(null);
@@ -542,13 +544,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      * 每个标签的统计量（最近使用时间、总字节数），用于排序。
      * 由 `get_tag_stats` 提供；拿不到时排序自动退化到只按名称/条目数。
      */
-    const [tagStats, setTagStats] = useState<Record<string, { last_used_at: number; total_bytes: number }>>({});
+    const [tagStats, setTagStats] = useState<Record<string, { last_used_at: number; total_bytes: number; created_at: number }>>({});
 
     const [tagSort, setTagSort] = useState<TagGroupSort>(() => {
         try {
             const saved = window.localStorage.getItem(TAG_GROUP_SORT_KEY);
             const allowed: TagGroupSort[] = [
-                'name', 'name_desc', 'recent', 'recent_asc',
+                'name', 'name_desc', 'created', 'created_desc', 'recent', 'recent_asc',
                 'count', 'count_asc', 'size', 'size_asc',
             ];
             if (allowed.includes(saved as TagGroupSort)) {
@@ -557,8 +559,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         } catch {
             // 读不到就用默认；这只是界面偏好，不值得打扰用户。
         }
-        // 默认按名称 A-Z：顺序可预期，找起来比"条目多的在前"更快。
-        return 'name';
+        return 'created';
     });
 
     const changeTagSort = useCallback((next: TagGroupSort) => {
@@ -937,11 +938,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             setTags(tagArray);
 
             // 统计量单独取一次：失败不影响标签列表本身，排序退化为名称/条目数。
-            invoke<Array<{ name: string; last_used_at: number; total_bytes: number }>>("get_tag_stats")
+            invoke<Array<{ name: string; last_used_at: number; total_bytes: number; created_at: number }>>("get_tag_stats")
                 .then((rows) => {
-                    const map: Record<string, { last_used_at: number; total_bytes: number }> = {};
+                    const map: Record<string, { last_used_at: number; total_bytes: number; created_at: number }> = {};
                     (rows || []).forEach((r) => {
-                        map[r.name] = { last_used_at: r.last_used_at, total_bytes: r.total_bytes };
+                        map[r.name] = { last_used_at: r.last_used_at, total_bytes: r.total_bytes, created_at: r.created_at };
                     });
                     setTagStats(map);
                 })
@@ -993,10 +994,12 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     useEffect(() => {
         const query = entrySearch.trim().toLowerCase();
         if (!query) {
+            setEntrySearchLoading(false);
             setEntrySearchItems([]);
             return;
         }
         let cancelled = false;
+        const progressTimer = window.setTimeout(() => setEntrySearchLoading(true), 2000);
         Promise.all(tags.map((tag) => invoke<ClipboardEntry[]>("get_tag_items", { tag: tag.name })))
             .then((pages) => {
                 if (cancelled) return;
@@ -1017,9 +1020,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     };
                     return prefix(a) - prefix(b) || b.timestamp - a.timestamp;
                 });
+                window.clearTimeout(progressTimer);
                 setEntrySearchItems(matched);
+                setEntrySearchLoading(false);
             })
-            .catch(() => { if (!cancelled) setEntrySearchItems([]); });
+            .catch(() => { if (!cancelled) { window.clearTimeout(progressTimer); setEntrySearchItems([]); setEntrySearchLoading(false); } });
         return () => { cancelled = true; };
     }, [entrySearch, entrySearchPattern, tags]);
 
@@ -1197,11 +1202,15 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         // `default` 保持后端给的顺序（按条目数降序），不改动；其余选项在这里重排。
         // 稳定排序：`name` 用 localeCompare 保证中文按拼音、英文按字母。
         const byName = (a: TagInfo, b: TagInfo) => a.name.localeCompare(b.name);
-        const stat = (n: string) => tagStats[n] ?? { last_used_at: 0, total_bytes: 0 };
+        const stat = (n: string) => tagStats[n] ?? { last_used_at: 0, total_bytes: 0, created_at: 0 };
         switch (tagSort) {
             case 'name_desc':
                 return [...matched].sort((a, b) => byName(b, a));
-            case 'count':
+            case 'created':
+                return [...matched].sort((a, b) => stat(a.name).created_at - stat(b.name).created_at || byName(a, b));
+            case 'created_desc':
+                return [...matched].sort((a, b) => stat(b.name).created_at - stat(a.name).created_at || byName(a, b));
+
                 return [...matched].sort((a, b) => b.count - a.count || byName(a, b));
             case 'count_asc':
                 return [...matched].sort((a, b) => a.count - b.count || byName(a, b));
@@ -1276,6 +1285,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             aria-label={t('tag_sort') || '排序方式'}
                             onChange={(e) => changeTagSort(e.target.value as TagGroupSort)}
                         >
+                            <option value="created">按创建时间（早→晚）</option>
+                            <option value="created_desc">按创建时间（晚→早）</option>
                             <option value="name">{t('tag_sort_name') || 'A-Z'}</option>
                             <option value="name_desc">{t('tag_sort_name_desc') || 'Z-A'}</option>
                             <option value="recent">{t('tag_sort_recent') || '最近使用'}</option>
@@ -1944,7 +1955,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
                         </div>
                         <div className="entry-search-results">
-                            {!entrySearch.trim() ? <div className="entry-search-empty">{t('tag_search_empty')}</div> : entrySearchItems.length === 0 ? <div className="entry-search-empty">{t('tag_search_no_results')}</div> : entrySearchItems.map((item) => (
+                            {entrySearchLoading ? <div className="entry-search-empty"><div className="search-progress-track" role="progressbar" aria-label="正在搜索"><div className="search-progress-indicator" /></div>正在搜索…</div> : !entrySearch.trim() ? <div className="entry-search-empty">{t('tag_search_empty')}</div> : entrySearchItems.length === 0 ? <div className="entry-search-empty">{t('tag_search_no_results')}</div> : entrySearchItems.map((item) => (
                                 <button key={item.id} className="entry-search-result" onClick={() => {
                                     const targetTag = item.tags?.[0];
                                     if (!targetTag) return;

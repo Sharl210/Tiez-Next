@@ -1,4 +1,13 @@
-.search-hit { background: rgba(245, 158, 11, 0.42); color: inherit; border-radius: 3px; padding: 0 1px; }
+.history-item.pinned {
+  background: rgba(191, 219, 254, 0.48);
+  border-color: rgba(96, 165, 250, 0.55);
+}
+
+.history-item.pinned:hover,
+.history-item.pinned:active {
+  background: rgba(191, 219, 254, 0.62);
+}
+
 .clipboard-type-bubble {
   display: inline-flex;
   align-items: center;

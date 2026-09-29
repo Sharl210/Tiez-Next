@@ -2052,7 +2052,9 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_sh
         val.replace("Win", "Super").parse::<Shortcut>()
     } {
         if shortcut == &search_s {
-            toggle_window(app);
+            if !crate::app::window_manager::is_main_window_focused() {
+                return;
+            }
             let _ = app.emit("focus-search-input", ());
         }
     }

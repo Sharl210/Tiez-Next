@@ -28,7 +28,10 @@ const ListFooter = ({ context }: { context?: VirtuosoListContext }) => {
             fontSize: '12px',
             color: 'var(--text-secondary)'
         }}>
-            {isLoading ? '加载中...' : '加载更多...'}
+            {isLoading ? <>
+                <div className="search-progress-track" role="progressbar" aria-label="正在搜索"><div className="search-progress-indicator" /></div>
+                <span>正在搜索…</span>
+            </> : '加载更多...'}
         </div>
     );
 };

@@ -37,6 +37,8 @@ pub struct TagStats {
     pub last_used_at: i64,
     /// 关联条目的正文长度之和。
     pub total_bytes: i64,
+    /// 标签首次创建时间（毫秒）。
+    pub created_at: i64,
 }
 
 pub struct SqliteTagRepository {
@@ -168,9 +170,10 @@ impl TagRepository for SqliteTagRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT et.tag, COUNT(h.id), COALESCE(MAX(h.timestamp), 0), \
-                            COALESCE(SUM(LENGTH(h.content)), 0) \
+                            COALESCE(SUM(LENGTH(h.content)), 0), COALESCE(MAX(st.created_at), 0) \
                      FROM entry_tags et \
                      LEFT JOIN clipboard_history h ON h.id = et.entry_id \
+                     LEFT JOIN saved_tags st ON st.name = et.tag \
                      GROUP BY et.tag",
                 )
                 .map_err(|e| e.to_string())?;
@@ -181,14 +184,15 @@ impl TagRepository for SqliteTagRepository {
                         row.get::<_, i32>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
             for row in rows.flatten() {
-                let (name, count, last_used_at, total_bytes) = row;
+                let (name, count, last_used_at, total_bytes, created_at) = row;
                 stats.insert(
                     name.clone(),
-                    TagStats { name, count, last_used_at, total_bytes },
+                    TagStats { name, count, last_used_at, total_bytes, created_at },
                 );
             }
         }
@@ -206,6 +210,7 @@ impl TagRepository for SqliteTagRepository {
                 count: 0,
                 last_used_at: 0,
                 total_bytes: 0,
+                created_at: 0,
             });
         }
 
@@ -214,31 +219,36 @@ impl TagRepository for SqliteTagRepository {
 
     fn create(&self, name: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR IGNORE INTO saved_tags (name) VALUES (?)",
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO saved_tags (name, created_at) VALUES (?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
             params![name],
-        )
-        .map_err(|e| e.to_string())?;
+        );
+        if result.is_err() {
+            conn.execute("INSERT OR IGNORE INTO saved_tags (name) VALUES (?)", params![name])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
-        // Update saved_tags table: merge color info if exists
-        let old_color: Option<String> = conn
+        let (old_color, old_created_at): (Option<String>, i64) = conn
             .query_row(
-                "SELECT color FROM saved_tags WHERE name = ?",
+                "SELECT color, created_at FROM saved_tags WHERE name = ?",
                 params![old_name],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .ok();
+            .unwrap_or((None, 0));
 
-        conn.execute(
-            "INSERT OR IGNORE INTO saved_tags (name, color) VALUES (?1, ?2)",
-            params![new_name, old_color],
-        )
-        .map_err(|e| e.to_string())?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO saved_tags (name, color, created_at) VALUES (?1, ?2, ?3)",
+            params![new_name, old_color, old_created_at],
+        );
+        if inserted.is_err() {
+            conn.execute("INSERT OR IGNORE INTO saved_tags (name, color) VALUES (?1, ?2)", params![new_name, old_color])
+                .map_err(|e| e.to_string())?;
+        }
 
         let _ = conn.execute("DELETE FROM saved_tags WHERE name = ?", params![old_name]);
 
@@ -438,7 +448,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "CREATE TABLE saved_tags (name TEXT PRIMARY KEY, color TEXT)",
+            "CREATE TABLE saved_tags (name TEXT PRIMARY KEY, color TEXT, created_at INTEGER NOT NULL DEFAULT 0)",
             [],
         )
         .unwrap();

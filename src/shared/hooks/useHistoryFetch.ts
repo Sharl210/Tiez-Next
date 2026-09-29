@@ -73,7 +73,9 @@ export const useHistoryFetch = ({
             tagOnly = true;
           }
 
+          let searchProgressTimer: ReturnType<typeof setTimeout> | undefined;
           try {
+            searchProgressTimer = setTimeout(() => setIsLoadingMore(true), 2000);
             data = await invoke<ClipboardEntry[]>("search_clipboard_history", {
               searchTerm: term,
               limit: 200,
@@ -83,6 +85,9 @@ export const useHistoryFetch = ({
           } catch (e) {
             console.error("Search failed, falling back", e);
             data = [];
+          } finally {
+            if (searchProgressTimer) clearTimeout(searchProgressTimer);
+            setIsLoadingMore(false);
           }
 
           if (seq !== fetchSeqRef.current) return;

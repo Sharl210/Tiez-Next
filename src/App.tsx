@@ -717,6 +717,10 @@ const App = () => {
     if (!isTauriRuntime()) return;
 
     const unlisten = listen("focus-search-input", () => {
+      if (effectiveShowTagManager) {
+        window.dispatchEvent(new Event("tag-manager-search-open"));
+        return;
+      }
       setShowSettings(false);
       setShowTagManager(false);
       setChatMode(false);
