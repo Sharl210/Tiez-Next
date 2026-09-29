@@ -576,6 +576,22 @@ const App = () => {
   );
 
   useEffect(() => {
+    if (!searchHotkey || searchHotkey === t('not_set')) return;
+    const onSearchHotkey = (event: KeyboardEvent) => {
+      if (event.repeat || isRecordingSearch || !matchesHotkey(event, searchHotkey)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (effectiveShowTagManager) {
+        window.dispatchEvent(new Event('tag-manager-search-open'));
+      } else {
+        setShowSearchBox(true);
+        requestAnimationFrame(() => searchInputRef.current?.focus());
+      }
+    };
+    window.addEventListener('keydown', onSearchHotkey, true);
+    return () => window.removeEventListener('keydown', onSearchHotkey, true);
+  }, [searchHotkey, effectiveShowTagManager, isRecordingSearch, t, setShowSearchBox]);
+  useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       if (isRecording || isRecordingSequential || isRecordingRich || isRecordingSearch) return;
       if (!hotkey || hotkey === t('not_set')) return;

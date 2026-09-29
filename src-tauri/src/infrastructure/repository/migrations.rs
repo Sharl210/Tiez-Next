@@ -209,7 +209,9 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     // Migration 12: Tag creation timestamps for stable creation-order sorting
     if current_version < 12 {
-        conn.execute("ALTER TABLE saved_tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0", [])?;
+        if !has_column(conn, "saved_tags", "created_at")? {
+            conn.execute("ALTER TABLE saved_tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         conn.execute("UPDATE saved_tags SET created_at = rowid WHERE created_at = 0", [])?;
         conn.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
     }
