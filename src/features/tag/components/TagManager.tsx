@@ -1937,9 +1937,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <strong>{t('tag_search_entries')}</strong>
                             <button className="action-btn" onClick={() => setEntrySearchOpen(false)} aria-label="关闭搜索"><X size={16} /></button>
                         </div>
-                        <div className="entry-search-input-wrap">
-                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
+                        <div className="entry-search-input-row">
                             <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
+                        </div>
+                        <div className="entry-search-options-row">
+                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
                         </div>
                         <div className="entry-search-results">
                             {!entrySearch.trim() ? <div className="entry-search-empty">{t('tag_search_empty')}</div> : entrySearchItems.length === 0 ? <div className="entry-search-empty">{t('tag_search_no_results')}</div> : entrySearchItems.map((item) => (
@@ -1950,9 +1952,11 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                     setEntrySearchOpen(false);
                                     void loadTagItems(targetTag);
                                 }}>
-                                    <span className="entry-search-result-text">{renderSearchHighlight(item.content, entrySearch, entrySearchPattern)}</span>
+                                    <span className="entry-search-result-main">
+                                        <span className="entry-search-result-text">{renderSearchHighlight(item.content, entrySearch, entrySearchPattern)}</span>
+                                        <span className="entry-search-result-tags">{(item.tags || []).map((tag, index) => <span key={tag}>{index ? ' · ' : ''}{renderSearchHighlight(tag, entrySearch, entrySearchPattern)}</span>)}</span>
+                                    </span>
                                     {item.note?.trim() && <span className="entry-search-result-note"><Sparkles size={13} /><span>{renderSearchHighlight(item.note, entrySearch, entrySearchPattern)}</span></span>}
-                                    <span className="entry-search-result-tags">{item.tags?.join(' · ') || '无标签'}</span>
                                 </button>
                             ))}
                         </div>
@@ -2223,13 +2227,15 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(245,248,255,.34); backdrop-filter: blur(18px) saturate(135%); }
                 .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: rgba(255,255,255,.72); backdrop-filter: blur(24px) saturate(145%); }
                 .entry-search-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: var(--text-primary); }
-                .entry-search-input-wrap { display: flex; align-items: center; gap: 8px; margin: 0 14px 12px; padding: 8px 10px; border: 1px solid var(--accent-color); border-radius: 12px; color: var(--accent-color); background: rgba(255,255,255,.88); box-shadow: 0 5px 18px rgba(15,23,42,.12); }
-                .entry-search-input-wrap input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; font-size: 13px; height: 28px; }
-                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 9px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+                .entry-search-input-row { display: flex; width: 100%; margin: 0 14px 6px; padding: 0; }
+                .entry-search-input-row input { width: 100%; height: 40px; border: 1px solid var(--accent-color); border-radius: 12px; padding: 0 14px; outline: 0; background: rgba(255,255,255,.9); color: var(--text-primary); user-select: text; font-size: 13px; box-shadow: 0 5px 18px rgba(15,23,42,.12); }
+                .entry-search-options-row { display: flex; justify-content: flex-start; padding: 0 14px 10px; }
+                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 10px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
                 .entry-search-mode.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
+                .entry-search-result-main { display: flex; align-items: center; gap: 10px; width: 100%; }
+                .entry-search-result-tags { flex: 0 0 auto; margin-left: auto; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
                 .entry-search-result-note { display: flex; align-items: flex-start; gap: 5px; width: 100%; color: #2563eb; font-size: 11px; }
                 .entry-search-result-note svg { flex: 0 0 auto; margin-top: 1px; }
-                .entry-search-result-tags { width: 100%; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
                 .entry-search-results { overflow-y: auto; padding: 0 10px 10px; }
                 .entry-search-result { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 11px 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
                 .entry-search-result:hover { background: var(--accent-soft); }
