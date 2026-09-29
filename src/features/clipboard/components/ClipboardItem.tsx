@@ -66,8 +66,15 @@ const highlightSearchText = (text: string, query: string, regex: boolean): React
     while ((match = matcher.exec(text))) {
         if (match.index > cursor) output.push(text.slice(cursor, match.index));
         output.push(<mark key={`${match.index}-${match[0]}`} className="search-hit">{match[0]}</mark>);
+        if (!match[0].length) {
+            if (cursor < text.length) {
+                output.push(<mark key={`${match.index}-empty`} className="search-hit">{text[cursor]}</mark>);
+                cursor += 1;
+            }
+            matcher.lastIndex = Math.max(matcher.lastIndex, cursor);
+            continue;
+        }
         cursor = match.index + match[0].length;
-        if (!match[0].length) matcher.lastIndex += 1;
     }
     if (!output.length) return text;
     if (cursor < text.length) output.push(text.slice(cursor));
@@ -1550,7 +1557,7 @@ const ClipboardItem = ({
                             gap: '4px'
                         }}
                     >
-                        {tag}
+                         {highlightSearchText(tag, searchQuery, searchRegex)}
                           {isEditingTags && (
                               /*
                                * 标签上的删除叉。
@@ -1827,7 +1834,7 @@ const ClipboardItem = ({
                         whiteSpace: 'nowrap'
                     }}
                 >
-                    {truncateNoteForInline(noteText)}
+                    {highlightSearchText(truncateNoteForInline(noteText), searchQuery, searchRegex)}
                 </span>
             </div>
         );

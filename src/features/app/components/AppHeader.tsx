@@ -224,8 +224,7 @@ const AppHeader = ({
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => setSearchRegex(!searchRegex)}
               >{searchRegex ? '正则' : '普通'}</button>
-              <div style={{ position: 'relative' }}>
-                <Search size={14} className="search-icon" />
+              <div className="main-search-field" style={{ position: 'relative' }}>
                 <input
                   ref={searchInputRef}
                   type="text"

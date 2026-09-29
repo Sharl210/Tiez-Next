@@ -99,18 +99,19 @@ header {
 }
 
 .search-container {
-  position: relative;
+  display: flex;
+  align-items: center;
   width: 100%;
   margin-top: 2px;
   overflow: visible !important;
   padding: 0 var(--spacing-md);
 }
 
+.main-search-field { flex: 1; min-width: 0; }
 .main-search-mode-btn {
-  position: absolute;
-  right: 8px;
-  top: 5px;
-  z-index: 2;
+  flex: 0 0 auto;
+  position: static;
+  margin-right: 6px;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   padding: 3px 7px;

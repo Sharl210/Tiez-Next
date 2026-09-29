@@ -127,8 +127,15 @@ const renderSearchHighlight = (text: string, query: string, regex: boolean): Rea
     while ((match = matcher.exec(text))) {
         if (match.index > cursor) parts.push(text.slice(cursor, match.index));
         parts.push(<mark key={`${match.index}-${match[0]}`} className="search-hit">{match[0]}</mark>);
+        if (!match[0].length) {
+            if (cursor < text.length) {
+                parts.push(<mark key={`${match.index}-empty`} className="search-hit">{text[cursor]}</mark>);
+                cursor += 1;
+            }
+            matcher.lastIndex = Math.max(matcher.lastIndex, cursor);
+            continue;
+        }
         cursor = match.index + match[0].length;
-        if (!match[0].length) matcher.lastIndex += 1;
     }
     if (!parts.length) return text;
     if (cursor < text.length) parts.push(text.slice(cursor));
