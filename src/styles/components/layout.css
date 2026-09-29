@@ -100,14 +100,16 @@ header {
 
 .search-container {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   width: 100%;
   margin-top: 2px;
   overflow: visible !important;
   padding: 0 var(--spacing-md);
 }
 
-.main-search-field { flex: 1; min-width: 0; }
+.main-search-input-row { display: flex; align-items: center; gap: 6px; width: 100%; }
+.main-search-input-row .main-search-field { flex: 1; }
 .main-search-mode-btn {
   flex: 0 0 auto;
   position: static;

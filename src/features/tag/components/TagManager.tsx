@@ -1954,7 +1954,10 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                 }}>
                                     <span className="entry-search-result-main">
                                         <span className="entry-search-result-text">{renderSearchHighlight(item.content, entrySearch, entrySearchPattern)}</span>
-                                        <span className="entry-search-result-tags">{(item.tags || []).map((tag, index) => <span key={tag}>{index ? ' · ' : ''}{renderSearchHighlight(tag, entrySearch, entrySearchPattern)}</span>)}</span>
+                                        <span className="entry-search-result-tags">{(item.tags || []).map((tag, index) => {
+                                            const background = tagColors[tag] || getTagColor(tag, theme);
+                                            return <span key={tag} className="entry-search-tag-bubble" style={{ background }}>{index ? ' · ' : ''}{renderSearchHighlight(tag, entrySearch, entrySearchPattern)}</span>;
+                                        })}</span>
                                     </span>
                                     {item.note?.trim() && <span className="entry-search-result-note"><Sparkles size={13} /><span>{renderSearchHighlight(item.note, entrySearch, entrySearchPattern)}</span></span>}
                                 </button>
@@ -2233,7 +2236,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 10px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
                 .entry-search-mode.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
                 .entry-search-result-main { display: flex; align-items: center; gap: 10px; width: 100%; }
-                .entry-search-result-tags { flex: 0 0 auto; margin-left: auto; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
+                .entry-search-tag-bubble { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; color: #fff; font-weight: 700; white-space: nowrap; }
                 .entry-search-result-note { display: flex; align-items: flex-start; gap: 5px; width: 100%; color: #2563eb; font-size: 11px; }
                 .entry-search-result-note svg { flex: 0 0 auto; margin-top: 1px; }
                 .entry-search-results { overflow-y: auto; padding: 0 10px 10px; }

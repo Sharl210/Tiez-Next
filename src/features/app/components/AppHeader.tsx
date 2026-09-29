@@ -219,7 +219,8 @@ const AppHeader = ({
             style={{ flexShrink: 0 }}
           >
             <div className="search-container window-no-drag">
-              <button
+              <div className="main-search-input-row">
+                <button
                 className={`main-search-mode-btn ${searchRegex ? 'active' : ''}`}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => setSearchRegex(!searchRegex)}
@@ -257,6 +258,7 @@ const AppHeader = ({
                   }}
                   style={{ color: colorMode === 'dark' ? '#ffffff' : undefined }}
                 />
+              </div>
               </div>
               <div
                 className="hide-scrollbar"
