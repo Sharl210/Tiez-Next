@@ -38,8 +38,8 @@ pub(crate) fn sync_registered_hotkeys(app_handle: &AppHandle) -> AppResult<()> {
     let rich_hotkey = settings.rich_paste_hotkey.lock().unwrap().clone();
     register_shortcut(app_handle, &rich_hotkey);
 
-    let search_hotkey = settings.search_hotkey.lock().unwrap().clone();
-    register_shortcut(app_handle, &search_hotkey);
+    // Search is intentionally handled only by the focused Tiez-Next WebView.
+    // It must not be registered as an OS-global shortcut, or other applications' Ctrl+F is swallowed.
 
     Ok(())
 }

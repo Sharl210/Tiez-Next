@@ -578,7 +578,7 @@ const App = () => {
   useEffect(() => {
     if (!searchHotkey || searchHotkey === t('not_set')) return;
     const onSearchHotkey = (event: KeyboardEvent) => {
-      if (event.repeat || isRecordingSearch || !matchesHotkey(event, searchHotkey)) return;
+      if (showSettings || effectiveShowEmojiPanel || chatMode) return;
       event.preventDefault();
       event.stopPropagation();
       if (effectiveShowTagManager) {
@@ -738,7 +738,13 @@ const App = () => {
 
     const unlisten = listen("focus-search-input", () => {
       if (effectiveShowTagManager) {
-        window.dispatchEvent(new Event("tag-manager-search-open"));
+        window.dispatchEvent(new Event("tag-manager-search-toggle"));
+        return;
+      }
+      if (showSearchBox) {
+        setShowSearchBox(false);
+        setSearchIsFocused(false);
+        setSearch("");
         return;
       }
       setShowSettings(false);
