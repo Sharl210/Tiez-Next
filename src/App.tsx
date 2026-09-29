@@ -576,26 +576,6 @@ const App = () => {
   );
 
   useEffect(() => {
-    if (!searchHotkey || searchHotkey === t('not_set')) return;
-    const onSearchHotkey = (event: KeyboardEvent) => {
-      if (showSettings || effectiveShowEmojiPanel || chatMode) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (effectiveShowTagManager) {
-        window.dispatchEvent(new Event('tag-manager-search-toggle'));
-      } else if (showSearchBox) {
-        setShowSearchBox(false);
-        setSearchIsFocused(false);
-        setSearch('');
-      } else {
-        setShowSearchBox(true);
-        requestAnimationFrame(() => searchInputRef.current?.focus());
-      }
-    };
-    window.addEventListener('keydown', onSearchHotkey, true);
-    return () => window.removeEventListener('keydown', onSearchHotkey, true);
-  }, [searchHotkey, effectiveShowTagManager, isRecordingSearch, showSearchBox, t, setShowSearchBox]);
-  useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       if (isRecording || isRecordingSequential || isRecordingRich || isRecordingSearch) return;
       if (!hotkey || hotkey === t('not_set')) return;
@@ -732,48 +712,6 @@ const App = () => {
     setAiAssignedProfileTranslate,
     setSettingsLoaded
   });
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-
-    const unlisten = listen("focus-search-input", () => {
-      if (effectiveShowTagManager) {
-        window.dispatchEvent(new Event("tag-manager-search-toggle"));
-        return;
-      }
-      if (showSearchBox) {
-        setShowSearchBox(false);
-        setSearchIsFocused(false);
-        setSearch("");
-        return;
-      }
-      setShowSettings(false);
-      setShowTagManager(false);
-      setChatMode(false);
-      setShowEmojiPanel(false);
-      setShowSearchBox(true);
-      setSearchIsFocused(true);
-      invoke("activate_window_focus")
-        .catch(console.error)
-        .finally(() => {
-          requestAnimationFrame(() => {
-            searchInputRef.current?.focus();
-          });
-        });
-    });
-
-    return () => {
-      unlisten.then((off) => off());
-    };
-  }, [
-    setShowSettings,
-    setShowTagManager,
-    setChatMode,
-    setShowEmojiPanel,
-    setShowSearchBox,
-    setSearchIsFocused,
-    searchInputRef
-  ]);
 
   useEffect(() => {
     if (!emojiPanelEnabled && showEmojiPanel) {

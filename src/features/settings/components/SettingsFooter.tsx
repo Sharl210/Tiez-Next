@@ -1,7 +1,6 @@
 import { Github, RotateCcw, X, ArrowUpCircle } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { useState } from "react";
 
 interface SettingsFooterProps {
@@ -23,35 +22,9 @@ const SettingsFooter = ({
 
     const handleInstallUpdate = async () => {
         if (!pendingUpdate) return;
-        setUpdateStatus(`${t('downloading')} (0%)`);
-        
-        let downloaded = 0;
-        let total = 0;
-
-        try {
-            await pendingUpdate.downloadAndInstall((event) => {
-                switch (event.event) {
-                    case 'Started':
-                        total = event.data.contentLength || 0;
-                        break;
-                    case 'Progress':
-                        downloaded += event.data.chunkLength;
-                        if (total > 0) {
-                            const percent = Math.round((downloaded / total) * 100);
-                            setUpdateStatus(`${t('downloading')} (${percent}%)`);
-                        }
-                        break;
-                    case 'Finished':
-                        setUpdateStatus(t('relaunching') || '正在重启...');
-                        break;
-                }
-            });
-            await relaunch();
-        } catch (err) {
-            console.error('Update failed:', err);
-            setUpdateStatus(t('checking_failed'));
-            setTimeout(() => setUpdateStatus(''), 3000);
-        }
+        const releaseUrl = `https://github.com/Sharl210/Tiez-Next/releases/tag/v${pendingUpdate.version}`;
+        await openUrl(releaseUrl).catch((err) => console.error('Open release failed:', err));
+        setPendingUpdate(null);
     };
 
     return (

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { check, Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { isTauriRuntime } from "../lib/tauriRuntime";
 
 export type UpdateStatus = "idle" | "checking" | "downloading" | "ready" | "error";
@@ -10,7 +10,7 @@ export const useAutoUpdate = () => {
   const [status, setStatus] = useState<UpdateStatus>("idle");
   const [version, setVersion] = useState("");
   const [notes, setNotes] = useState("");
-  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadProgress] = useState(0);
   const [updateObj, setUpdateObj] = useState<Update | null>(null);
 
   const checkUpdate = useCallback(async () => {
@@ -48,43 +48,16 @@ export const useAutoUpdate = () => {
 
   const startUpdate = async () => {
     if (!updateObj) return;
-
-    try {
-      setStatus("downloading");
-      setDownloadProgress(0);
-
-      // 4. Use the native plugin logic to download and install
-      await updateObj.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            console.log("[Update] Download started");
-            break;
-          case "Progress":
-            // Calculate progress based on bytes if available, or incremental simulation
-            setDownloadProgress((prev) => Math.min(prev + 5, 99)); 
-            break;
-          case "Finished":
-            console.log("[Update] Download finished");
-            setDownloadProgress(100);
-            setStatus("ready");
-            break;
-        }
-      });
-      
-      setStatus("ready");
-      setDownloadProgress(100);
-    } catch (error) {
-      console.error("[Update] Failed to download or install update:", error);
-      setStatus("error");
-    }
+    const releaseUrl = `https://github.com/Sharl210/Tiez-Next/releases/tag/v${updateObj.version}`;
+    await openUrl(releaseUrl).catch((error) => console.error("[Update] Failed to open release:", error));
+    setIsOpen(false);
   };
 
   const applyUpdate = async () => {
-    try {
-      await relaunch();
-    } catch (error) {
-      console.error("[Update] Failed to relaunch:", error);
-    }
+    if (!updateObj) return;
+    const releaseUrl = `https://github.com/Sharl210/Tiez-Next/releases/tag/v${updateObj.version}`;
+    await openUrl(releaseUrl).catch((error) => console.error("[Update] Failed to open release:", error));
+    setIsOpen(false);
   };
 
   useEffect(() => {

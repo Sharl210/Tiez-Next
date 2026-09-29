@@ -180,6 +180,11 @@ npm run tauri:build:win     # 交叉编译出 Windows 安装包
 每个版本的**完整说明**在 [Releases](https://github.com/Sharl210/Tiez-Next/releases) 页面。
 这里只列每个版本**最重要的变化**，方便快速判断要不要升级。
 
+### v0.5.34
+
+- 清除残余的任意按键唤起搜索监听。
+- 更新检查绑定 GitHub Release，有新版本时弹窗并打开对应 Release 页面，不在应用内自动安装。
+
 ### v0.5.33
 
 - 完全移除搜索快捷键功能及设置项，不再显示、不再注册、不再触发。
