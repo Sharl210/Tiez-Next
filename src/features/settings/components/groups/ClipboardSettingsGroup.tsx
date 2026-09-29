@@ -344,51 +344,6 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                         </div>
                     </div>
                     <div className="setting-item">
-                        <div className="item-label-group">
-                            <span className="item-label">{props.t('search_hotkey_label')}</span>
-                            <span className="hint">{props.isRecordingSearch ? props.t('hotkey_recording_esc') : props.t('hotkey_click_hint')}</span>
-                        </div>
-                        <div
-                            className={`key-group ${props.isRecordingSearch ? 'recording' : ''}`}
-                            onClick={(e) => { props.setIsRecordingSearch(true); e.currentTarget.focus(); }}
-                            tabIndex={0}
-                            onKeyDown={(e) => {
-                                if (!props.isRecordingSearch) return;
-                                e.preventDefault();
-                                e.stopPropagation();
-
-                                if (e.key === 'Escape') {
-                                    props.setIsRecordingSearch(false);
-                                    return;
-                                }
-
-                                if (e.key === 'Backspace' || e.key === 'Delete') {
-                                    props.updateSearchHotkey('');
-                                    props.setIsRecordingSearch(false);
-                                    return;
-                                }
-
-                                const modifiers = [];
-                                if (e.ctrlKey) modifiers.push('Ctrl');
-                                if (e.shiftKey) modifiers.push('Shift');
-                                if (e.altKey) modifiers.push('Alt');
-                                if (e.metaKey) modifiers.push('Command');
-
-                                const key = e.key.toUpperCase();
-                                if (['CONTROL', 'SHIFT', 'ALT', 'META'].includes(key)) return;
-
-                                const newHotkey = [...modifiers, key].join('+');
-                                props.updateSearchHotkey(newHotkey);
-                            }}
-                        >
-                            {props.isRecordingSearch ? (
-                                <div className="key-cap" style={{ width: '8em' }}>{props.t('waiting_for_input')}</div>
-                            ) : (
-                                renderHotkeyCaps(props.searchHotkey)
-                            )}
-                        </div>
-                    </div>
-                    <div className="setting-item">
                         <props.LabelWithHint
                             label={props.t('quick_paste_modifier')}
                             hint={props.t('quick_paste_modifier_hint')}

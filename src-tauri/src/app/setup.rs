@@ -2061,17 +2061,6 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_sh
         }
     }
 
-    if let Ok(search_s) = {
-        let val = settings.search_hotkey.lock().unwrap().clone();
-        val.replace("Win", "Super").parse::<Shortcut>()
-    } {
-        if shortcut == &search_s {
-            if !crate::app::window_manager::is_main_window_focused() && !cursor_is_over_main_window(app) {
-                return;
-            }
-            let _ = app.emit("focus-search-input", ());
-        }
-    }
 }
 
 pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {

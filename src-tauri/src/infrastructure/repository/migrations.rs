@@ -229,6 +229,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
     }
 
+    // Migration 13: Remove retired search shortcut setting.
+    if current_version < 13 {
+        conn.execute("DELETE FROM settings WHERE key = 'app.search_hotkey'", [])?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+    }
+
     Ok(())
 }
 
