@@ -80,8 +80,8 @@ export const useHistoryFetch = ({
               searchTerm: term,
               limit: 200,
               tagOnly,
-              regex: searchRegex
-            });
+              regex: searchRegex,
+              offset: reset ? 0 : baseOffset            });
           } catch (e) {
             console.error("Search failed, falling back", e);
             data = [];
@@ -91,10 +91,13 @@ export const useHistoryFetch = ({
           }
 
           if (seq !== fetchSeqRef.current) return;
-          // Search results are not paginated; always replace list and stop infinite loading.
-          setHistory(data);
-          setCurrentOffset(data.length);
-          setHasMore(false);
+          if (reset) {
+            setHistory(data);
+          } else {
+            setHistory((prev) => [...prev, ...data.filter((item) => !prev.some((existing) => existing.id === item.id))]);
+          }
+          setCurrentOffset((reset ? 0 : baseOffset) + data.length);
+          setHasMore(data.length >= 200);
         } else {
           const requestedLimit = pageSize + 1; // Use standard page size for DB limit
           const rawData = await invoke<ClipboardEntry[]>("get_clipboard_history", {
@@ -153,7 +156,7 @@ export const useHistoryFetch = ({
 
   const loadMoreHistory = useCallback(async () => {
     if (loadingRef.current || isLoadingMore || !hasMore) return;
-    if (debouncedSearch && debouncedSearch.trim().length > 0) return;
+    // Search results are paged too; loading the next page is safe and bounded.
 
     const effectiveOffset = Math.min(currentOffsetRef.current, historyLengthRef.current);
     if (lastRequestedOffsetRef.current === effectiveOffset) return;

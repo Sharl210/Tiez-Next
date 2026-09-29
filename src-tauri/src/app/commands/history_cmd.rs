@@ -112,21 +112,22 @@ pub fn search_clipboard_history(
     limit: i32,
     tag_only: Option<bool>,
     regex: Option<bool>,
+    offset: Option<i32>,
 ) -> AppResult<Vec<ClipboardEntry>> {
     let is_tag_only = tag_only.unwrap_or(false);
     let is_regex = regex.unwrap_or(false);
+    let search_offset = offset.unwrap_or(0).max(0);
     let mut history = if is_regex {
         let re = regex::Regex::new(&search_term).map_err(|e| AppError::from(e.to_string()))?;
         // Expressions that match the empty string (notably `.*`) match every record. Avoid
         // scanning an unbounded history snapshot: return the normal visible page directly.
         if re.is_match("") {
-            state.repo.get_history(limit.max(0).min(200), 0, None)?
+            state.repo.get_history(limit.max(0).min(200), search_offset, None)?
         } else {
-            let scan_limit = limit.max(0).min(2_000).max(1);
+            let scan_limit = (search_offset + limit.max(0).min(200)).min(2_000).max(1);
             let mut rows = state.repo.get_history(scan_limit, 0, None)?;
             rows.retain(|item| re.is_match(&item.content) || re.is_match(&item.preview) || re.is_match(&item.note) || re.is_match(&item.source_app) || item.tags.iter().any(|tag| re.is_match(tag)) || item.html_content.as_deref().map(|html| re.is_match(html)).unwrap_or(false));
-            rows.truncate(limit.max(0) as usize);
-            rows
+            rows.into_iter().skip(search_offset as usize).take(limit.max(0) as usize).collect()
         }
     } else {
         state.repo.search(&search_term, limit, is_tag_only)?

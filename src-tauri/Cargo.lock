@@ -5884,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "tiez-next"
-version = "0.5.34"
+version = "0.5.35"
 dependencies = [
  "arboard",
  "axum",
