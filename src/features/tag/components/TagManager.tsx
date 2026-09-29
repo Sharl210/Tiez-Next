@@ -490,7 +490,6 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
 
     const [tagItems, setTagItems] = useState<ClipboardEntry[]>([]);
     const [tagColors, setTagColors] = useState<Record<string, string>>({});
-    const [noteTagNames, setNoteTagNames] = useState<Set<string>>(new Set());
 
     const [editingTag, setEditingTag] = useState<string | null>(null);
     const [newTagName, setNewTagName] = useState('');
@@ -967,17 +966,6 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     };
 
     useEffect(() => {
-        if (!tags.length) { setNoteTagNames(new Set()); return; }
-        let cancelled = false;
-        Promise.all(tags.map((tag) => invoke<ClipboardEntry[]>("get_tag_items", { tag: tag.name }))).then((pages) => {
-            if (cancelled) return;
-            const names = new Set<string>();
-            pages.forEach((items, index) => { if (items.some((item) => !!item.note?.trim())) names.add(tags[index].name); });
-            setNoteTagNames(names);
-        }).catch(() => {});
-        return () => { cancelled = true; };
-    }, [tags]);
-    useEffect(() => {
         const openSearch = () => setEntrySearchOpen(true);
         window.addEventListener('tag-manager-search-open', openSearch);
         return () => window.removeEventListener('tag-manager-search-open', openSearch);
@@ -1438,7 +1426,6 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                      * click anywhere on it selects the group.
                                      */}
                                     <span className="tag-name">{tag.name}</span>
-                                    {noteTagNames.has(tag.name) && <Sparkles className="tag-note-sparkle" size={13} aria-label="有备注" />}
                                     <span className="tag-badge">{tag.count}</span>
                                 </>
                             )}
@@ -1957,7 +1944,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                     void loadTagItems(targetTag);
                                 }}>
                                     <span className="entry-search-result-text">{renderSearchHighlight(item.content, entrySearch, entrySearchPattern)}</span>
-                                    <span className="entry-search-result-meta">{item.tags?.join(' · ') || '无标签'}</span>
+                                    {item.note?.trim() && <span className="entry-search-result-note"><Sparkles size={13} /><span>{renderSearchHighlight(item.note, entrySearch, entrySearchPattern)}</span></span>}
+                                    <span className="entry-search-result-tags">{item.tags?.join(' · ') || '无标签'}</span>
                                 </button>
                             ))}
                         </div>
@@ -2228,10 +2216,13 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                 .entry-search-modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; background: rgba(245,248,255,.34); backdrop-filter: blur(18px) saturate(135%); }
                 .entry-search-modal { width: min(680px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line-soft); border-radius: 18px; background: rgba(255,255,255,.72); backdrop-filter: blur(24px) saturate(145%); }
                 .entry-search-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: var(--text-primary); }
-                .entry-search-input-wrap { display: flex; align-items: center; gap: 8px; margin: 0 14px 12px; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: 12px; color: var(--accent-color); background: var(--bg-input); }
-                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 4px 8px; background: var(--bg-panel); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+                .entry-search-input-wrap { display: flex; align-items: center; gap: 8px; margin: 0 14px 12px; padding: 8px 10px; border: 1px solid var(--accent-color); border-radius: 12px; color: var(--accent-color); background: rgba(255,255,255,.88); box-shadow: 0 5px 18px rgba(15,23,42,.12); }
+                .entry-search-input-wrap input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; font-size: 13px; height: 28px; }
+                .entry-search-mode { border: 1px solid var(--line-soft); border-radius: 8px; padding: 5px 9px; min-width: 42px; background: var(--bg-input); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
                 .entry-search-mode.active { color: var(--accent-color); border-color: var(--accent-color); background: var(--accent-soft); }
- flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); user-select: text; }
+                .entry-search-result-note { display: flex; align-items: flex-start; gap: 5px; width: 100%; color: #2563eb; font-size: 11px; }
+                .entry-search-result-note svg { flex: 0 0 auto; margin-top: 1px; }
+                .entry-search-result-tags { width: 100%; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
                 .entry-search-results { overflow-y: auto; padding: 0 10px 10px; }
                 .entry-search-result { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 11px 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
                 .entry-search-result:hover { background: var(--accent-soft); }
