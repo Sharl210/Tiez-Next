@@ -990,7 +990,7 @@ const App = () => {
     typeFilter
   });
 
-  const effectiveHasMore = hasMore && filteredHistory.length >= PAGE_SIZE;
+  const effectiveHasMore = hasMore;
 
   const { pinnedItems, unpinnedItems, handlePinnedReorder } = usePinnedSort({
     filteredHistory,
