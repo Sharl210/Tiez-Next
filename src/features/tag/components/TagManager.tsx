@@ -1200,6 +1200,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
             // 此前这里硬编码 `moveToTop: true`，绕过了用户设置（该设置在用户的库里
             // 是 false），导致"在标签管理页点一下条目就跳到第一条"——用户以为是
             // 编辑导致的，实际是这里的粘贴置顶。编辑本身不改排序键（timestamp）。
+            // 标签管理中的“粘贴”也要在主历史中留下最新一条记录；先写入历史，再执行实际粘贴。
+            await invoke('add_manual_item', { content, contentType: type, tags: [] });
             await invoke('copy_to_clipboard', { content, contentType: type, paste: true, id, deleteAfterUse: false });
         } catch (err) { console.error(err); }
     };

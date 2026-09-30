@@ -1,5 +1,6 @@
 // Clipboard operations module
-use crate::app_state::{PasteQueue, SessionHistory, SettingsState};
+use crate::app_state::{AppDataDir, PasteQueue, SessionHistory, SettingsState};
+use crate::domain::models::ClipboardEntry;
 use crate::database::{calc_image_hash_from_rgba, DbState};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
