@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { RefObject } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -100,9 +101,15 @@ const AppHeader = ({
     }
   };
 
+  useEffect(() => {
+    if (!showSearchBox) return;
+    const frame = requestAnimationFrame(() => searchInputRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [showSearchBox, searchInputRef]);
+
   return (
-  <header className="window-drag-region">
-    <div className="header-top">
+    <header className="window-drag-region">
+      <div className="header-top">
       <div className="header-leading">
         {(showSettings || showTagManager || showEmojiPanel) && (
           <button className="btn-icon window-no-drag" onClick={onBack} title={t('tooltip_back')}>
@@ -159,6 +166,7 @@ const AppHeader = ({
               onClick={() => {
                 const next = !showSearchBox;
                 setShowSearchBox(next);
+                if (!next) setSearch('');
                 try {
                   localStorage.setItem('tiez_show_search_box', next ? 'true' : 'false');
                 } catch {
