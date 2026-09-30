@@ -28,7 +28,9 @@ export const useAppState = (): AppState => {
   );
   const [history, setHistory] = useState<ClipboardEntry[]>([]);
   const [search, setSearch] = useState("");
-  const [searchRegex, setSearchRegex] = useState(false);
+  const [searchRegex, setSearchRegex] = useState(() => {
+    try { return window.localStorage.getItem("tiez_main_search_regex") === "true"; } catch { return false; }
+  });
   const [isComposing, setIsComposing] = useState(false);
   const [searchIsFocused, setSearchIsFocused] = useState(false);
   const [showTagFilter, setShowTagFilter] = useState(false);

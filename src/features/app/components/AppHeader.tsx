@@ -206,7 +206,7 @@ const AppHeader = ({
 
     {!showSettings && !showTagManager && !showEmojiPanel && (
       <AnimatePresence>
-        {(showSearchBox || search.trim().length > 0) && (
+        {showSearchBox && (
           <motion.div
             initial={{ height: 0, opacity: 0, overflow: 'hidden' }}
             animate={{
@@ -224,7 +224,7 @@ const AppHeader = ({
                   <button
                     className={`main-search-mode-btn ${searchRegex ? 'active' : ''}`}
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => setSearchRegex(!searchRegex)}
+                    onClick={() => { const next = !searchRegex; try { window.localStorage.setItem('tiez_main_search_regex', String(next)); } catch {} setSearchRegex(next); }}
                   >{searchRegex ? '正则' : '普通'}</button>
                   <input
                     ref={searchInputRef}

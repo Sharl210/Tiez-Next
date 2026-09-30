@@ -493,7 +493,9 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
     const [entrySearch, setEntrySearch] = useState('');
     const [entrySearchLoading, setEntrySearchLoading] = useState(false);
     const [entrySearchItems, setEntrySearchItems] = useState<ClipboardEntry[]>([]);
-    const [entrySearchPattern, setEntrySearchPattern] = useState(false);
+    const [entrySearchPattern, setEntrySearchPattern] = useState(() => {
+        try { return window.localStorage.getItem('tiez_tag_search_regex') === 'true'; } catch { return false; }
+    });
     const entrySearchInputRef = useRef<HTMLInputElement | null>(null);
     const pendingSearchTargetRef = useRef<number | null>(null);
 
@@ -1954,7 +1956,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                             <button className="action-btn" onClick={() => setEntrySearchOpen(false)} aria-label="关闭搜索"><X size={16} /></button>
                         </div>
                         <div className="entry-search-input-row">
-                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => !value)}>{entrySearchPattern ? '正则' : '普通'}</button>
+                            <button className={`entry-search-mode ${entrySearchPattern ? 'active' : ''}`} onClick={() => setEntrySearchPattern((value) => { const next = !value; try { window.localStorage.setItem('tiez_tag_search_regex', String(next)); } catch {} return next; })}>{entrySearchPattern ? '正则' : '普通'}</button>
                             <input ref={entrySearchInputRef} value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} placeholder={t('tag_search_placeholder')} />
                         </div>
                         <div className="entry-search-results">

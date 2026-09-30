@@ -4,12 +4,14 @@ import type { ClipboardEntry } from "../types";
 interface UseFilteredHistoryOptions {
   history: ClipboardEntry[];
   search: string;
+  searchRegex: boolean;
   typeFilter: string | null;
 }
 
 export const useFilteredHistory = ({
   history,
   search,
+  searchRegex,
   typeFilter
 }: UseFilteredHistoryOptions) => {
   return useMemo(() => {
@@ -27,6 +29,8 @@ export const useFilteredHistory = ({
       }
 
       if (!effectiveSearch) return true;
+      // Backend already applied regex matching; do not filter regex results literally.
+      if (searchRegex) return true;
 
       if (isTagSearch) {
         return item.tags?.some((tag) => tag.toLowerCase().includes(effectiveSearch)) ?? false;
@@ -51,5 +55,5 @@ export const useFilteredHistory = ({
       }
       return b.timestamp - a.timestamp;
     });
-  }, [history, search, typeFilter]);
+  }, [history, search, searchRegex, typeFilter]);
 };

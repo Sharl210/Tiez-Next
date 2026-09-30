@@ -2643,7 +2643,7 @@ const ClipboardItem = ({
                                 </span>
                             </div>
                         )
-                        : highlightSearchText(item.preview || item.content, searchQuery, searchRegex)
+                        : highlightSearchText(item.content_type === 'text' ? item.content : (item.preview || item.content), searchQuery, searchRegex)
                 )}
                 {overlayTagsInPreview && renderTagsContainer(true)}
                 </div>

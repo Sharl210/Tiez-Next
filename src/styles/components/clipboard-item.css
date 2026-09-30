@@ -1,3 +1,5 @@
+.content-preview { white-space: pre-wrap; }
+
 .history-item.pinned {
   background: color-mix(in srgb, var(--accent-color) 22%, var(--bg-content) 78%);
   border-color: var(--accent-color);

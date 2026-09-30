@@ -987,6 +987,7 @@ const App = () => {
   const filteredHistory = useFilteredHistory({
     history,
     search,
+    searchRegex,
     typeFilter
   });
 
