@@ -5,7 +5,7 @@ import { listen, emit } from '@tauri-apps/api/event';
 import {
     Edit2, Trash2, X, ChevronRight, LayoutGrid, List,
     Clock, MousePointer2, ChevronLeft, Plus, Search, ExternalLink, CheckSquare, Copy,
-    Sparkles
+    Sparkles, FileText
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
 import type { ClipboardEntry } from "../../../shared/types";
@@ -497,6 +497,8 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         try { return window.localStorage.getItem('tiez_tag_search_regex') === 'true'; } catch { return false; }
     });
     const entrySearchInputRef = useRef<HTMLInputElement | null>(null);
+    /** 进入标签管理页时默认接收键盘焦点，用户可以直接打字搜索标签组。 */
+    const tagSearchInputRef = useRef<HTMLInputElement | null>(null);
     const pendingSearchTargetRef = useRef<number | null>(null);
 
     const [tagItems, setTagItems] = useState<ClipboardEntry[]>([]);
@@ -997,6 +999,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
         const id = window.setTimeout(() => entrySearchInputRef.current?.focus(), 0);
         return () => window.clearTimeout(id);
     }, [entrySearchOpen]);
+    /**
+     * 进入标签管理页时把键盘焦点放到标签组搜索框，用户不用先点一下就能直接打字。
+     * 侧边栏折叠时输入框不存在，此时不抢焦点。
+     */
+    useEffect(() => {
+        if (isCollapsed) return;
+        const id = window.setTimeout(() => tagSearchInputRef.current?.focus(), 0);
+        return () => window.clearTimeout(id);
+        // 只在进入页面（挂载）时执行一次；折叠状态变化不应反复抢焦点。
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     useEffect(() => {
         const query = entrySearch.trim().toLowerCase();
@@ -1135,6 +1148,46 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      * 所以写入由 `resolveEditSavePlan` 按模式门控：`body` 模式最多写正文，
      * `note` 模式最多写备注。脏检查只在其上叠加，用来省掉没有意义的写命令。
      */
+    /**
+     * 富文本条目「转换为纯文本」。
+     *
+     * 与主页面的同名按钮走**同一条后端路径**：`update_item_content` 带上
+     * `htmlContent: ""`。仓储层把 `Some("")` 定义为"显式清空 HTML 并降级为 text"，
+     * 所以两处结果一致，不会出现"主页面能转、标签管理页转不了"的分叉。
+     */
+    const handleConvertRichToPlain = async () => {
+        if (!editingItem) return;
+        const plain = richBodyEditorRef.current?.innerText ?? htmlToPlainText(editingItem.html ?? '');
+        if (!plain.trim()) return;
+        try {
+            await invoke('update_item_content', {
+                id: editingItem.id,
+                newContent: plain,
+                htmlContent: '',
+            });
+            setEditingItem(null);
+            if (selectedTag) await loadTagItems(selectedTag);
+        } catch (err) { console.error(err); }
+    };
+
+    /**
+     * 卡片上的「转为纯文本」快捷键入口。
+     *
+     * 与弹窗内按钮、主页面按钮三者共用同一后端语义（`htmlContent: ""`），
+     * 所以不需要用户先进编辑弹窗再转换。仅对富文本条目显示。
+     */
+    const convertItemRichToPlain = async (item: ClipboardEntry) => {
+        try {
+            await invoke('update_item_content', {
+                id: item.id,
+                newContent: item.content,
+                htmlContent: '',
+            });
+            if (selectedTag) await loadTagItems(selectedTag);
+            emit('clipboard-changed');
+        } catch (err) { console.error(err); }
+    };
+
     const handleSaveItem = async () => {
         if (!editingItem) return;
         const plan = resolveEditSavePlan(editingItem);
@@ -1338,6 +1391,7 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                     <div className="tag-search-box">
                         <Search size={16} className="search-icon-placeholder" />
                         <input
+                            ref={tagSearchInputRef}
                             placeholder={t('find_or_create')}
                             value={tagSearch}
                             onMouseDown={() => invoke('activate_window_focus').catch(console.error)}
@@ -1643,6 +1697,19 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                                             <Edit2 size={10} />
                                                         </button>
                                                     )}
+                                                    {editActions.canEditBody && item.content_type === 'rich_text' && (
+                                                        <button
+                                                            className="card-action-btn"
+                                                            data-testid="card-to-plain-text"
+                                                            title={t('convert_rich_to_plain_hint')}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                void convertItemRichToPlain(item);
+                                                            }}
+                                                        >
+                                                            <FileText size={10} />
+                                                        </button>
+                                                    )}
                                                     {editActions.canEditNote && (
                                                         <button
                                                             className="card-action-btn"
@@ -1939,6 +2006,17 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                         )}
 
                         <div className="confirm-dialog-buttons">
+                            {/* 富文本条目才需要这个入口；纯文本条目本来就没有格式可移除。
+                                复用主页面同一个后端语义（htmlContent: ""），保证两处行为一致。 */}
+                            {editingItem.mode === 'body' && editingItem.contentType === 'rich_text' && (
+                                <button
+                                    className="confirm-dialog-button rich-to-plain-button"
+                                    onClick={handleConvertRichToPlain}
+                                    title={t('convert_rich_to_plain_hint')}
+                                >
+                                    <span>{t('convert_rich_to_plain')}</span>
+                                </button>
+                            )}
                             <button className="confirm-dialog-button" onClick={() => setEditingItem(null)}>
                                 {t('cancel')}
                             </button>
