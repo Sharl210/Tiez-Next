@@ -1,5 +1,4 @@
 use crate::database::save_image_to_file;
-use crate::domain::models::ClipboardEntry;
 use base64::{engine::general_purpose, Engine as _};
 use regex::Regex;
 use reqwest::header::CONTENT_TYPE;
@@ -10,11 +9,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use urlencoding::decode;
 
-const HTML_PREVIEW_MAX_CHARS: usize = 5000;
-const HTML_PREVIEW_MAX_ROWS: usize = 10;
-const HTML_TRUNCATION_SUFFIX: &str = "... [HTML Truncated]";
-const TEXT_PREVIEW_MAX_CHARS: usize = 500;
-const TEXT_PREVIEW_TRUNCATED_CHARS: usize = TEXT_PREVIEW_MAX_CHARS - 3;
 const RICH_TEXT_PREVIEW_FALLBACK: &str = "[Rich Text Content]";
 pub const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--TIEZ_RICH_IMAGE:";
 pub const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
@@ -1105,15 +1099,7 @@ pub fn build_entry_preview(
         collapse_preview_whitespace(&normalize_clipboard_plain_text(content))
     };
 
-    if preview_text.chars().count() > TEXT_PREVIEW_MAX_CHARS {
-        let preview_text: String = preview_text
-            .chars()
-            .take(TEXT_PREVIEW_TRUNCATED_CHARS)
-            .collect();
-        format!("{}...", preview_text)
-    } else {
-        preview_text
-    }
+    preview_text
 }
 
 pub fn attach_rich_image_fallback(html: &str, payload: &str) -> String {
@@ -1251,131 +1237,6 @@ pub fn externalize_rich_image_fallback(html: &str, data_dir: &Path) -> String {
     html.to_string()
 }
 
-pub fn truncate_entry_for_ui(mut entry: ClipboardEntry) -> ClipboardEntry {
-    if (entry.content_type == "text"
-        || entry.content_type == "code"
-        || entry.content_type == "url"
-        || entry.content_type == "rich_text")
-        && entry.content.chars().count() > 2000
-    {
-        entry.content = format!(
-            "{}... [Truncated for speed]",
-            entry.content.chars().take(2000).collect::<String>()
-        );
-    }
-
-    // Also truncate HTML content up to a certain point for UI preview
-    if let Some(ref html) = entry.html_content {
-        if html.chars().count() > HTML_PREVIEW_MAX_CHARS {
-            entry.html_content = truncate_html_for_preview(html);
-        }
-    }
-
-    entry
-}
-
-pub fn truncate_html_for_preview(html: &str) -> Option<String> {
-    let repaired = repair_html_fragment(html);
-    if repaired.trim().is_empty() {
-        return None;
-    }
-
-    let (without_named_formats, named_formats) = split_rich_html_and_named_formats(&repaired);
-    let (clean_html, image_fallback) = split_rich_html_and_image_fallback(&without_named_formats);
-    let renderable_html = strip_office_preview_noise(&clean_html);
-    let cleaned_repaired = repair_html_fragment(if renderable_html.trim().is_empty() {
-        &clean_html
-    } else {
-        &renderable_html
-    });
-    let reattach_preview_metadata = |html: String| {
-        let with_image = if let Some(payload) = image_fallback.as_deref() {
-            attach_rich_image_fallback(&html, payload)
-        } else {
-            html
-        };
-        if named_formats.is_empty() {
-            with_image
-        } else {
-            attach_rich_named_formats(&with_image, &named_formats)
-        }
-    };
-
-    if cleaned_repaired.chars().count() <= HTML_PREVIEW_MAX_CHARS {
-        return Some(reattach_preview_metadata(cleaned_repaired));
-    }
-
-    let trimmed = cleaned_repaired.trim();
-    let lower = trimmed.to_ascii_lowercase();
-
-    // Strategy 1: Table-based HTML — truncate by rows
-    let table_pos = lower.find("<table");
-    let tr_pos = lower.find("<tr");
-    let start_pos = match (table_pos, tr_pos) {
-        (Some(t), Some(r)) => Some(std::cmp::min(t, r)),
-        (Some(t), None) => Some(t),
-        (None, Some(r)) => Some(r),
-        (None, None) => None,
-    };
-
-    if let Some(start) = start_pos {
-        let slice = &trimmed[start..];
-        let lower_slice = &lower[start..];
-        let mut end_rel = 0usize;
-        let mut rows = 0usize;
-        let mut search_idx = 0usize;
-
-        while rows < HTML_PREVIEW_MAX_ROWS {
-            if let Some(pos) = lower_slice[search_idx..].find("</tr") {
-                let close_start = search_idx + pos;
-                let close_end = lower_slice[close_start..]
-                    .find('>')
-                    .map(|p| close_start + p + 1)
-                    .unwrap_or(close_start + 4);
-                end_rel = close_end;
-                rows += 1;
-                search_idx = close_end;
-            } else {
-                break;
-            }
-        }
-
-        if end_rel == 0 {
-            return Some(reattach_preview_metadata(slice.to_string()));
-        }
-
-        let mut out = slice[..end_rel].to_string();
-        if lower_slice.starts_with("<tr") {
-            out = format!(
-                "<table style=\"border-collapse: collapse; min-width: 100%;\">{}</table>",
-                out
-            );
-        } else if lower_slice.starts_with("<table") {
-            if !out.to_ascii_lowercase().contains("</table") {
-                out.push_str("</table>");
-            }
-        }
-
-        return Some(reattach_preview_metadata(out));
-    }
-
-    // Strategy 2: Generic HTML — truncate at a safe tag boundary
-    // Find the last '>' before the char limit to avoid cutting inside a tag.
-    let limit = HTML_PREVIEW_MAX_CHARS;
-    let byte_limit = trimmed
-        .char_indices()
-        .nth(limit)
-        .map(|(idx, _)| idx)
-        .unwrap_or(trimmed.len());
-    let safe_end = trimmed[..byte_limit]
-        .rfind('>')
-        .map(|p| p + 1)
-        .unwrap_or(byte_limit);
-    let mut truncated = trimmed[..safe_end].to_string();
-    truncated.push_str(HTML_TRUNCATION_SUFFIX);
-    Some(reattach_preview_metadata(truncated))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1387,7 +1248,7 @@ mod tests {
         infer_rich_html_from_plain_text, looks_like_bare_url_text, normalize_clipboard_plain_text,
         parse_app_cleanup_policies, parse_cf_html, parse_cleanup_rules,
         split_rich_html_and_image_fallback, split_rich_html_and_named_formats,
-        truncate_html_for_preview, AppCleanupPolicy, HTML_TRUNCATION_SUFFIX,
+        AppCleanupPolicy,
     };
     use base64::Engine;
     use std::fs;
@@ -1625,66 +1486,6 @@ mod tests {
         );
 
         assert!(html.is_none());
-    }
-
-    #[test]
-    fn table_html_preview_keeps_valid_table_markup() {
-        let row = "<tr><td>WPS</td><td>Preview</td><td>Cell</td></tr>";
-        let html = format!(
-            "<table border=0 cellpadding=0 cellspacing=0 style='border-collapse:collapse'>{}</table>",
-            row.repeat(120)
-        );
-
-        let truncated = truncate_html_for_preview(&html).expect("table preview should exist");
-
-        assert!(truncated.starts_with("<table"));
-        assert!(truncated.contains("WPS"));
-        assert!(truncated.ends_with("</table>"));
-    }
-
-    #[test]
-    fn mixed_html_preview_keeps_text_context_instead_of_images_only() {
-        let html = format!(
-            "<div class='card'><img src='https://example.com/card.jpg' alt='cover' /><h2>巴林牵头 阿拉伯国家在理会试图推动武力破局</h2><p>{}</p></div>",
-            "后续描述".repeat(2000)
-        );
-
-        let truncated = truncate_html_for_preview(&html).expect("mixed html preview should exist");
-
-        assert!(truncated.contains("<img"));
-        assert!(truncated.contains("巴林牵头"));
-        assert!(!truncated.starts_with("<div style=\"display:flex;flex-wrap:wrap;gap:4px;\">"));
-    }
-
-    #[test]
-    fn truncated_html_preview_keeps_rich_image_fallback_marker() {
-        let base_html = format!("<div><p>GIF 标题</p><p>{}</p></div>", "内容".repeat(3000));
-        let html = attach_rich_image_fallback(
-            &base_html,
-            "data:image/gif;base64,R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==",
-        );
-
-        let truncated = truncate_html_for_preview(&html).expect("html preview should exist");
-        let (cleaned, fallback) = split_rich_html_and_image_fallback(&truncated);
-
-        assert!(cleaned.contains("GIF 标题"));
-        assert_eq!(
-            fallback.as_deref(),
-            Some("data:image/gif;base64,R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
-        );
-    }
-
-    #[test]
-    fn html_preview_prefers_renderable_body_over_leading_head_noise() {
-        let html = format!(
-            "<html><head><style>{}</style></head><body><div><p>真正可见的网页内容</p></div></body></html>",
-            "x".repeat(7000)
-        );
-
-        let truncated = truncate_html_for_preview(&html).expect("html preview should exist");
-
-        assert!(truncated.contains("真正可见的网页内容"));
-        assert_ne!(truncated.trim(), HTML_TRUNCATION_SUFFIX);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::infrastructure::repository::tag_repo::TagRepository;
 use crate::services::clipboard::{
-    build_entry_preview, derive_rich_text_content, truncate_html_for_preview,
+    build_entry_preview, derive_rich_text_content,
 };
 use crate::services::clipboard_mutation::{self, TagTransfer};
 use crate::services::encryption_queue::EncryptionJob;
@@ -66,40 +66,8 @@ pub fn get_clipboard_history(
         history.truncate(limit as usize);
     }
 
-    // 5. Truncate content for UI performance
-    for item in &mut history {
-        normalize_rich_text_item_content(item);
-
-        if (item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text")
-            && item.content.chars().count() > 2000
-        {
-            item.content = format!(
-                "{}... [Truncated for speed]",
-                item.content.chars().take(2000).collect::<String>()
-            );
-        }
-
-        if let Some(ref html) = item.html_content {
-            if html.chars().count() > 5000 {
-                item.html_content = truncate_html_for_preview(html);
-            }
-        }
-
-        if item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text"
-        {
-            item.preview = build_entry_preview(
-                &item.content_type,
-                &item.content,
-                item.html_content.as_deref(),
-            );
-        }
-    }
+    // 5. Normalize and rebuild derived previews.
+    finalize_history_for_ui(&mut history);
 
     Ok(history)
 }
@@ -160,26 +128,34 @@ pub fn search_clipboard_history(
         history.truncate(limit as usize);
     }
 
-    for item in &mut history {
+    finalize_history_for_ui(&mut history);
+
+    Ok(history)
+}
+
+/// Prepare a page of entries for transport to the UI.
+///
+/// # Why this is one shared function
+///
+/// Two things must stay true for every entry the UI receives, and both used to be
+/// written out twice (once per history command):
+///
+/// 1. Rich-text rows get normalized so `content` and `html_content` agree.
+/// 2. `preview` is rebuilt from the authoritative body.
+///
+/// # What must NOT happen here
+///
+/// **No shortening.** Earlier versions cut `content` at 2000 chars and
+/// `html_content` at 5000 chars "for speed" and appended markers such as
+/// `... [Truncated for speed]` / `... [HTML Truncated]`. That was not just a display
+/// choice: the body editors are seeded from this very payload, so saving an entry
+/// wrote the shortened text back over the full original — silent, permanent data
+/// loss. The list already bounds height in CSS, which costs nothing in fidelity.
+///
+/// The regression test below pins this: a long body must come back byte-identical.
+fn finalize_history_for_ui(history: &mut [ClipboardEntry]) {
+    for item in history.iter_mut() {
         normalize_rich_text_item_content(item);
-
-        if (item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text")
-            && item.content.chars().count() > 2000
-        {
-            item.content = format!(
-                "{}... [Truncated for speed]",
-                item.content.chars().take(2000).collect::<String>()
-            );
-        }
-
-        if let Some(ref html) = item.html_content {
-            if html.chars().count() > 5000 {
-                item.html_content = truncate_html_for_preview(html);
-            }
-        }
 
         if item.content_type == "text"
             || item.content_type == "code"
@@ -193,8 +169,82 @@ pub fn search_clipboard_history(
             );
         }
     }
+}
 
-    Ok(history)
+#[cfg(test)]
+mod body_fidelity_tests {
+    use super::finalize_history_for_ui;
+    use crate::domain::models::ClipboardEntry;
+
+    fn entry(content_type: &str, content: String, html: Option<String>) -> ClipboardEntry {
+        ClipboardEntry {
+            id: 1,
+            content_type: content_type.to_string(),
+            content,
+            html_content: html,
+            source_app: "test".to_string(),
+            source_app_path: None,
+            timestamp: 1,
+            preview: String::new(),
+            is_pinned: false,
+            tags: Vec::new(),
+            use_count: 0,
+            is_external: false,
+            pinned_order: 0,
+            note: String::new(),
+            file_preview_exists: true,
+        }
+    }
+
+    /// The exact bug the user reported: a long body came back carrying a truncation
+    /// marker, and saving the entry then persisted that shortened text.
+    #[test]
+    fn long_plain_body_is_returned_verbatim() {
+        let body = "CUSTOMER_LABEL = MOLY.NR17.R2
+".repeat(400); // > 2000 chars
+        let mut history = vec![entry("text", body.clone(), None)];
+
+        finalize_history_for_ui(&mut history);
+
+        assert_eq!(history[0].content, body);
+        assert!(!history[0].content.contains("Truncated"));
+        assert!(history[0].preview.chars().count() <= body.chars().count());
+    }
+
+    #[test]
+    fn long_rich_html_is_returned_verbatim() {
+        let plain = "配置项".repeat(600);
+        let html = format!("<p>{}</p><p>{}</p>", "配置项".repeat(300), "第二段".repeat(300)); // > 5000 chars
+        let mut history = vec![entry("rich_text", plain.clone(), Some(html.clone()))];
+
+        finalize_history_for_ui(&mut history);
+
+        assert_eq!(history[0].html_content.as_deref(), Some(html.as_str()));
+        assert!(!history[0].html_content.as_deref().unwrap().contains("Truncated"));
+    }
+
+    /// Code/url rows go through the same path; they were truncated identically.
+    #[test]
+    fn long_code_body_is_returned_verbatim() {
+        let body = "let x = 1;
+".repeat(400);
+        let mut history = vec![entry("code", body.clone(), None)];
+
+        finalize_history_for_ui(&mut history);
+
+        assert_eq!(history[0].content, body);
+    }
+
+    /// Binary-ish rows keep their payload untouched (no preview rebuild, no cuts).
+    #[test]
+    fn image_row_payload_untouched() {
+        let payload = "C:/tmp/very-long-name.png".to_string();
+        let mut history = vec![entry("image", payload.clone(), None)];
+
+        finalize_history_for_ui(&mut history);
+
+        assert_eq!(history[0].content, payload);
+    }
 }
 
 #[tauri::command]
@@ -244,22 +294,8 @@ pub fn get_tag_items(state: State<'_, DbState>, tag: String) -> AppResult<Vec<Cl
         .get_entries_by_tag(&tag)
         .map_err(AppError::from)?;
 
-    for item in &mut history {
-        normalize_rich_text_item_content(item);
-
-        // 标签管理需要完整正文；不要在命令层改写或追加截断标记。
-        if item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text"
-        {
-            item.preview = build_entry_preview(
-                &item.content_type,
-                &item.content,
-                item.html_content.as_deref(),
-            );
-        }
-    }
+    // 标签管理需要完整正文；不要在命令层改写或追加截断标记。
+    finalize_history_for_ui(&mut history);
 
     Ok(history)
 }

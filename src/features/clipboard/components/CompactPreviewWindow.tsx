@@ -559,7 +559,7 @@ const CompactPreviewWindow = () => {
                 <HtmlContent
                     className="rich-text-preview"
                     htmlContent={cleanHtml || payload.htmlContent}
-                    fallbackText={payload.preview || payload.content}
+                    fallbackText={payload.content || payload.preview}
                     preview={false}
                     style={{
                         // Keep a single scrollbar on .popover-content to avoid nested scrollbars.

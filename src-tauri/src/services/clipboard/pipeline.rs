@@ -595,7 +595,7 @@ impl PipelineStage for DistributionStage {
         // Notify
         let _ = ctx
             .app_handle
-            .emit("clipboard-updated", truncate_entry_for_ui(entry.clone()));
+            .emit("clipboard-updated", entry.clone());
 
         if settings.persistent.load(Ordering::Relaxed) && entry.id > 0 {
             crate::services::cloud_sync::request_cloud_sync(ctx.app_handle.clone());

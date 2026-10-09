@@ -59,7 +59,9 @@ const resolveImgSource = (el: Element): string | null => {
  * 导出它是为了让正文编辑器复用**同一条渲染管线**：编辑器里看到的内容必须与条目
  * 在列表里显示的内容一致，否则用户会以为自己打开的是另一份文档。
  */
-export const sanitizeHTML = (html: string, preview?: boolean) => {
+// `preview` is kept in the signature for callers, but it no longer changes the output:
+// content is never shortened for preview any more. Height/overflow are handled in CSS.
+export const sanitizeHTML = (html: string, _preview?: boolean) => {
   const parser = new DOMParser();
 
   const stripLeadingPreviewNoise = (container: HTMLElement) => {
@@ -113,28 +115,11 @@ export const sanitizeHTML = (html: string, preview?: boolean) => {
   });
   doc.querySelectorAll("meta, link, xml").forEach((el) => el.remove());
 
-  // Truncate tables for preview to save performance
-  if (preview) {
-    doc.querySelectorAll("table").forEach(table => {
-      const rows = table.querySelectorAll("tr");
-      if (rows.length > 5) {
-        // Keep first 3 rows
-        for (let i = 4; i < rows.length; i++) {
-          rows[i].remove();
-        }
-        // Add a "..." indicator
-        const moreRow = doc.createElement("tr");
-        const moreCell = doc.createElement("td");
-        moreCell.colSpan = 10;
-        moreCell.style.textAlign = "center";
-        moreCell.style.fontSize = "10px";
-        moreCell.style.opacity = "0.5";
-        moreCell.innerText = "... content truncated for preview ...";
-        moreRow.appendChild(moreCell);
-        table.appendChild(moreRow);
-      }
-    });
-  }
+  // Tables render in full, including in list previews. Rows beyond the third used to be
+  // dropped and replaced with a "... content truncated for preview ..." marker. That hid
+  // real content, and since the body editors are seeded from this same payload a save
+  // could write the shortened HTML back over the original. The list still bounds height
+  // visually via the container's max-height/mask, so this is presentation, not truncation.
 
   // Move styles from head to body to ensure they are included in the final innerHTML
   doc.head.querySelectorAll("style").forEach(style => {
@@ -185,11 +170,16 @@ export const sanitizeHTML = (html: string, preview?: boolean) => {
   bodyClone.querySelectorAll("style, script, meta, link, xml").forEach(el => el.remove());
   
   const textContent = (bodyClone.textContent || "").trim();
-  const TRUNCATION_MARKER = "... [HTML Truncated]";
-  
-  // If the ONLY content is the truncation marker, treat it as not renderable
-  // so we fallback to the clean plain text preview.
-  const hasRenderableText = textContent.length > 0 && textContent !== TRUNCATION_MARKER;
+  // Legacy-data guard, NOT a truncation of its own.
+  //
+  // When HTML is exactly a bare truncation marker it means the row itself has no
+  // renderable markup, so we render the plain-text fallback instead of a lone
+  // "... [HTML Truncated]" string. Removing content is no longer possible anywhere
+  // in the write or read path, so this now only matters for rows that an older
+  // build already saved in that state.
+  const LEGACY_TRUNCATION_MARKER = "... [HTML Truncated]";
+
+  const hasRenderableText = textContent.length > 0 && textContent !== LEGACY_TRUNCATION_MARKER;
   const hasRenderableElement = !!bodyClone.querySelector("p, div, span, img, table, ul, ol, li, h1, h2, h3, h4, h5, h6, blockquote, pre");
 
   return { html: doc.body.innerHTML, hasRenderable: hasRenderableText || hasRenderableElement };

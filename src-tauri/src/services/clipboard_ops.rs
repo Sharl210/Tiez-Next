@@ -1,6 +1,5 @@
 // Clipboard operations module
-use crate::app_state::{AppDataDir, PasteQueue, SessionHistory, SettingsState};
-use crate::domain::models::ClipboardEntry;
+use crate::app_state::{PasteQueue, SessionHistory, SettingsState};
 use crate::database::{calc_image_hash_from_rgba, DbState};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
@@ -1360,10 +1359,9 @@ fn handle_post_paste_actions(
         // Re-reading the row after the touch yields the refreshed timestamp, and the
         // payload shape matches the capture pipeline's event (one ClipboardEntry).
         if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
-            let _ = app_handle.emit(
-                "clipboard-updated",
-                crate::services::clipboard::truncate_entry_for_ui(entry),
-            );
+            // Payload is the full row: the UI seeds editors from it, so trimming
+            // here would let a save write the trimmed text back over the original.
+            let _ = app_handle.emit("clipboard-updated", entry);
         }
     }
 

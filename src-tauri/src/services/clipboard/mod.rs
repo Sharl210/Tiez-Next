@@ -1144,7 +1144,7 @@ pub use utils::{
     build_entry_preview, derive_rich_text_content, extract_animated_image_data_url_from_html,
     extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
     parse_cf_html, repair_html_fragment, split_rich_html_and_image_fallback,
-    split_rich_html_and_named_formats, truncate_entry_for_ui, truncate_html_for_preview,
+    split_rich_html_and_named_formats,
 };
 
 pub fn process_new_entry(

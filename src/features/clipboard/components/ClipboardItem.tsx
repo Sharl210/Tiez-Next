@@ -2608,7 +2608,7 @@ const ClipboardItem = ({
                         <HtmlContent
                             className="rich-text-preview"
                             htmlContent={richTextCleanHtml || item.html_content}
-                            fallbackText={item.preview}
+                            fallbackText={item.content || item.preview}
                             preview={true}
                             style={{
                                 maxHeight: `${richTextSnapshotDisplayMaxHeight}px`,
@@ -2643,7 +2643,7 @@ const ClipboardItem = ({
                                 </span>
                             </div>
                         )
-                        : highlightSearchText(item.content_type === 'text' ? item.content : (item.preview || item.content), searchQuery, searchRegex)
+                        : highlightSearchText(item.content || item.preview, searchQuery, searchRegex)
                 )}
                 {overlayTagsInPreview && renderTagsContainer(true)}
                 </div>
