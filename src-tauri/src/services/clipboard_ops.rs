@@ -225,9 +225,14 @@ pub async fn copy_to_clipboard(
         }
     }
 
-    if current_type == "rich_text" {
-        let normalized =
-            crate::services::clipboard::derive_rich_text_content(&content, html_content.as_deref());
+    // 统一派生：既处理 `rich_text`，也修复"转换为纯文本后降级成 `text`、但早先
+    // 把链接标签存了进来"的存量行 —— 否则粘贴出去的还是标签。
+    {
+        let normalized = crate::services::clipboard::plain_text_of(
+            &content,
+            &current_type,
+            html_content.as_deref(),
+        );
         if !normalized.trim().is_empty() {
             content = normalized;
         }
@@ -318,9 +323,14 @@ pub async fn paste_content_transiently(
         }
     }
 
-    if current_type == "rich_text" {
-        let normalized =
-            crate::services::clipboard::derive_rich_text_content(&content, html_content.as_deref());
+    // 统一派生：既处理 `rich_text`，也修复"转换为纯文本后降级成 `text`、但早先
+    // 把链接标签存了进来"的存量行 —— 否则粘贴出去的还是标签。
+    {
+        let normalized = crate::services::clipboard::plain_text_of(
+            &content,
+            &current_type,
+            html_content.as_deref(),
+        );
         if !normalized.trim().is_empty() {
             content = normalized;
         }
@@ -1363,7 +1373,9 @@ fn handle_post_paste_actions(
         if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
             // Payload is the full row: the UI seeds editors from it, so trimming
             // here would let a save write the trimmed text back over the original.
-            let _ = app_handle.emit("clipboard-updated", entry);
+            let mut emitted = entry;
+            crate::services::clipboard::normalize_content_for_ui(&mut emitted);
+            let _ = app_handle.emit("clipboard-updated", emitted);
         }
     }
 

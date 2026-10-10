@@ -44,7 +44,9 @@ const T = (key: string) => key;
 
 const TAG = "工作";
 /** 富文本条目的纯文本正文与 HTML 是两个不同的东西，正好用来分辨写入了哪一个。 */
-const RICH_PLAIN = "第一行\n第二行";
+// 两个相邻 <p> 之间是**空行**：后端把块标签的开闭都换成换行，前端已与之对齐。
+// 这个常量原先写单个换行，那会让"点按钮转换"与"直接纯文本粘贴"的行结构不一致。
+const RICH_PLAIN = "第一行\n\n第二行";
 const RICH_HTML = "<p>第一行</p><p>第二行</p>";
 
 const entry = (

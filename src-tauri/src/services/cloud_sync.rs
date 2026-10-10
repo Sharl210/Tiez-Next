@@ -1087,6 +1087,13 @@ fn normalize_item_for_sync(mut item: CloudSyncItem) -> Option<CloudSyncItem> {
         if let Some(html) = item.html_content.as_ref() {
             item.html_content = Some(rewrite_rich_html_resources_for_sync(html));
         }
+        // 纯文本正文按当前口径重新派生：否则本机早先存的链接标签会被原样搬到
+        // 其他设备，那边的用户看到的也是标签。
+        item.content = crate::services::clipboard::plain_text_of(
+            &item.content,
+            &item.content_type,
+            item.html_content.as_deref(),
+        );
     }
 
     Some(item)
@@ -1805,10 +1812,19 @@ fn apply_remote_changes(
             item.preview.clone()
         };
 
+        // 远端送来的 `content` 按当前口径重新派生：对方可能还是旧版本（正文里存的是
+        // 链接标签），直接落库会把标签搬到本机，之后本地读取也只会看到标签。
+        // HTML 在就一定能重算出网址，所以这里以本机规则为准，不信任远端那个字段。
+        let received_content = crate::services::clipboard::plain_text_of(
+            &item.content,
+            &item.content_type,
+            item.html_content.as_deref(),
+        );
+
         let entry = ClipboardEntry {
             id: 0,
             content_type: item.content_type.clone(),
-            content: item.content.clone(),
+            content: received_content,
             html_content: item.html_content.clone(),
             source_app: item.source_app.clone(),
             source_app_path: None,

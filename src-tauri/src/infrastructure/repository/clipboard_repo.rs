@@ -1192,6 +1192,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                  FROM clipboard_history ch
                  LEFT JOIN entry_tags et ON ch.id = et.entry_id
                  WHERE ch.content LIKE '%' || ?1 || '%'
+                    OR ch.html_content LIKE '%' || ?1 || '%'
                     OR ch.source_app LIKE '%' || ?1 || '%'
                     OR et.tag LIKE '%' || ?1 || '%'
                  ORDER BY ch.timestamp DESC
@@ -1659,5 +1660,105 @@ mod history_order_tests {
         let repo = repo();
 
         assert!(repo.get_most_recent_entry(None).expect("查询应成功").is_none());
+    }
+}
+
+#[cfg(test)]
+mod plain_conversion_tests {
+    use super::*;
+    use crate::services::mcp::store::MCP_SCHEMA;
+    use rusqlite::{params, Connection};
+    use std::sync::{Arc, Mutex};
+
+    const URL: &str = "http://192.168.23.98:8888/c/T750/+/176116";
+
+    fn repo() -> SqliteClipboardRepository {
+        let conn = Connection::open_in_memory().expect("内存库应可创建");
+        conn.execute_batch(MCP_SCHEMA).expect("schema 应可建表");
+        SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)))
+    }
+
+    /// 落一条富文本：屏幕上显示的是标签，地址在 href 里。
+    fn insert_rich(repo: &SqliteClipboardRepository) {
+        let html = format!("<p><a href=\"{URL}\">T750 变更单</a></p>");
+        let conn = repo.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO clipboard_history
+             (id, content_type, content, html_content, source_app, timestamp, preview)
+             VALUES (1, 'rich_text', 'T750 变更单', ?1, 'test', 100, 'T750 变更单')",
+            params![html],
+        )
+        .expect("插入应成功");
+    }
+
+    fn read_row(repo: &SqliteClipboardRepository) -> (String, String, Option<String>) {
+        let conn = repo.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT content, content_type, html_content FROM clipboard_history WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("读取应成功")
+    }
+
+    /// 「转换为纯文本」送的就是界面派生好的地址，落库后必须还是地址。
+    ///
+    /// 同时钉住一条**必须保留**的性质：转换时 `html_content` 留原样，不清空。
+    /// 有了它，早先按旧口径（只存下标签）转换过的行还能被恢复出网址；一旦这里
+    /// 改成清空，那些条目的地址就永久丢失了。
+    #[test]
+    fn converting_rich_to_plain_stores_the_url_and_keeps_the_html() {
+        let repo = repo();
+        insert_rich(&repo);
+
+        repo.update_entry_content(1, URL, "", Some(""))
+            .expect("更新应成功");
+
+        let (content, content_type, html) = read_row(&repo);
+        assert_eq!(content, URL, "转换后存的应当是网址本身");
+        assert_eq!(content_type, "text", "转换后降级为纯文本");
+        assert!(
+            html.as_deref().is_some_and(|h| h.contains(URL)),
+            "HTML 必须保留：清空它就等于把地址永久丢掉，存量行再也修不回来"
+        );
+    }
+
+    /// 存量行：转换时把标签存了进去，但 `html_content` 还在。
+    ///
+    /// 读取侧要能把它恢复成地址（用户不必再点一次按钮）。
+    #[test]
+    fn already_converted_row_still_exposes_the_url_on_read() {
+        let repo = repo();
+        insert_rich(&repo);
+        // 模拟旧行为留下的结果：类型已降级、正文是标签、HTML 原样保留。
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE clipboard_history SET content = 'T750 变更单', content_type = 'text' WHERE id = 1",
+                [],
+            )
+            .expect("模拟存量数据应成功");
+        }
+
+        let listed = repo.get_history(10, 0, None).expect("查询应成功");
+        let recovered =
+            crate::services::clipboard::plain_text_of_entry(&listed[0]);
+
+        assert_eq!(recovered, URL, "存量行读取时应当恢复出网址");
+    }
+
+    /// 写入真正富文本时，正文按同一口径派生（不是把 HTML 源码存进正文）。
+    #[test]
+    fn saving_rich_content_derives_the_url_into_content() {
+        let repo = repo();
+        insert_rich(&repo);
+        let html = format!("<p><a href=\"{URL}\">T750 变更单</a></p>");
+
+        repo.update_entry_content(1, &html, "ignored preview", Some(&html))
+            .expect("更新应成功");
+
+        let (content, content_type, _) = read_row(&repo);
+        assert_eq!(content, URL, "正文应当是派生的纯文本");
+        assert_eq!(content_type, "rich_text", "带 HTML 的写入保持富文本");
     }
 }

@@ -482,11 +482,15 @@ pub async fn call_ai(
                     html_for_session,
                 );
                 // Emit update event from session item
-                let _ = app_handle.emit("clipboard-updated", item.clone());
+                let mut emitted = item.clone();
+                crate::services::clipboard::normalize_content_for_ui(&mut emitted);
+                let _ = app_handle.emit("clipboard-updated", emitted);
             } else if persistent {
                 // If persistent and not in session, fetch from DB to emit
                 if let Ok(Some(updated_entry)) = state.repo.get_entry_by_id(id) {
-                    let _ = app_handle.emit("clipboard-updated", updated_entry);
+                    let mut emitted = updated_entry;
+                    crate::services::clipboard::normalize_content_for_ui(&mut emitted);
+                    let _ = app_handle.emit("clipboard-updated", emitted);
                 }
             }
         }

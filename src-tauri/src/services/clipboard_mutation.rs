@@ -298,6 +298,27 @@ pub fn apply_entry_content(
     repo.update_entry_content(id, content, preview.as_str(), html_content)
 }
 
+/// 把富文本条目**转换为纯文本**：清掉 HTML 并降级为 `text`，正文用给定值。
+///
+/// # 为什么要有这个专门的函数
+///
+/// "转换为纯文本"是一个**语义明确的操作**，而 [`apply_entry_content`] 的 `html_content`
+/// 参数同时承担两种含义：传 `None` 表示"本次不带 HTML，保留原值"（供 AI 改写等场景用，
+/// 避免富文本坍缩），传 `Some("")` 才是"清空 HTML 并降级"。
+///
+/// 这个区别很容易踩错：MCP 的转换工具曾经传 `None`，于是条目**仍然是富文本类型**、
+/// 界面里照旧带下划线，只有返回值是纯文本 —— 与界面按钮（传 `Some("")`）结果不同，
+/// 同一个功能出现两种行为。把语义收进一个有名字的函数，调用点就不必再各自判断参数。
+///
+/// 注意 `content` 应当已经是派生好的纯文本（网址形态），调用方负责派生。
+pub fn convert_entry_to_plain_text(
+    repo: &impl ClipboardRepository,
+    id: i64,
+    content: &str,
+) -> Result<(), String> {
+    apply_entry_content(repo, id, content, Some(""))
+}
+
 /// 把一段**纯文本**转成可渲染的 HTML 片段。
 ///
 /// # 为什么需要它（R13）
@@ -602,6 +623,87 @@ mod r13_session_mirror_tests {
         assert_eq!(
             item.html_content, None,
             "纯文本行不能被写入 HTML（类型与载荷必须一致）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convert_to_plain_text_tests {
+    use super::convert_entry_to_plain_text;
+    use crate::domain::models::ClipboardEntry;
+    use crate::infrastructure::repository::clipboard_repo::{
+        ClipboardRepository, SqliteClipboardRepository,
+    };
+    use crate::services::mcp::store::MCP_SCHEMA;
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+
+    const URL: &str = "http://192.168.23.98:8888/c/T750/+/176116";
+
+    /// 内存库 + 一条富文本条目（屏幕上显示的是标签，地址在 href 里）。
+    fn seeded() -> (SqliteClipboardRepository, i64) {
+        let conn = Connection::open_in_memory().expect("内存库应可创建");
+        conn.execute_batch(MCP_SCHEMA).expect("schema 应可建表");
+        let repo = SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)));
+
+        let entry = ClipboardEntry {
+            id: 0,
+            content_type: "rich_text".to_string(),
+            content: "T750 变更单".to_string(),
+            html_content: Some(format!("<p><a href=\"{URL}\">T750 变更单</a></p>")),
+            source_app: "test".to_string(),
+            source_app_path: None,
+            timestamp: 100,
+            preview: "T750 变更单".to_string(),
+            is_pinned: false,
+            tags: vec![],
+            use_count: 0,
+            is_external: false,
+            pinned_order: 0,
+            note: String::new(),
+            file_preview_exists: true,
+        };
+        let id = repo.save(&entry, None).expect("落库应成功");
+        (repo, id)
+    }
+
+    fn read(repo: &SqliteClipboardRepository, id: i64) -> (String, String, Option<String>) {
+        repo.get_entry_content_with_html(id)
+            .expect("读取应成功")
+            .expect("条目应存在")
+    }
+
+    /// 「转换为纯文本」必须**真的**降级：类型变 `text`，界面不再按富文本渲染。
+    ///
+    /// 这条盯住的是一个真实踩过的坑：MCP 的转换工具曾经传 `None`（含义是"保留 HTML"），
+    /// 于是条目仍是 `rich_text`、界面里照旧带下划线，只有 AI 拿到的返回值是纯文本 ——
+    /// 同一个功能两种结果。**把本函数改回传 `None`，这条测试立刻变红。**
+    #[test]
+    fn conversion_actually_downgrades_to_plain_text() {
+        let (repo, id) = seeded();
+
+        convert_entry_to_plain_text(&repo, id, URL).expect("转换应成功");
+
+        let (content, content_type, _) = read(&repo, id);
+        assert_eq!(content, URL, "正文应当是网址本身");
+        assert_eq!(
+            content_type, "text",
+            "转换后必须是纯文本类型，否则界面照旧按富文本渲染"
+        );
+    }
+
+    /// 转换**保留** HTML 是有意的：地址存在里面，早先按旧口径转换过的行才能被恢复出来。
+    /// 若这里被改成清空，那些条目的网址就永久丢了。
+    #[test]
+    fn conversion_keeps_the_html_so_the_url_stays_recoverable() {
+        let (repo, id) = seeded();
+
+        convert_entry_to_plain_text(&repo, id, URL).expect("转换应成功");
+
+        let (_, _, html) = read(&repo, id);
+        assert!(
+            html.as_deref().is_some_and(|h| h.contains(URL)),
+            "HTML 必须留着，否则地址无法恢复"
         );
     }
 }

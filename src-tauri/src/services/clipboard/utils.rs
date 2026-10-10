@@ -381,6 +381,15 @@ fn save_image_bytes_to_attachments(
     }
 }
 
+/// 去掉全部空白（含换行）。用于"只差空白"的比对。
+fn strip_all_whitespace(text: &str) -> String {
+    static WS_RE: OnceLock<Regex> = OnceLock::new();
+    WS_RE
+        .get_or_init(|| Regex::new(r"\s+").unwrap())
+        .replace_all(text, "")
+        .to_string()
+}
+
 fn collapse_preview_whitespace(text: &str) -> String {
     static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -1056,46 +1065,129 @@ fn describes_href_backed_link(plain_text: &str, html: &str) -> bool {
 /// 归一化结果做比较，而不是数标签 —— 后者会被 `<p>`、`<div>` 这类包裹层干扰。
 ///
 /// 多链接、嵌套链接、href 为空或指向 `javascript:` / `data:` 的一律不替换。
-fn sole_anchor_href(html: &str) -> Option<String> {
+/// 富文本条目的**纯文本正文**（已按"所有超链接换成网址本身"的口径派生）。
+///
+/// # 为什么要有一个统一入口
+///
+/// 读取侧过去各自决定要不要调用派生函数，于是漏掉的地方会把链接标签直接交给用户
+/// 或下游：顺序粘贴、MCP 暴露给 AI、云同步搬运都曾如此。同一个规则散落成多份判断，
+/// 就一定会漏。
+///
+/// 非富文本条目原样返回（除非命中下面的存量修复）。
+pub fn plain_text_of_entry(item: &crate::domain::models::ClipboardEntry) -> String {
+    plain_text_of(
+        &item.content,
+        &item.content_type,
+        item.html_content.as_deref(),
+    )
+}
+
+/// 把条目的正文就地归一化成对外形态（链接是地址）。用于事件载荷等"直接送实体给
+/// 界面"的通道 —— 那些通道绕过了列表命令的归一化，是本规则最容易漏的一类出口。
+pub fn normalize_content_for_ui(item: &mut crate::domain::models::ClipboardEntry) {
+    let plain = plain_text_of_entry(item);
+    if !plain.trim().is_empty() {
+        item.content = plain;
+    }
+}
+
+/// [`plain_text_of_entry`] 的底层形式，供手上只有三个字段、没有整条 `ClipboardEntry`
+/// 的调用点使用（复制、粘贴队列等）。
+pub fn plain_text_of(content: &str, content_type: &str, html_content: Option<&str>) -> String {
+    if content_type == "rich_text" {
+        let derived = derive_rich_text_content(content, html_content);
+        if !derived.trim().is_empty() {
+            return derived;
+        }
+        return content.to_string();
+    }
+
+    // 已被"转换为纯文本"降级过的存量行。
+    //
+    // 转换会把 `content_type` 改成 `text`（`html_content` 保留原样），此后
+    // `rich_text` 的派生分支不再覆盖它，于是早先存进去的链接标签就永久留在了列表、
+    // 粘贴与搜索里 —— 用户会以为"改了也没生效"。
+    //
+    // 但不能无脑用 HTML 覆盖：用户可能后来手改过正文，那份 HTML 已经是旧的。判定
+    // 依据是**存储的正文是否恰好就是那份 HTML 的可见文字**（即早先口径的派生结果）：
+    // 相等说明它只是陈旧派生，可以安全换成新口径；不等说明正文被改过，保持原样。
+    if let Some(html) = html_content {
+        if !html.trim().is_empty() {
+            let legacy = extract_plain_text_from_htmlish(html);
+            let derived = derive_rich_text_content(content, Some(html));
+            if !legacy.trim().is_empty() && !derived.trim().is_empty() && derived != content {
+                // 两种情况都算"这条正文只是当年转换留下的旧结果"：
+                //
+                // 1. 与旧口径的可见文字完全相同 —— 直接比对即成立。
+                // 2. 去空白后与旧口径相同 —— 旧按钮读的是浏览器 `innerText`（链接紧贴
+                //    正文时不补空格），而旧后端口径会在标签处补空格，于是
+                //    `详见标签说明` 与 `详见 标签 说明` 只差空白。按空白归一后比对，
+                //    这批"链接紧贴正文"的存量行才能一并救回来。
+                //
+                // 用户手写的内容不会同时满足这两条：它要么在文字上就不等于那份 HTML，
+                // 要么长度/用词已经不同。
+                let same_exact =
+                    collapse_preview_whitespace(&legacy) == collapse_preview_whitespace(content);
+                let same_ignoring_spaces =
+                    strip_all_whitespace(&legacy) == strip_all_whitespace(content);
+                if same_exact || same_ignoring_spaces {
+                    return derived;
+                }
+            }
+        }
+    }
+
+    content.to_string()
+}
+
+/// 把 HTML 里的每个 `<a href>` 换成 href 本身（返回改写后的 HTML）。
+///
+/// # 为什么是"每个"而不是"整条只有一个链接时"
+///
+/// 纯文本正文代表"这条内容以纯文本形式粘贴出去长什么样"。带下划线的标签文字是
+/// 界面的装饰，链接的**真实目标**是 `href` —— 用户要能直接看到、复制、打开那个地址。
+/// 所以只要有超链接，就换成网址本身，不论它在正文的什么位置、是不是唯一一个。
+///
+/// （早期的实现只在"整条内容恰好就是一个链接"时才替换，那会让正文里夹带的链接
+/// 继续停留在标签文字上，用户反馈仍然看不到地址。）
+///
+/// # 不改写的情况
+///
+/// - 没有 href、href 为空；
+/// - `javascript:` / `data:` / `vbscript:` 这类不是可导航目标；
+/// - 标签文字与地址本来就完全相同（改写等于没改）。
+///
+/// 锚点内部的格式标签（`<a href="X"><b>粗</b></a>`）不用特殊处理：整个锚点被替换成
+/// 地址后，原本嵌在里面的标签自然消失。
+fn rewrite_anchor_hrefs_to_urls(html: &str) -> String {
     static ANCHOR_RE: OnceLock<Regex> = OnceLock::new();
 
     let anchor_re = ANCHOR_RE.get_or_init(|| {
-        Regex::new(r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#)
-            .unwrap()
+        // 三种写法都要认：双引号、单引号、**不加引号**。
+        // 只认前两种会让 `<a href=http://h/1>看这里</a>` 抓不到，而前端的 DOM 解析
+        // 能认出它 —— 同一个文件用界面按钮和后端粘贴会得到不同结果。
+        Regex::new(
+            r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))[^>]*>.*?</a\s*>"#,
+        )
+        .unwrap()
     });
 
-    let mut matches = anchor_re.captures_iter(html);
-    let first = matches.next()?;
-    if matches.next().is_some() {
-        return None; // 多个链接：不是"整条内容就是一个链接"
-    }
-
-    let href = first
-        .get(1)
-        .or_else(|| first.get(2))
-        .map(|m| m.as_str().trim())
-        .unwrap_or("");
-    if href.is_empty() || looks_like_non_navigable_href(href) {
-        return None;
-    }
-
-    let anchor_inner = first.get(3).map(|m| m.as_str()).unwrap_or("");
-    let anchor_text = collapse_preview_whitespace(&extract_plain_text_from_htmlish(anchor_inner));
-    if anchor_text.is_empty() {
-        return None;
-    }
-
-    let visible_text = collapse_preview_whitespace(&extract_plain_text_from_htmlish(html));
-    if visible_text != anchor_text {
-        return None; // 锚点只是正文的一部分，保留原文
-    }
-
-    // 标签文字就是地址本身时，默认路径已经给出同样的结果，没必要走这条分支。
-    if visible_text == href {
-        return None;
-    }
-
-    Some(href.to_string())
+    anchor_re
+        .replace_all(html, |caps: &regex::Captures<'_>| {
+            let href = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str().trim())
+                .unwrap_or("");
+            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            if href.is_empty() || looks_like_non_navigable_href(href) {
+                whole.to_string()
+            } else {
+                href.to_string()
+            }
+        })
+        .into_owned()
 }
 
 /// `javascript:` / `data:` 这类不能当作链接目标回填到纯文本里的协议。
@@ -1119,22 +1211,12 @@ pub fn derive_rich_text_content(content: &str, html_content: Option<&str>) -> St
         if describes_href_backed_link(&sanitized_plain, html) {
             return sanitized_plain;
         }
-
-        // 整条内容就是一个链接（标签文字与地址不同）时，纯文本正文用地址。
-        // 富文本那条路径不受影响：它渲染的是 `html_content`，仍然显示带下划线的标签。
-        //
-        // 前置条件：纯文本列**本身还不是** URL。若它已经是 URL，那是用户直接复制的
-        // 链接地址，比 HTML 里的锚点更权威 —— 尤其当锚点指向别处时（网页正文里常见），
-        // 用 href 覆盖会把用户真正复制的那个地址换掉。
-        if !looks_like_bare_url_text(&sanitized_plain) {
-            if let Some(href) = sole_anchor_href(html) {
-                return href;
-            }
-        }
     }
 
+    // 所有超链接一律换成网址本身，再做纯文本提取。
+    // 富文本那条路径不受影响：它渲染的是 `html_content`，仍然显示带下划线的标签。
     let html_text = html_content
-        .map(extract_plain_text_from_htmlish)
+        .map(|html| extract_plain_text_from_htmlish(&rewrite_anchor_hrefs_to_urls(html)))
         .filter(|text| !text.is_empty());
     if let Some(text) = html_text {
         return text;
@@ -1324,8 +1406,9 @@ mod tests {
         decode_basic_html_entities, derive_rich_text_content,
         extract_animated_image_data_url_from_html,
         extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
-        extract_plain_text_from_htmlish, infer_rich_html_from_plain_text,
-        looks_like_bare_url_text, normalize_clipboard_plain_text, sole_anchor_href,
+        infer_rich_html_from_plain_text,
+        looks_like_bare_url_text, normalize_clipboard_plain_text, plain_text_of,
+        plain_text_of_entry,
         parse_app_cleanup_policies, parse_cf_html, parse_cleanup_rules,
         split_rich_html_and_image_fallback, split_rich_html_and_named_formats,
         AppCleanupPolicy,
@@ -1457,36 +1540,248 @@ mod tests {
         assert_eq!(derive_rich_text_content(label, Some(&html)), url);
     }
 
-    /// 反向：行内链接**不能**被替换成地址，否则文章正文会被网址打碎。
+    /// 统一入口：富文本条目取出纯文本正文时，链接必须是地址。
     ///
-    /// 断言只看"有没有把网址塞进来"，不看空格：既有实现会在行内标签处补一个空格
-    /// （`<a …>X</a>` → " X "），那是本函数之外的既有行为，不属于本次改动范围。
+    /// 这条盯住的是"读取侧忘了派生"这类漏 —— 顺序粘贴、MCP、云同步都曾经直接把
+    /// 库里的旧正文交出去。
     #[test]
-    fn inline_link_inside_prose_keeps_the_original_text() {
+    fn plain_text_of_entry_derives_the_url_for_rich_text() {
+        let item = crate::domain::models::ClipboardEntry {
+            id: 1,
+            content_type: "rich_text".to_string(),
+            content: "T750 变更单".to_string(),
+            html_content: Some(
+                "<p><a href=\"http://192.168.23.98:8888/c/T750/+/176116\">T750 变更单</a></p>"
+                    .to_string(),
+            ),
+            source_app: "test".to_string(),
+            timestamp: 0,
+            preview: String::new(),
+            is_pinned: false,
+            pinned_order: 0,
+            tags: Vec::new(),
+            use_count: 0,
+            note: String::new(),
+            source_app_path: None,
+            is_external: false,
+            file_preview_exists: false,
+        };
+
+        assert_eq!(
+            plain_text_of_entry(&item),
+            "http://192.168.23.98:8888/c/T750/+/176116"
+        );
+    }
+
+    /// 非富文本条目原样返回，不被改写。
+    #[test]
+    fn plain_text_of_entry_leaves_other_types_alone() {
+        let item = crate::domain::models::ClipboardEntry {
+            id: 2,
+            content_type: "text".to_string(),
+            content: "普通文字".to_string(),
+            html_content: None,
+            source_app: "test".to_string(),
+            timestamp: 0,
+            preview: String::new(),
+            is_pinned: false,
+            pinned_order: 0,
+            tags: Vec::new(),
+            use_count: 0,
+            note: String::new(),
+            source_app_path: None,
+            is_external: false,
+            file_preview_exists: false,
+        };
+
+        assert_eq!(plain_text_of_entry(&item), "普通文字");
+    }
+
+    /// 富文本但 HTML 缺失时，退回存储的正文，不要变成空串。
+    #[test]
+    fn plain_text_of_entry_falls_back_when_html_is_missing() {
+        let item = crate::domain::models::ClipboardEntry {
+            id: 3,
+            content_type: "rich_text".to_string(),
+            content: "有些文字".to_string(),
+            html_content: None,
+            source_app: "test".to_string(),
+            timestamp: 0,
+            preview: String::new(),
+            is_pinned: false,
+            pinned_order: 0,
+            tags: Vec::new(),
+            use_count: 0,
+            note: String::new(),
+            source_app_path: None,
+            is_external: false,
+            file_preview_exists: false,
+        };
+
+        assert_eq!(plain_text_of_entry(&item), "有些文字");
+    }
+
+    /// 存量行【链接紧贴正文】的恢复。
+    ///
+    /// 旧按钮读的是浏览器 `innerText`（紧贴时不补空格），旧后端口径却会在标签处补
+    /// 空格，于是库里存的是 `详见标签说明`、而那份 HTML 的旧可见文字是 `详见 标签 说明`。
+    /// 只做精确比对会漏掉这一批，用户升级后那条仍显示标签。
+    #[test]
+    fn glueed_link_stale_row_recovers_the_url() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p>详见<a href=\"{url}\">标签</a>说明</p>");
+
+        // 紧贴写法（innerText 的产物，无空格）：网址被正确取出，原文次序不变。
+        // 断言只检查"网址在、链接标签不再作为链接出现"，不锁死空格 —— 那是
+        // `extract_plain_text_from_htmlish` 既有的排版行为，不属于本次改动范围。
+        let glued = plain_text_of("详见标签说明", "text", Some(&html));
+        assert!(
+            glued.contains(url),
+            "紧贴写法也应取出网址，实际得到: {glued:?}"
+        );
+        assert!(
+            glued.contains("详见") && glued.contains("说明"),
+            "链接周围的文字必须保留，实际得到: {glued:?}"
+        );
+
+        // 带空格写法（旧后端口径）同样能恢复
+        let spaced = plain_text_of("详见 标签 说明", "text", Some(&html));
+        assert!(spaced.contains(url), "带空格的旧结果也应恢复: {spaced:?}");
+    }
+
+    /// 用户真正手写过的正文不能被"去掉空白也算相同"误伤。
+    #[test]
+    fn hand_written_text_is_not_overwritten_by_whitespace_tolerance() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p>详见<a href=\"{url}\">标签</a>说明</p>");
+
+        // 文字本身不同（多了一个字），即使去掉空白也不相等
+        let kept = plain_text_of("详见标签说明补充", "text", Some(&html));
+
+        assert_eq!(kept, "详见标签说明补充");
+    }
+
+    /// 不加引号的 href 也要认。
+    ///
+    /// 前端用 DOM 解析天然认得它；后端正则若只认两种引号，同一个文件用界面按钮
+    /// 与后端粘贴会得到不同结果（一边是网址、一边是标签）。
+    #[test]
+    fn unquoted_href_is_recognised() {
+        let content = derive_rich_text_content(
+            "看这里",
+            Some("<p><a href=http://h/1>看这里</a></p>"),
+        );
+
+        assert_eq!(content, "http://h/1");
+    }
+
+    /// 真实形态：从浏览器/内网 wiki 复制链接时，剪贴板 HTML 是带 Windows 剪贴板
+    /// 标记（`StartFragment` / `EndFragment`）与 Office 噪声的完整文档，链接藏在
+    /// 这些包裹层里面。用用户实际遇到的那条链接验证端到端结果。
+    #[test]
+    fn real_clipboard_html_with_fragment_markers_yields_the_url() {
+        let html = "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000300\r\n\
+StartFragment:0000000141\r\nEndFragment:0000000264\r\n\
+<html><body>\r\n<!--StartFragment--><p class=\"MsoNormal\"><a \
+href=\"http://192.168.23.98:8888/c/T750/+/176116\">T750 变更单</a></p>\
+<!--EndFragment-->\r\n</body></html>";
+
+        let content = derive_rich_text_content("T750 变更单", Some(html));
+
+        assert_eq!(content, "http://192.168.23.98:8888/c/T750/+/176116");
+    }
+
+    /// 富文本**渲染**用的 HTML 不能被改动：界面上仍要显示带下划线的标签。
+    /// 只有"纯文本形态"才换成网址。
+    #[test]
+    fn html_itself_is_never_rewritten() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p><a href=\"{url}\">T750 变更单</a></p>");
+
+        let content = derive_rich_text_content("T750 变更单", Some(&html));
+
+        assert_eq!(content, url, "纯文本形态是网址");
+        assert!(html.contains("T750 变更单"), "原始 HTML 变量本身不变");
+        assert!(html.contains(&format!("href=\"{url}\"")));
+    }
+
+    /// 存量修复：已降级成 `text`、正文里存着链接标签的行，读取时给出地址。
+    ///
+    /// 这正是用户"改了还是不对"的那批数据：早先转换时把界面上的标签文字存进了
+    /// `content`，而 `html_content`（含真实地址）保留着。转换时类型已降级为 `text`，
+    /// 从此 `rich_text` 的派生分支不再覆盖它。
+    #[test]
+    fn stale_converted_row_recovers_the_url() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p><a href=\"{url}\">T750 变更单</a></p>");
+
+        let recovered = plain_text_of("T750 变更单", "text", Some(&html));
+
+        assert_eq!(recovered, url);
+    }
+
+    /// 但**不能**覆盖用户手改过的正文。
+    ///
+    /// 判定依据是"存储的正文是否恰好就是那份 HTML 的可见文字"：不等就说明正文被人
+    /// 改过，那份 HTML 已经过期，必须保持原样。
+    #[test]
+    fn stale_recovery_leaves_hand_edited_content_alone() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p><a href=\"{url}\">T750 变更单</a></p>");
+
+        let kept = plain_text_of("我自己改写的说明", "text", Some(&html));
+
+        assert_eq!(kept, "我自己改写的说明");
+    }
+
+    /// 普通 `text` 条目（没有 HTML）不受影响。
+    #[test]
+    fn stale_recovery_ignores_rows_without_html() {
+        assert_eq!(plain_text_of("普通文字", "text", None), "普通文字");
+        assert_eq!(plain_text_of("普通文字", "text", Some("")), "普通文字");
+    }
+
+    /// 标签与地址本来就相同、没有需要修复的内容时不改动。
+    #[test]
+    fn stale_recovery_is_a_noop_when_nothing_to_fix() {
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<p><a href=\"{url}\">{url}</a></p>");
+
+        assert_eq!(plain_text_of(url, "text", Some(&html)), url);
+    }
+
+    /// 行内链接也换成地址，周围文字保留。
+    ///
+    /// 这条测试原先断言"行内链接保留人话标签"。用户明确要求改成**所有**超链接都
+    /// 换成网址本身（"我要的是超链接转换为链接网址本身而不是网址标题"），所以期望值
+    /// 翻转 —— 这是需求变更，不是回归。
+    #[test]
+    fn inline_link_inside_prose_also_becomes_the_url() {
         let text = "详见 T750 变更单里的说明";
         let html = "<p>详见 <a href=\"http://192.168.23.98:8888/c/T750/+/176116\">T750 变更单</a>里的说明</p>";
 
         let content = derive_rich_text_content(text, Some(html));
 
         assert!(
-            !content.contains("192.168.23.98"),
-            "行内链接不应把网址插进正文，实际得到: {content:?}"
+            content.contains("http://192.168.23.98:8888/c/T750/+/176116"),
+            "行内链接应当换成网址本身，实际得到: {content:?}"
         );
         assert!(
-            content.contains("T750 变更单"),
-            "行内链接的人话标签应当保留，实际得到: {content:?}"
+            content.contains("详见") && content.contains("里的说明"),
+            "链接周围的文字必须保留，实际得到: {content:?}"
         );
     }
 
-    /// 反向：两个链接不算"整条内容就是一个链接"。
+    /// 多个链接**各自**换成自己的地址（不是挑一个，也不是都不换）。
     #[test]
-    fn multiple_links_are_not_treated_as_a_single_link() {
+    fn every_link_becomes_its_own_url() {
         let text = "变更单 与 版本说明";
         let html = "<p><a href=\"http://a.example/1\">变更单</a> 与 <a href=\"http://b.example/2\">版本说明</a></p>";
 
         let content = derive_rich_text_content(text, Some(html));
 
-        assert!(!content.contains("a.example"), "多链接不应被替换成某一个地址");
+        assert!(content.contains("http://a.example/1"), "第一条链接应换成地址: {content:?}");
+        assert!(content.contains("http://b.example/2"), "第二条链接应换成地址: {content:?}");
     }
 
     /// 反向：`javascript:` 不是可导航地址，保留原文。
@@ -1498,29 +1793,29 @@ mod tests {
         assert_eq!(derive_rich_text_content(label, Some(html)), label);
     }
 
+    /// 文章正文里的链接同样换成地址（期望值按新契约翻转）。
     #[test]
-    fn rich_text_content_still_prefers_html_text_for_in_article_links() {
-        // The copied text (not the clipboard plain text) is the content here, so
-        // the HTML text has to keep winning over any anchor href.
+    fn in_article_link_also_becomes_the_url() {
         let text = "Read the full story";
         let html = "<p>Read the <a href=\"https://example.com/article\">full story</a></p>";
 
         let content = derive_rich_text_content(text, Some(html));
 
-        assert_eq!(content, "Read the full story");
+        assert_eq!(content, "Read the https://example.com/article");
     }
 
+    /// 锚点指向别处时，以锚点的地址为准（它才是这份 HTML 里真正的链接目标）。
+    ///
+    /// 期望值由"保留可见文字里的那个 URL"翻转为 href —— 与"所有超链接换成网址本身"
+    /// 的新契约一致。
     #[test]
-    fn rich_text_content_keeps_html_text_when_anchor_points_to_another_host() {
-        // The plain text is a URL but the anchor links elsewhere, so this is page
-        // content with a hyperlink rather than a copied link.
+    fn anchor_target_wins_when_it_points_to_another_host() {
         let text = "https://example.com/article";
         let html = "<p><a href=\"https://other.example.org/other\">https://example.com/article</a></p>";
 
         let content = derive_rich_text_content(text, Some(html));
 
-        assert_eq!(content, "https://example.com/article");
-        assert!(content.contains("example.com"));
+        assert_eq!(content, "https://other.example.org/other");
     }
 
     /// 整条内容就是一个带下划线的链接时，纯文本正文取**地址**。

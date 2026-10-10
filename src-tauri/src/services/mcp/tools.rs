@@ -924,16 +924,15 @@ fn entry_type_label(entry: &crate::domain::models::ClipboardEntry) -> String {
 /// 条目 → JSON。`include_content=false` 时用 `preview` 代替 `content`，
 /// 便于在大库上做概览而不必搬运全部正文。
 fn entry_json(entry: &crate::domain::models::ClipboardEntry, include_content: bool) -> Value {
+    // 走统一派生：富文本条目的纯文本正文里，链接是地址而不是界面上的标签文字。
+    let plain = crate::services::clipboard::plain_text_of_entry(entry);
     let mut map = Map::new();
     map.insert("id".into(), json!(entry.id));
     map.insert("contentType".into(), json!(entry.content_type));
     map.insert("typeLabel".into(), json!(entry_type_label(entry)));
-    map.insert(
-        "contentChars".into(),
-        json!(entry.content.chars().count()),
-    );
+    map.insert("contentChars".into(), json!(plain.chars().count()));
     if include_content {
-        map.insert("content".into(), json!(entry.content));
+        map.insert("content".into(), json!(plain));
     } else {
         map.insert("contentPreview".into(), json!(entry.preview));
     }
@@ -1106,9 +1105,16 @@ fn mirror_content_in_session(ctx: &Ctx<'_>, id: i64, content: &str, html: Option
         };
         item.content = content.to_string();
         item.preview = preview.clone();
-        // R13：会话态与库内一致 —— 只有富文本条目的 HTML 会被更新，类型不被偷走。
         if item.content_type == "rich_text" {
-            item.html_content = html_owned.clone();
+            // `Some("")` = 显式清空 HTML，即"转换为纯文本"：类型也要跟着降级，
+            // 否则库里已是 `text`、列表里还是 `rich_text`，界面继续按富文本渲染。
+            if html_owned.as_deref() == Some("") {
+                item.content_type = "text".to_string();
+                item.html_content = Some(String::new());
+            } else {
+                // R13：其余情况保留原 HTML（含 `None`），类型不被偷走。
+                item.html_content = html_owned.clone();
+            }
         }
         1
     });
@@ -1799,8 +1805,11 @@ pub fn invoke(ctx: &Ctx<'_>, tool: &str, args: &Value) -> ToolOutcome {
             };
             if entry.content_type != "rich_text" { return ToolOutcome::failed("只有 rich_text 条目支持此转换".to_string()); }
             let plain = crate::services::clipboard::derive_rich_text_content(&entry.content, entry.html_content.as_deref());
-            match mutation::apply_entry_content(&store.repo, target_id, &plain, None) {
-                Ok(()) => { mirror_content_in_session(ctx, target_id, &plain, None); ctx.effects.emit_changed(); ctx.effects.request_cloud_sync(); ToolOutcome::ok(json!({ "id": target_id, "converted": true, "content": plain })) }
+            // 走专门的语义函数：它内部固定用 `Some("")`（清空 HTML 并降级为 text），
+            // 与界面按钮一致。这里曾经传 `None`（含义是"保留 HTML"），导致条目仍是
+            // 富文本类型、界面照旧带下划线，只有 AI 拿到的返回值是网址。
+            match mutation::convert_entry_to_plain_text(&store.repo, target_id, &plain) {
+                Ok(()) => { mirror_content_in_session(ctx, target_id, &plain, Some("")); ctx.effects.emit_changed(); ctx.effects.request_cloud_sync(); ToolOutcome::ok(json!({ "id": target_id, "converted": true, "content": plain })) }
                 Err(e) => ToolOutcome::failed(format!("转换失败：{}", e)),
             }
         }

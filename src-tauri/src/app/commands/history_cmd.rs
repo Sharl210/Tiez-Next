@@ -12,12 +12,10 @@ use crate::services::encryption_queue::EncryptionJob;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 fn normalize_rich_text_item_content(item: &mut ClipboardEntry) {
-    if item.content_type != "rich_text" {
-        return;
-    }
-
-    let normalized = derive_rich_text_content(&item.content, item.html_content.as_deref());
-    if !normalized.trim().is_empty() {
+    // 走统一入口：既覆盖 `rich_text` 行，也修复"转换为纯文本后降级成 `text`、
+    // 但早先把链接标签存了进来"的存量行（判定依据见 `plain_text_of_entry`）。
+    let normalized = crate::services::clipboard::plain_text_of_entry(item);
+    if !normalized.trim().is_empty() && normalized != item.content {
         item.content = normalized;
     }
 }

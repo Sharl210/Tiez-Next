@@ -18,6 +18,12 @@ interface UseKeyboardNavigationOptions {
   chatMode: boolean;
   editingTagsId: number | null;
   arrowKeySelection: boolean;
+  /**
+   * 设置里那个"粘贴快捷键"（`app.rich_paste_hotkey`）。
+   *
+   * 名字里的 `rich` 是历史遗留：默认格式翻转为富文本之后，**这个组合键现在是纯文本
+   * 那条通道**（见下方 keydown 里的 `isRich`）。设置键名保持不动以免破坏已有配置。
+   */
   richPasteHotkey: string;
   searchInputRef: RefObject<HTMLInputElement | null>;
   copyToClipboard: (id: number, content: string, contentType: string, pasteWithFormat?: boolean) => Promise<void>;
@@ -137,11 +143,11 @@ export const useKeyboardNavigation = ({
         return;
       }
 
-      const matchesRichHotkey = matchesHotkey(e, richPasteHotkeyRef.current);
+      // 默认是富文本；这个组合键是"改为纯文本"的那条路（与右键同义）。
+      const matchesPlainTextHotkey = matchesHotkey(e, richPasteHotkeyRef.current);
       const shouldHandleEnter = e.key === "Enter" && isKeyboardModeRef.current;
-      if (shouldHandleEnter || matchesRichHotkey) {
-        // Rich is the default; the modifier hotkey is the plain-text escape hatch.
-        const isRich = !matchesRichHotkey;
+      if (shouldHandleEnter || matchesPlainTextHotkey) {
+        const isRich = !matchesPlainTextHotkey;
         e.preventDefault();
         e.stopPropagation();
 

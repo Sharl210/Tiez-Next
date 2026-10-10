@@ -112,6 +112,14 @@ pub async fn paste_next_step(app_handle: tauri::AppHandle) {
         };
 
         if let Some((content, c_type, html_content)) = content_opt {
+            // 纯文本正文按统一口径重新派生：库里早先存的可能是链接标签，
+            // 直接粘出去用户看到的就是标签而不是地址。
+            let content = crate::services::clipboard::plain_text_of(
+                &content,
+                &c_type,
+                html_content.as_deref(),
+            );
+
             crate::services::clipboard_ops::remember_recent_paste(
                 &app_handle,
                 &content,

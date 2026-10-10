@@ -2001,7 +2001,7 @@ const ClipboardItem = ({
                     )}
                     <div className="confirm-dialog-buttons">
                         {bodyEditIsRich && (
-                            <button className="confirm-dialog-button rich-to-plain-button" disabled={bodyEditSaving} onClick={() => onBodyEditSave(bodyEditorRichRef.current?.innerText ?? bodyDraft, '')} title={t('convert_rich_to_plain_hint')}>
+                            <button className="confirm-dialog-button rich-to-plain-button" disabled={bodyEditSaving} onClick={() => onBodyEditSave(htmlToPlainText(bodyEditorRichRef.current?.innerHTML ?? bodyInitialHtml ?? ''), '')} title={t('convert_rich_to_plain_hint')}>
                                 <span>{t('convert_rich_to_plain')}</span>
                             </button>
                         )}

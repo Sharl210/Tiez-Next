@@ -509,7 +509,9 @@ fn update_database_with_changes(
                     preview,
                     synced_html.as_deref(),
                 );
-                let _ = app_handle.emit("clipboard-updated", item.clone());
+                let mut emitted = item.clone();
+                crate::services::clipboard::normalize_content_for_ui(&mut emitted);
+                let _ = app_handle.emit("clipboard-updated", emitted);
                 println!(
                     "Session item updated and clipboard-updated event emitted for id: {}",
                     id
@@ -553,6 +555,8 @@ fn update_database_with_changes(
         }
 
         if let Ok(Some(updated_entry)) = state.repo.get_entry_by_id(id) {
+            let mut updated_entry = updated_entry;
+            crate::services::clipboard::normalize_content_for_ui(&mut updated_entry);
             let _ = app_handle.emit("clipboard-updated", updated_entry);
             println!(
                 "Database updated and clipboard-updated event emitted for id: {}",

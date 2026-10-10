@@ -1179,9 +1179,16 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      */
     const convertItemRichToPlain = async (item: ClipboardEntry) => {
         try {
+            /*
+             * 从 `html_content` 重新派生，而不是直接用 `item.content`。
+             *
+             * `item.content` 是库里那份**已经派生过**的纯文本。旧版本派生时会把链接写成
+             * 标签文字，所以直接复用它等于把老结果再存一遍，用户看到的还是标签而不是地址。
+             * 这里每次都从 HTML 现算，历史数据也能被纠正过来。
+             */
             await invoke('update_item_content', {
                 id: item.id,
-                newContent: item.content,
+                newContent: htmlToPlainText(item.html_content ?? item.content),
                 htmlContent: '',
             });
             if (selectedTag) await loadTagItems(selectedTag);
@@ -1594,7 +1601,10 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
                                             onClick={async () => {
                                                 const selectedItems = tagItems.filter(item => selectedItemIds.has(item.id));
                                                 if (selectedItems.length > 0) {
-                                                    const combinedContent = selectedItems.map(item => item.content).join('\n');
+                                                    // 从 HTML 派生：库里存的可能是早先那个口径的结果（链接只剩标签文字）。
+                                                    const combinedContent = selectedItems
+                                                        .map(item => htmlToPlainText(item.html_content ?? item.content))
+                                                        .join('\n');
                                                     await invoke('copy_to_clipboard', {
                                                         content: combinedContent,
                                                         contentType: 'text',
