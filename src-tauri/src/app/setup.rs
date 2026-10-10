@@ -2057,7 +2057,7 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_sh
         val.replace("Win", "Super").parse::<Shortcut>()
     } {
         if shortcut == &rich_s {
-            crate::services::clipboard_ops::paste_latest_rich(app.clone());
+            crate::services::clipboard_ops::paste_latest_as_plain_text(app.clone());
         }
     }
 

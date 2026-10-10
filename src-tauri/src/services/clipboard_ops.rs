@@ -1,6 +1,7 @@
 // Clipboard operations module
 use crate::app_state::{PasteQueue, SessionHistory, SettingsState};
 use crate::database::{calc_image_hash_from_rgba, DbState};
+use crate::domain::models::ClipboardEntry;
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
@@ -397,7 +398,8 @@ pub async fn paste_history_item_by_index(
         true,
         item.id,
         delete_after_use,
-        Some(false),
+        // 默认富文本：与主列表单击保持一致。
+        Some(true),
         None,
     )
     .await?;
@@ -1375,8 +1377,46 @@ fn play_paste_sound_if_enabled(app_handle: &tauri::AppHandle) {
     }
 }
 
+/// 取"最近一条"，供快捷键粘贴使用。
+///
+/// # 为什么不能直接用列表的第一条
+///
+/// 列表顺序是**置顶优先**（`HISTORY_ORDER_PINNED_FIRST`），所以
+/// `get_clipboard_history(limit = 1)` 的第一条其实是"置顶里最新的那条"。一旦用户
+/// 置顶了一条旧内容，之后每次带格式粘贴都会粘到它 —— 它永久占住了这个位置。
+///
+/// 而置顶只是**位置上的排序**：它应当影响用户在列表里看到什么，不该影响"最近一条"
+/// 指的是谁。这里改为按纯时间取，并且把会话里尚未落库的新条目一起比较，语义就是
+/// 如实的"最近一条"。
+fn most_recent_entry_for_paste(app: &tauri::AppHandle) -> Option<ClipboardEntry> {
+    let db_state = app.state::<DbState>();
+    let session = app.state::<SessionHistory>();
+
+    let from_db = db_state.repo.get_most_recent_entry(None).ok().flatten();
+    let from_session = session
+        .inner()
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .max_by_key(|item| item.timestamp)
+        .cloned();
+
+    match (from_db, from_session) {
+        (Some(persisted), Some(session_item)) => {
+            if session_item.timestamp > persisted.timestamp {
+                Some(session_item)
+            } else {
+                Some(persisted)
+            }
+        }
+        (Some(entry), None) | (None, Some(entry)) => Some(entry),
+        (None, None) => None,
+    }
+}
+
 #[tauri::command]
-pub fn paste_latest_rich(app_handle: tauri::AppHandle) {
+pub fn paste_latest_as_plain_text(app_handle: tauri::AppHandle) {
     let app_handle_clone = app_handle.clone();
     tauri::async_runtime::spawn(async move {
         let delete_after = {
@@ -1384,30 +1424,21 @@ pub fn paste_latest_rich(app_handle: tauri::AppHandle) {
             settings.delete_after_paste.load(Ordering::Relaxed)
         };
 
-        let history = crate::app::commands::history_cmd::get_clipboard_history(
-            app_handle_clone.state::<DbState>(),
-            app_handle_clone.state::<SessionHistory>(),
-            1,
-            0, // offset
-            None,
-        );
-
-        if let Ok(items) = history {
-            if let Some(item) = items.first() {
-                let _ = copy_to_clipboard(
-                    app_handle_clone.clone(),
-                    app_handle_clone.state::<DbState>(),
-                    app_handle_clone.state::<SessionHistory>(),
-                    item.content.clone(),
-                    item.content_type.clone(),
-                    true, // paste
-                    item.id,
-                    delete_after, // delete_after_use
-                    Some(true),   // paste_with_format
-                    None,
-                )
-                .await;
-            }
+        if let Some(item) = most_recent_entry_for_paste(&app_handle_clone) {
+            let _ = copy_to_clipboard(
+                app_handle_clone.clone(),
+                app_handle_clone.state::<DbState>(),
+                app_handle_clone.state::<SessionHistory>(),
+                item.content.clone(),
+                item.content_type.clone(),
+                true, // paste
+                item.id,
+                delete_after, // delete_after_use
+                // 纯文本：该快捷键是「默认富文本」之外的那条例外通道。
+                Some(false),  // paste_with_format
+                None,
+            )
+            .await;
         }
     });
 }

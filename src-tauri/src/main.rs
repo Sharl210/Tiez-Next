@@ -100,7 +100,7 @@ fn main() {
             app::hooks::set_recording_mode,
             services::content_handler::open_content,
             services::clipboard_ops::copy_to_clipboard,
-            services::clipboard_ops::paste_latest_rich,
+            services::clipboard_ops::paste_latest_as_plain_text,
             app::commands::get_clipboard_history,
             app::commands::search_clipboard_history,
             app::commands::delete_clipboard_entry,

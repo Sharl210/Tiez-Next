@@ -1039,6 +1039,73 @@ fn describes_href_backed_link(plain_text: &str, html: &str) -> bool {
     collapse_preview_whitespace(&html_text) != collapse_preview_whitespace(plain_text)
 }
 
+/// HTML 里的可见文字**整体就是一个链接**时，返回那个链接的 href。
+///
+/// # 为什么需要它
+///
+/// 从网页/内网 wiki 复制一条链接时，剪贴板里的 HTML 往往是
+/// `<a href="http://host/c/T750/+/176116">点击查看</a>`：屏幕上显示的是带下划线的
+/// 标签文字，而链接地址藏在 `href` 里。纯文本正文代表"以纯文本形式粘贴出去会是
+/// 什么"，此时用户要的是**链接本身**（能点、能复制、能直接打开），不是那层标签。
+///
+/// # 为什么不能无条件替换所有 `<a>`
+///
+/// 文章正文里的行内链接必须保留原文：`<p>Read the <a href="...">full story</a></p>`
+/// 粘贴成纯文本应当是 "Read the full story"，而不是把句子中间插进一个网址。所以
+/// 只在**锚点就是全部可见内容**时才替换。判断方式是拿 HTML 的可见文字与锚点文字的
+/// 归一化结果做比较，而不是数标签 —— 后者会被 `<p>`、`<div>` 这类包裹层干扰。
+///
+/// 多链接、嵌套链接、href 为空或指向 `javascript:` / `data:` 的一律不替换。
+fn sole_anchor_href(html: &str) -> Option<String> {
+    static ANCHOR_RE: OnceLock<Regex> = OnceLock::new();
+
+    let anchor_re = ANCHOR_RE.get_or_init(|| {
+        Regex::new(r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#)
+            .unwrap()
+    });
+
+    let mut matches = anchor_re.captures_iter(html);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None; // 多个链接：不是"整条内容就是一个链接"
+    }
+
+    let href = first
+        .get(1)
+        .or_else(|| first.get(2))
+        .map(|m| m.as_str().trim())
+        .unwrap_or("");
+    if href.is_empty() || looks_like_non_navigable_href(href) {
+        return None;
+    }
+
+    let anchor_inner = first.get(3).map(|m| m.as_str()).unwrap_or("");
+    let anchor_text = collapse_preview_whitespace(&extract_plain_text_from_htmlish(anchor_inner));
+    if anchor_text.is_empty() {
+        return None;
+    }
+
+    let visible_text = collapse_preview_whitespace(&extract_plain_text_from_htmlish(html));
+    if visible_text != anchor_text {
+        return None; // 锚点只是正文的一部分，保留原文
+    }
+
+    // 标签文字就是地址本身时，默认路径已经给出同样的结果，没必要走这条分支。
+    if visible_text == href {
+        return None;
+    }
+
+    Some(href.to_string())
+}
+
+/// `javascript:` / `data:` 这类不能当作链接目标回填到纯文本里的协议。
+fn looks_like_non_navigable_href(href: &str) -> bool {
+    static NON_NAVIGABLE_RE: OnceLock<Regex> = OnceLock::new();
+    NON_NAVIGABLE_RE
+        .get_or_init(|| Regex::new(r"(?i)^\s*(?:javascript|data|vbscript)\s*:").unwrap())
+        .is_match(href)
+}
+
 pub fn derive_rich_text_content(content: &str, html_content: Option<&str>) -> String {
     let sanitized_plain = sanitize_rich_text_plain_text(content);
     if looks_like_obsidian_callout_markdown(&sanitized_plain) {
@@ -1051,6 +1118,18 @@ pub fn derive_rich_text_content(content: &str, html_content: Option<&str>) -> St
     if let Some(html) = html_content {
         if describes_href_backed_link(&sanitized_plain, html) {
             return sanitized_plain;
+        }
+
+        // 整条内容就是一个链接（标签文字与地址不同）时，纯文本正文用地址。
+        // 富文本那条路径不受影响：它渲染的是 `html_content`，仍然显示带下划线的标签。
+        //
+        // 前置条件：纯文本列**本身还不是** URL。若它已经是 URL，那是用户直接复制的
+        // 链接地址，比 HTML 里的锚点更权威 —— 尤其当锚点指向别处时（网页正文里常见），
+        // 用 href 覆盖会把用户真正复制的那个地址换掉。
+        if !looks_like_bare_url_text(&sanitized_plain) {
+            if let Some(href) = sole_anchor_href(html) {
+                return href;
+            }
         }
     }
 
@@ -1245,7 +1324,8 @@ mod tests {
         decode_basic_html_entities, derive_rich_text_content,
         extract_animated_image_data_url_from_html,
         extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
-        infer_rich_html_from_plain_text, looks_like_bare_url_text, normalize_clipboard_plain_text,
+        extract_plain_text_from_htmlish, infer_rich_html_from_plain_text,
+        looks_like_bare_url_text, normalize_clipboard_plain_text, sole_anchor_href,
         parse_app_cleanup_policies, parse_cf_html, parse_cleanup_rules,
         split_rich_html_and_image_fallback, split_rich_html_and_named_formats,
         AppCleanupPolicy,
@@ -1353,6 +1433,71 @@ mod tests {
         assert_eq!(content, text);
     }
 
+    /// 用户报的场景：内网 wiki 的一条链接，屏幕上显示的是标签文字（带下划线），
+    /// 地址藏在 href 里。纯文本正文应当是**地址本身**。
+    #[test]
+    fn sole_link_content_yields_the_href_for_plain_text_paste() {
+        let label = "T750 变更单";
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<a href=\"{url}\">{label}</a>");
+
+        let content = derive_rich_text_content(label, Some(&html));
+
+        assert_eq!(content, url);
+        assert!(!content.contains(label), "纯文本正文不应只剩标签文字");
+    }
+
+    /// 同上，但链接被块级元素包着（从网页复制时的常见形态）。
+    #[test]
+    fn sole_link_wrapped_in_blocks_still_yields_the_href() {
+        let label = "T750 变更单";
+        let url = "http://192.168.23.98:8888/c/T750/+/176116";
+        let html = format!("<div><p><span><a href=\"{url}\">{label}</a></span></p></div>");
+
+        assert_eq!(derive_rich_text_content(label, Some(&html)), url);
+    }
+
+    /// 反向：行内链接**不能**被替换成地址，否则文章正文会被网址打碎。
+    ///
+    /// 断言只看"有没有把网址塞进来"，不看空格：既有实现会在行内标签处补一个空格
+    /// （`<a …>X</a>` → " X "），那是本函数之外的既有行为，不属于本次改动范围。
+    #[test]
+    fn inline_link_inside_prose_keeps_the_original_text() {
+        let text = "详见 T750 变更单里的说明";
+        let html = "<p>详见 <a href=\"http://192.168.23.98:8888/c/T750/+/176116\">T750 变更单</a>里的说明</p>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert!(
+            !content.contains("192.168.23.98"),
+            "行内链接不应把网址插进正文，实际得到: {content:?}"
+        );
+        assert!(
+            content.contains("T750 变更单"),
+            "行内链接的人话标签应当保留，实际得到: {content:?}"
+        );
+    }
+
+    /// 反向：两个链接不算"整条内容就是一个链接"。
+    #[test]
+    fn multiple_links_are_not_treated_as_a_single_link() {
+        let text = "变更单 与 版本说明";
+        let html = "<p><a href=\"http://a.example/1\">变更单</a> 与 <a href=\"http://b.example/2\">版本说明</a></p>";
+
+        let content = derive_rich_text_content(text, Some(html));
+
+        assert!(!content.contains("a.example"), "多链接不应被替换成某一个地址");
+    }
+
+    /// 反向：`javascript:` 不是可导航地址，保留原文。
+    #[test]
+    fn non_navigable_href_is_not_used_as_plain_text() {
+        let label = "点我";
+        let html = "<a href=\"javascript:void(0)\">点我</a>";
+
+        assert_eq!(derive_rich_text_content(label, Some(html)), label);
+    }
+
     #[test]
     fn rich_text_content_still_prefers_html_text_for_in_article_links() {
         // The copied text (not the clipboard plain text) is the content here, so
@@ -1378,14 +1523,19 @@ mod tests {
         assert!(content.contains("example.com"));
     }
 
+    /// 整条内容就是一个带下划线的链接时，纯文本正文取**地址**。
+    ///
+    /// 这条测试原本断言保留标签文字（"Example Site | Home"）。用户明确要求改掉：
+    /// 富文本显示的是下划线标签，而以纯文本粘贴/转换时应当得到链接本身。所以期望值
+    /// 由标签翻转为 href —— 这是本次需求的核心行为，不是回归。
     #[test]
-    fn rich_text_content_keeps_html_text_when_plain_text_is_not_a_url() {
+    fn anchor_labelled_link_yields_the_url_when_plain_text_is_a_label() {
         let text = "Example Site | Home";
         let html = "<a href=\"https://example.com/article\">Example Site | Home</a>";
 
         let content = derive_rich_text_content(text, Some(html));
 
-        assert_eq!(content, "Example Site | Home");
+        assert_eq!(content, "https://example.com/article");
     }
 
     #[test]

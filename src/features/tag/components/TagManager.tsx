@@ -8,6 +8,7 @@ import {
     Sparkles, FileText
 } from 'lucide-react';
 import { getTagColor } from "../../../shared/lib/utils";
+import { htmlToPlainText } from "../../../shared/lib/htmlToPlainText";
 import type { ClipboardEntry } from "../../../shared/types";
 import {
     isBodyEditable,
@@ -104,15 +105,7 @@ export const escapeHtmlForEditor = (text: string): string =>
  *
  * 用 `DOMParser` 而不是正则：标签嵌套与实体转义（`&amp;`、`&nbsp;`）正则会算错。
  */
-export const htmlToPlainText = (html: string): string => {
-    if (!html) return '';
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    // 块级元素之间补换行，否则两段文字会粘成一行。
-    doc.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
-    doc.querySelectorAll('p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote, pre')
-        .forEach(el => el.append('\n'));
-    return (doc.body.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim();
-};
+export { htmlToPlainText };
 
 export type CardEditMode = 'body' | 'note';
 
@@ -1157,7 +1150,15 @@ export default function TagManager({ t, theme, persistedSize }: TagManagerProps)
      */
     const handleConvertRichToPlain = async () => {
         if (!editingItem) return;
-        const plain = richBodyEditorRef.current?.innerText ?? htmlToPlainText(editingItem.html ?? '');
+        /*
+         * 从 HTML 派生，而不是读编辑器的 `innerText`。
+         *
+         * `innerText` 是**屏幕上显示的文字**：链接会给出锚文本（"文字"），而纯文本
+         * 正文要的是链接地址（`href`）。读 innerText 会把链接丢掉，正是本按钮要修
+         * 的问题。`editingItem.html` 由编辑器 `onInput` 实时同步，所以这里拿到的是
+         * 用户当前编辑的内容。
+         */
+        const plain = htmlToPlainText(editingItem.html ?? '') || editingItem.content;
         if (!plain.trim()) return;
         try {
             await invoke('update_item_content', {

@@ -140,7 +140,8 @@ export const useKeyboardNavigation = ({
       const matchesRichHotkey = matchesHotkey(e, richPasteHotkeyRef.current);
       const shouldHandleEnter = e.key === "Enter" && isKeyboardModeRef.current;
       if (shouldHandleEnter || matchesRichHotkey) {
-        const isRich = matchesRichHotkey;
+        // Rich is the default; the modifier hotkey is the plain-text escape hatch.
+        const isRich = !matchesRichHotkey;
         e.preventDefault();
         e.stopPropagation();
 
@@ -222,7 +223,7 @@ export const useKeyboardNavigation = ({
         if (!isNavMode) return;
         if (currentIndex >= 0 && currentIndex < history.length) {
           const item = history[currentIndex];
-          copyToClipboard(item.id, item.content, item.content_type, false);
+          copyToClipboard(item.id, item.content, item.content_type, true);
         }
       } else if (action === "escape") {
         setSearch("");

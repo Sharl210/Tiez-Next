@@ -73,6 +73,15 @@ pub trait ClipboardRepository {
         offset: i32,
         content_type: Option<&str>,
     ) -> Result<Vec<ClipboardEntry>, String>;
+    /// 按**时间**取最近一条，忽略置顶顺序。
+    ///
+    /// [`Self::get_history`] 的第一条是"置顶里的第一条"，那是**界面列表**要的顺序。
+    /// 需要表达"最近一条"的功能（如带格式粘贴最近一条）不能复用那个顺序，否则
+    /// 置顶一条旧内容就会把它一直顶到最前面，看起来像置顶改变了粘贴行为。
+    fn get_most_recent_entry(
+        &self,
+        content_type: Option<&str>,
+    ) -> Result<Option<ClipboardEntry>, String>;
     fn search(&self, query: &str, limit: i32, tag_only: bool) -> Result<Vec<ClipboardEntry>, String>;
     fn delete(&self, id: i64, data_dir: Option<&std::path::Path>) -> Result<(), String>;
     fn clear(&self, data_dir: Option<&std::path::Path>) -> Result<(), String>;
@@ -115,7 +124,131 @@ pub struct SqliteClipboardRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// 界面列表的顺序：置顶优先，再按置顶序、时间、id。
+///
+/// **只用于展示**。任何表达"最近一条"语义的功能都不该用这个顺序 —— 否则置顶一条
+/// 旧内容就会让它永远排第一，看起来像置顶改变了粘贴行为。
+const HISTORY_ORDER_PINNED_FIRST: &str =
+    "ORDER BY is_pinned DESC, pinned_order DESC, timestamp DESC, id DESC";
+
+/// 纯时间顺序，置顶不参与。用于"最近一条"语义。
+const HISTORY_ORDER_RECENT_FIRST: &str = "ORDER BY timestamp DESC, id DESC";
+
 impl SqliteClipboardRepository {
+    /// 取一段历史，`order_clause` 决定"哪一条排最前"。
+    ///
+    /// 抽出来是因为有两种合法的"第一条"：
+    /// - 界面列表要**置顶优先**（`HISTORY_ORDER_PINNED_FIRST`）；
+    /// - "最近一条"类功能要**纯按时间**（`HISTORY_ORDER_RECENT_FIRST`），置顶不该参与。
+    ///
+    /// 两者只在 ORDER BY 上不同，解密、敏感标签处理、行映射完全一致，所以共用一份实现。
+    fn query_history(
+        &self,
+        limit: i32,
+        offset: i32,
+        content_type: Option<&str>,
+        order_clause: &str,
+    ) -> Result<Vec<ClipboardEntry>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        let map_row = |row: &rusqlite::Row| {
+            let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
+            let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+            let content_type: String = row.get(1)?;
+            let content_raw: String = row.get(2)?;
+            let html_raw: Option<String> = row.get(3).ok();
+            let preview_raw: String = row.get(6)?;
+            let content = self.maybe_decrypt_text(&content_raw);
+            let preview = self.maybe_decrypt_text(&preview_raw);
+            let html_content = html_raw.as_ref().map(|v| self.maybe_decrypt_text(v));
+
+            Ok((
+                ClipboardEntry {
+                    id: row.get(0)?,
+                    content_type,
+                    content,
+                    html_content,
+                    source_app: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    preview,
+                    is_pinned: row.get::<_, i32>(7)? == 1,
+                    tags,
+                    use_count: row.get(9).unwrap_or(0),
+                    is_external: row.get::<_, i32>(10)? == 1,
+                    pinned_order: row.get(11).unwrap_or(0),
+                    source_app_path: row.get(12).unwrap_or(None),
+                    note: row.get::<_, String>(13).unwrap_or_default(),
+                    // Avoid synchronous filesystem existence checks in history query.
+                    // Missing files are still handled by frontend image/file preview error fallback.
+                    file_preview_exists: true,
+                },
+                content_raw,
+                preview_raw,
+                html_raw,
+            ))
+        };
+
+        let mut mapped_rows = Vec::new();
+        if let Some(ct) = content_type {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
+                 FROM clipboard_history 
+                 WHERE content_type = ? 
+                 {order_clause} 
+                 LIMIT ? OFFSET ?"
+            )).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![ct, limit, offset], map_row)
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                mapped_rows.push(row.map_err(|e| e.to_string())?);
+            }
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
+                 FROM clipboard_history 
+                 {order_clause} 
+                 LIMIT ? OFFSET ?"
+            )).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([limit, offset], map_row)
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                mapped_rows.push(row.map_err(|e| e.to_string())?);
+            }
+        }
+
+        let mut history = Vec::new();
+        for (entry, content_raw, preview_raw, html_raw) in mapped_rows {
+            #[cfg(not(feature = "portable"))]
+            {
+                let is_sensitive = has_sensitive_tag(&entry.tags);
+                let content_encrypted = content_raw.starts_with(ENCRYPT_PREFIX);
+                let preview_encrypted = preview_raw.starts_with(ENCRYPT_PREFIX);
+                let html_encrypted = html_raw
+                    .as_ref()
+                    .map(|h| h.starts_with(ENCRYPT_PREFIX))
+                    .unwrap_or(false);
+                let html_needs_encrypt = html_raw
+                    .as_ref()
+                    .map(|h| !h.starts_with(ENCRYPT_PREFIX))
+                    .unwrap_or(false);
+
+                if is_sensitive && (!content_encrypted || !preview_encrypted || html_needs_encrypt)
+                {
+                    let _ = self.encrypt_entry_with_conn(&conn, entry.id);
+                } else if !is_sensitive
+                    && (content_encrypted || preview_encrypted || html_encrypted)
+                {
+                    let _ = self.decrypt_entry_with_conn(&conn, entry.id);
+                }
+            }
+
+            history.push(entry);
+        }
+        Ok(history)
+    }
+
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
@@ -1023,103 +1156,17 @@ impl ClipboardRepository for SqliteClipboardRepository {
         offset: i32,
         content_type: Option<&str>,
     ) -> Result<Vec<ClipboardEntry>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let map_row = |row: &rusqlite::Row| {
-            let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
-            let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
-            let content_type: String = row.get(1)?;
-            let content_raw: String = row.get(2)?;
-            let html_raw: Option<String> = row.get(3).ok();
-            let preview_raw: String = row.get(6)?;
-            let content = self.maybe_decrypt_text(&content_raw);
-            let preview = self.maybe_decrypt_text(&preview_raw);
-            let html_content = html_raw.as_ref().map(|v| self.maybe_decrypt_text(v));
+        self.query_history(limit, offset, content_type, HISTORY_ORDER_PINNED_FIRST)
+    }
 
-            Ok((
-                ClipboardEntry {
-                    id: row.get(0)?,
-                    content_type,
-                    content,
-                    html_content,
-                    source_app: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    preview,
-                    is_pinned: row.get::<_, i32>(7)? == 1,
-                    tags,
-                    use_count: row.get(9).unwrap_or(0),
-                    is_external: row.get::<_, i32>(10)? == 1,
-                    pinned_order: row.get(11).unwrap_or(0),
-                    source_app_path: row.get(12).unwrap_or(None),
-                    note: row.get::<_, String>(13).unwrap_or_default(),
-                    // Avoid synchronous filesystem existence checks in history query.
-                    // Missing files are still handled by frontend image/file preview error fallback.
-                    file_preview_exists: true,
-                },
-                content_raw,
-                preview_raw,
-                html_raw,
-            ))
-        };
-
-        let mut mapped_rows = Vec::new();
-        if let Some(ct) = content_type {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
-                 FROM clipboard_history 
-                 WHERE content_type = ? 
-                 ORDER BY is_pinned DESC, pinned_order DESC, timestamp DESC, id DESC 
-                 LIMIT ? OFFSET ?",
-            ).map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![ct, limit, offset], map_row)
-                .map_err(|e| e.to_string())?;
-            for row in rows {
-                mapped_rows.push(row.map_err(|e| e.to_string())?);
-            }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
-                 FROM clipboard_history 
-                 ORDER BY is_pinned DESC, pinned_order DESC, timestamp DESC, id DESC 
-                 LIMIT ? OFFSET ?",
-            ).map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([limit, offset], map_row)
-                .map_err(|e| e.to_string())?;
-            for row in rows {
-                mapped_rows.push(row.map_err(|e| e.to_string())?);
-            }
-        }
-
-        let mut history = Vec::new();
-        for (entry, content_raw, preview_raw, html_raw) in mapped_rows {
-            #[cfg(not(feature = "portable"))]
-            {
-                let is_sensitive = has_sensitive_tag(&entry.tags);
-                let content_encrypted = content_raw.starts_with(ENCRYPT_PREFIX);
-                let preview_encrypted = preview_raw.starts_with(ENCRYPT_PREFIX);
-                let html_encrypted = html_raw
-                    .as_ref()
-                    .map(|h| h.starts_with(ENCRYPT_PREFIX))
-                    .unwrap_or(false);
-                let html_needs_encrypt = html_raw
-                    .as_ref()
-                    .map(|h| !h.starts_with(ENCRYPT_PREFIX))
-                    .unwrap_or(false);
-
-                if is_sensitive && (!content_encrypted || !preview_encrypted || html_needs_encrypt)
-                {
-                    let _ = self.encrypt_entry_with_conn(&conn, entry.id);
-                } else if !is_sensitive
-                    && (content_encrypted || preview_encrypted || html_encrypted)
-                {
-                    let _ = self.decrypt_entry_with_conn(&conn, entry.id);
-                }
-            }
-
-            history.push(entry);
-        }
-        Ok(history)
+    fn get_most_recent_entry(
+        &self,
+        content_type: Option<&str>,
+    ) -> Result<Option<ClipboardEntry>, String> {
+        Ok(self
+            .query_history(1, 0, content_type, HISTORY_ORDER_RECENT_FIRST)?
+            .into_iter()
+            .next())
     }
 
     fn search(&self, query: &str, limit: i32, tag_only: bool) -> Result<Vec<ClipboardEntry>, String> {
@@ -1514,5 +1561,103 @@ impl ClipboardRepository for SqliteClipboardRepository {
     ) -> Result<Option<(String, String, Option<String>)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.get_entry_content_with_html_with_conn(&conn, id)
+    }
+}
+
+#[cfg(test)]
+mod history_order_tests {
+    use super::*;
+    use crate::services::mcp::store::MCP_SCHEMA;
+    use rusqlite::{params, Connection};
+    use std::sync::{Arc, Mutex};
+
+    /// 内存库 + 与生产同形的表结构。
+    fn repo() -> SqliteClipboardRepository {
+        let conn = Connection::open_in_memory().expect("内存库应可创建");
+        conn.execute_batch(MCP_SCHEMA).expect("schema 应可建表");
+        SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)))
+    }
+
+    fn insert(repo: &SqliteClipboardRepository, id: i64, content: &str, ts: i64, pinned: i32) {
+        let conn = repo.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO clipboard_history
+             (id, content_type, content, source_app, timestamp, preview, is_pinned, pinned_order)
+             VALUES (?1, 'text', ?2, 'test', ?3, ?2, ?4, 0)",
+            params![id, content, ts, pinned],
+        )
+        .expect("插入应成功");
+    }
+
+    /// 列表顺序：置顶优先。这是界面要的顺序，本身正确。
+    #[test]
+    fn history_order_pins_first() {
+        let repo = repo();
+        insert(&repo, 1, "较新", 200, 0);
+        insert(&repo, 2, "较旧但置顶", 100, 1);
+
+        let listed = repo.get_history(10, 0, None).expect("查询应成功");
+
+        assert_eq!(listed[0].id, 2, "列表第一条应当是置顶那条");
+    }
+
+    /// 而"最近一条"必须**忽略置顶**。
+    ///
+    /// 这正是用户报的问题：置顶一条旧内容后，带格式粘贴一直粘到它。原因是那条路径
+    /// 复用了列表顺序（置顶优先）。修复后它走纯时间顺序，置顶不再参与。
+    #[test]
+    fn most_recent_ignores_pinning() {
+        let repo = repo();
+        insert(&repo, 1, "较新", 200, 0);
+        insert(&repo, 2, "较旧但置顶", 100, 1);
+
+        let recent = repo
+            .get_most_recent_entry(None)
+            .expect("查询应成功")
+            .expect("应当有结果");
+
+        assert_eq!(recent.id, 1, "最近一条应当按时间取，而不是被置顶顶到最前");
+        assert_eq!(recent.content, "较新");
+    }
+
+    /// 置顶了最新的那条时，两种顺序结果一致（置顶没有额外特权，只是位置）。
+    #[test]
+    fn most_recent_matches_history_order_when_newest_is_pinned() {
+        let repo = repo();
+        insert(&repo, 1, "最新且置顶", 300, 1);
+        insert(&repo, 2, "次新", 200, 0);
+
+        let listed = repo.get_history(10, 0, None).expect("查询应成功");
+        let recent = repo
+            .get_most_recent_entry(None)
+            .expect("查询应成功")
+            .expect("应当有结果");
+
+        assert_eq!(listed[0].id, 1);
+        assert_eq!(recent.id, 1);
+    }
+
+    /// 多条置顶时，"最近一条"也不受置顶序影响，只看时间。
+    #[test]
+    fn most_recent_ignores_pin_order_among_multiple_pins() {
+        let repo = repo();
+        insert(&repo, 1, "普通但最新", 500, 0);
+        insert(&repo, 2, "置顶A", 400, 1);
+        insert(&repo, 3, "置顶B", 300, 1);
+
+        let recent = repo
+            .get_most_recent_entry(None)
+            .expect("查询应成功")
+            .expect("应当有结果");
+
+        assert_eq!(recent.id, 1);
+    }
+
+    /// 空库不应报错，只返回 None。
+    #[test]
+    fn most_recent_on_empty_history_is_none() {
+        let repo = repo();
+
+        assert!(repo.get_most_recent_entry(None).expect("查询应成功").is_none());
     }
 }

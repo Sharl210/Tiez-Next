@@ -260,7 +260,7 @@ const ClipboardSettingsGroup = (props: ClipboardSettingsGroupProps) => {
                     <div className="setting-item">
                         <props.LabelWithHint
                             label={props.t('capture_rich_text') || '捕获富文本'}
-                            hint={props.t('capture_rich_text_hint') || '开启后可记录富文本并支持双击带格式粘贴'}
+                            hint={props.t('capture_rich_text_hint') || '开启后可记录带格式的文本。单击粘贴带格式，右键粘贴纯文本'}
                             hintKey="capture_rich_text"
                         />
                         <label className="switch">

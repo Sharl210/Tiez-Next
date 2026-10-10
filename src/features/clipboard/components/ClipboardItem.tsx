@@ -47,6 +47,7 @@ import {
 import HtmlContent from "../../../shared/components/HtmlContent";
 import { toTauriLocalImageSrc } from "../../../shared/lib/localImageSrc";
 import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot";
+import { htmlToPlainText } from "../../../shared/lib/htmlToPlainText";
 import { getFileIcon as getSystemFileIcon, peekFileIcon } from "../../../shared/lib/fileIcon";
 import { getSourceAppIcon, peekSourceAppIcon } from "../../../shared/lib/sourceAppIcon";
 import { registerCompactPreviewControls } from "../lib/compactPreviewControls";
@@ -112,15 +113,6 @@ const truncateNoteForInline = (note: string): string => {
  * 会看到 HTML 源码。后端以同一口径再派生一次作为权威值，这里派生是为了让界面上显示的
  * 正文与最终落库的内容一致。
  */
-const htmlToPlainText = (html: string): string => {
-    if (!html) return "";
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
-    doc.querySelectorAll("p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote, pre")
-        .forEach((el) => el.append("\n"));
-    return (doc.body.textContent ?? "").replace(/\n{3,}/g, "\n\n").trim();
-};
-
 const escapeHtmlForEditor = (text: string): string =>
     text
         .replace(/&/g, "&amp;")
@@ -2221,7 +2213,7 @@ const ClipboardItem = ({
                 // target loses focus before we dispatch the paste keystroke.
                 e.preventDefault();
                 void hideCompactPreview();
-                onCopy(false); // Plain text by default
+                onCopy(true); // Rich text by default (see PASTE_FORMAT_DEFAULT)
                 onSelect();
             }}
             onClick={(e) => {
@@ -2254,7 +2246,7 @@ const ClipboardItem = ({
                 if (target.closest('a')) {
                     e.stopPropagation();
                 }
-                onCopy(true); // Formatted text for right-click
+                onCopy(false); // Plain text is the right-click escape hatch
 
                 onSelect();
             }}
